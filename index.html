@@ -1470,6 +1470,24 @@ var WORKSPACES = {
     }
   },
 
+  // SPATCO Energy Solutions — ENTERPRISE account. Their custom EV/project
+  // estimate tool + the sitemap editor are MANDATORY (pinned, non-removable).
+  'spatco.com': {
+    type: 'developer',
+    orgId: 'spatco.com',
+    clientName: 'SPATCO Energy Solutions',
+    accountTier: 'Enterprise',
+    tierLevel: 3,                              // Enterprise — sees everything
+    allowedDomain: 'spatco.com',
+    requiredTools: ['editor','spatco_ev'],     // mandatory, pinned, non-removable
+    exportBrand: {
+      logo: '/spatco-logo.jpg',
+      name: 'SPATCO Energy Solutions',
+      poweredBy: 'Powered by ClearSky-OMEGA',
+      platformCopyright: '© 2025 ClearSky Energy Solutions LLC · ClearSky-OMEGA platform'
+    }
+  },
+
   'nextnrg.com': {
     type: 'developer',
     orgId: 'nextnrg.com',           // hard tenant lock — scopes all data
@@ -1698,6 +1716,21 @@ function showApp(user) {
     applyDeveloperChrome(ws);
     renderDashboard();  // developer: single-org roll-up (existing behavior)
   }
+
+  // If we arrived here from the Projects page "+ New Project" button
+  // (which navigates to /?new=1 because the create-project modal lives on this
+  // page), auto-open the new-project modal. Developer tenants only; partners
+  // don't create projects. We clear the query param so a refresh won't re-open.
+  try {
+    if (!isPartner && /[?&]new=1(&|$)/.test(window.location.search)) {
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState({}, document.title, window.location.pathname);
+      }
+      if (typeof openNewProjectModal === 'function') {
+        setTimeout(function(){ openNewProjectModal('bess'); }, 60);
+      }
+    }
+  } catch(e){ /* non-fatal: just skip auto-open */ }
 }
 
 // Developer tenant: keep the existing single-org command center.
