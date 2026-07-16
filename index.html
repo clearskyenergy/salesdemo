@@ -1379,7 +1379,7 @@ body{font-family:'DM Sans',sans-serif;background:var(--cs-bg);color:var(--cs-tex
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script src="/config.js"></script>
-<script src="https://tools.csebuilders.com/omega-tools.js?v=8"></script>
+<script src="https://tools.csebuilders.com/omega-tools.js?v=9"></script>
 
 <script>
 // ══════════════════════════════════════════════════════════════════════
@@ -3565,9 +3565,23 @@ function _catLabel(key){
 function _paintDash(){
   var el = document.getElementById('dash-grid'); if(!el) return;
   el.className = 'pm-grid';
-  var tools = _qualifying(), html = '', renderedKeys = {};
-  for (var i=0;i<tools.length;i++){
-    if (_required(tools[i]) || _pinned(tools[i].key)){ html += _tile(tools[i], true); renderedKeys[tools[i].key]=true; }
+  var html = '', renderedKeys = {};
+  // 1) Required tools (mandatory for this tenant) — from the unlocked set.
+  var qual = _qualifying();
+  for (var i=0;i<qual.length;i++){
+    if (_required(qual[i]) && !renderedKeys[qual[i].key]){
+      html += _tile(qual[i], true); renderedKeys[qual[i].key]=true;
+    }
+  }
+  // 2) Pinned tools — resolved DIRECTLY from the catalog by key, so a tool the
+  //    customer added in the marketplace ALWAYS shows here (a pin is an explicit
+  //    choice; we don't re-filter it through the tier/unlock gate). This fixes
+  //    the case where "+ Add to dashboard" saved a pin that never appeared.
+  var pins = (OMEGATools && OMEGATools.pinnedTools)
+    ? OMEGATools.pinnedTools(_PINNED, _PORTAL_WS)
+    : qual.filter(function(t){ return _pinned(t.key); });
+  for (var p=0;p<pins.length;p++){
+    if (!renderedKeys[pins[p].key]){ html += _tile(pins[p], true); renderedKeys[pins[p].key]=true; }
   }
   // SPATCO EV tool fallback: if the shared catalog doesn't (yet) carry the
   // 'spatco_ev' key but this workspace requires it, render a direct tile so
