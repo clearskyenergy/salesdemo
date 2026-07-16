@@ -1802,7 +1802,10 @@ function showApp(user) {
   // page), auto-open the new-project modal. Developer tenants only; partners
   // don't create projects. We clear the query param so a refresh won't re-open.
   try {
-    if (!isPartner && /[?&]new=1(&|$)/.test(window.location.search)) {
+    var _wantNew = /[?&]new=1(&|$)/.test(window.location.search)
+                || (window.location.hash || '').replace('#','') === 'new';
+    if (!isPartner && _wantNew) {
+      // Clear the query/hash so a refresh won't re-open the modal.
       if (window.history && window.history.replaceState) {
         window.history.replaceState({}, document.title, window.location.pathname);
       }
