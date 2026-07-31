@@ -25,7 +25,9 @@
        clientName:   'Example Energy',
        accountTier:  'Enterprise',
        tierLevel:    3,
-       allowedDomain:'example.com',
+       allowedDomain:'example.com',   // primary sign-in domain
+       allowedDomains:['contractor.io'], // OPTIONAL extra domains
+       allowedEmails:['jane@gmail.com'], // OPTIONAL individual accounts
        requiredTools:['editor'],
        logo:         '/example-logo.png',
        exportBrand:  { name:'Example Energy', logo:'/example-logo.png' }
@@ -69,6 +71,36 @@
     return null;
   }
 
+  /* Every domain this tenant accepts: `allowedDomain` plus any in the optional
+     `allowedDomains` array. */
+  function allowedDomainsOf(ws) {
+    var out = [];
+    if (!ws) return out;
+    if (ws.allowedDomain) out.push(String(ws.allowedDomain).toLowerCase());
+    var extra = ws.allowedDomains || [];
+    for (var i = 0; i < extra.length; i++) out.push(String(extra[i]).toLowerCase());
+    return out;
+  }
+
+  /* Individually allowlisted addresses. Lets a specific personal account (a
+     Gmail, a contractor) into a tenant WITHOUT opening its whole domain. */
+  function emailAllowed(ws, email) {
+    var list = (ws && ws.allowedEmails) || [];
+    var e = String(email || '').toLowerCase();
+    for (var i = 0; i < list.length; i++) {
+      if (String(list[i]).toLowerCase() === e) return true;
+    }
+    return false;
+  }
+
+  /* True once this deployment knows who it is. False means /config.js is
+     missing its `tenant` (or `workspaces`) block. */
+  function configured(registry) {
+    if (pinned(registry)) return true;
+    for (var k in registry) { if (registry.hasOwnProperty(k)) return true; }
+    return false;
+  }
+
   /* Domains permitted to view a locked deployment in addition to the tenant's
      own (e.g. ClearSky staff previewing a client portal). */
   function adminDomains() {
@@ -76,11 +108,22 @@
     return (c.adminDomains && c.adminDomains.length) ? c.adminDomains : [];
   }
 
-  /* The domain users are expected to sign in with. Drives the Google `hd`
-     account hint and the auth copy. NOT a security gate — resolve() is. */
+  /* The domain users are expected to sign in with. Drives the auth copy.
+     NOT a security gate — resolve() is. */
   function defaultDomain(registry) {
     var ws = pinned(registry);
     return (ws && ws.allowedDomain) || cfg().allowedDomain || '';
+  }
+
+  /* Domain hint for the Google account chooser. Suppressed when the tenant
+     accepts more than one domain or allowlists individual addresses —
+     otherwise Google would hide exactly the accounts we just permitted. */
+  function googleHint(registry) {
+    var ws = pinned(registry);
+    if (!ws) return '';
+    if ((ws.allowedEmails || []).length) return '';
+    if (allowedDomainsOf(ws).length > 1) return '';
+    return ws.allowedDomain || '';
   }
 
   /* Authoritative gate. Returns the workspace this user may use, or null.
@@ -93,10 +136,19 @@
 
     var lock = pinned(registry);
     if (lock) {
-      var ok = (dom === lock.allowedDomain) || (adminDomains().indexOf(dom) >= 0);
+      var ok = (allowedDomainsOf(lock).indexOf(dom) >= 0)
+            || emailAllowed(lock, email)
+            || (adminDomains().indexOf(dom) >= 0);
       return ok ? lock : null;
     }
-    return (registry && registry.hasOwnProperty(dom)) ? registry[dom] : null;
+
+    if (registry && registry.hasOwnProperty(dom)) return registry[dom];
+
+    /* Multi-tenant hub: honour per-tenant email allowlists too. */
+    for (var k in registry) {
+      if (registry.hasOwnProperty(k) && emailAllowed(registry[k], email)) return registry[k];
+    }
+    return null;
   }
 
   /* ── Brand accessors ────────────────────────────────────────────────────── */
@@ -168,7 +220,7 @@
 
     setImg('auth-logo-img', logoOf(ws), name);
     setText('auth-company', name ? name + ' Workspace' : 'Workspace');
-    setText('auth-toggle-brand', name || 'this');
+    setText('auth-toggle-brand', name ? (name + ' workspace') : 'this workspace');
     setText('auth-note-domain', dom ? '@' + dom : '');
     setText('auth-platform', platformName());
 
@@ -187,8 +239,16 @@
 
   /* Message shown when a user's domain isn't permitted on this deployment. */
   function accessMessage(email, registry) {
-    var dom = defaultDomain(registry);
     var who = email || 'an unrecognized account';
+
+    /* Deployment hasn't been configured — say so plainly instead of blaming
+       the user's account. This is the message you get if /config.js is stale. */
+    if (!configured(registry)) {
+      return 'This deployment has no tenant configured. Add a `tenant` block to '
+           + '/config.js (see config.example.js), then reload.';
+    }
+
+    var dom = defaultDomain(registry);
     return dom
       ? ('This workspace is restricted to @' + dom + ' accounts. You signed in as '
          + who + '. Please sign in with your @' + dom + ' account.')
@@ -200,8 +260,12 @@
     domainOf:      domainOf,
     esc:           esc,
     pinned:        pinned,
+    configured:    configured,
     adminDomains:  adminDomains,
     defaultDomain: defaultDomain,
+    googleHint:    googleHint,
+    allowedDomainsOf: allowedDomainsOf,
+    emailAllowed:  emailAllowed,
     resolve:       resolve,
     nameOf:        nameOf,
     logoOf:        logoOf,

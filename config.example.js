@@ -29,9 +29,18 @@ window.CLEARSKY_CONFIG = {
     clientName:    'SPATCO Energy Solutions',
     accountTier:   'Enterprise',
     tierLevel:     3,                      // 3 = Enterprise, every tool unlocked
-    allowedDomain: 'spatco.com',           // only this email domain may sign in
+    allowedDomain: 'spatco.com',           // primary sign-in domain
     requiredTools: ['editor', 'spatco_ev'],// pinned, non-removable dashboard tiles
     logo:          '/spatco-logo.jpg',
+
+    /* OPTIONAL — additional whole domains this tenant accepts. */
+    // allowedDomains: ['spatco-contractors.com'],
+
+    /* OPTIONAL — individual accounts allowed in alongside the domains above.
+       Use this to admit one Gmail/personal address WITHOUT opening all of
+       gmail.com. When set, the Google account-chooser domain hint is
+       suppressed so the allowlisted account is actually selectable. */
+    // allowedEmails: ['jane.doe@gmail.com'],
 
     /* Bespoke tools not in the shared OMEGATools catalog. Any key listed here
        that also appears in requiredTools gets a dashboard tile. This is how the
