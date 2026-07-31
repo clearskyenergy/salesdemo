@@ -36,7 +36,11 @@
      // ── Option B: name a tenant already in the WORKSPACES registry ──
      // tenantKey: 'example.com',
 
-     // ── Option C: omit both → multi-tenant, resolve by email domain ──
+     // ── Option C: omit both → ZERO-CONFIG. The workspace is derived from
+     //    whoever signs in: their email domain becomes the orgId, so the
+     //    portal works immediately on upload with no config edit.
+     //    Any domain may sign in; each is isolated by orgId (Firestore rules
+     //    enforce this). Set strictTenant:true to refuse instead.
 
      adminDomains: ['csebuilders.com']   // may preview any locked deployment
    };
@@ -126,6 +130,42 @@
     return ws.allowedDomain || '';
   }
 
+  /* ── Zero-config fallback ─────────────────────────────────────────────
+     When /config.js names neither a `tenant` nor a `workspaces` map, derive a
+     workspace from the signed-in user's own email domain. This is what makes
+     the pages work the instant they're uploaded, with no config step.
+
+     TRADE-OFF: in this mode ANY email domain can sign in and receives its own
+     empty workspace, isolated from every other by orgId. That's right for a
+     demo or a first deploy; it is NOT right for a customer-facing production
+     tenant. Lock those down by defining `tenant` in /config.js — or set
+     `strictTenant: true` to refuse unconfigured sign-ins outright. */
+  function autoTenantEnabled() { return cfg().strictTenant !== true; }
+
+  function titleCase(str) {
+    var parts = String(str || '').split(/[-_.]+/), out = [];
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i]) out.push(parts[i].charAt(0).toUpperCase() + parts[i].slice(1));
+    }
+    return out.join(' ');
+  }
+
+  function autoTenant(email) {
+    var dom = domainOf(email);
+    if (!dom) return null;
+    var label = titleCase(dom.replace(/\.[a-z.]+$/i, ''));
+    return {
+      type:          'developer',
+      orgId:         dom,              // scopes all data to this domain
+      clientName:    label || dom,
+      accountTier:   'Enterprise',
+      tierLevel:     3,
+      allowedDomain: dom,
+      requiredTools: ['editor'],
+      _auto:         true              // flag: derived, not configured
+    };
+  }
+
   /* Authoritative gate. Returns the workspace this user may use, or null.
        • Locked deployment  → the pinned tenant, if the user's domain matches
                               it or an admin domain; otherwise null.
@@ -148,6 +188,10 @@
     for (var k in registry) {
       if (registry.hasOwnProperty(k) && emailAllowed(registry[k], email)) return registry[k];
     }
+
+    /* Nothing configured → derive a workspace from the user's domain. */
+    if (!configured(registry) && autoTenantEnabled()) return autoTenant(email);
+
     return null;
   }
 
@@ -241,11 +285,12 @@
   function accessMessage(email, registry) {
     var who = email || 'an unrecognized account';
 
-    /* Deployment hasn't been configured — say so plainly instead of blaming
-       the user's account. This is the message you get if /config.js is stale. */
+    /* Strict mode with nothing configured — say so plainly instead of
+       blaming the user's account. Without strict mode we never get here,
+       because autoTenant() will have resolved a workspace. */
     if (!configured(registry)) {
-      return 'This deployment has no tenant configured. Add a `tenant` block to '
-           + '/config.js (see config.example.js), then reload.';
+      return 'This deployment has no tenant configured and strictTenant is on. '
+           + 'Add a `tenant` block to /config.js (see config.example.js), then reload.';
     }
 
     var dom = defaultDomain(registry);
@@ -256,11 +301,23 @@
          + 'deployment. Contact your administrator for access.');
   }
 
+  /* Make auto mode visible to anyone with devtools open. */
+  function warnIfAuto(registry) {
+    if (configured(registry) || !autoTenantEnabled()) return;
+    if (global.console && console.warn) {
+      console.warn('[OmegaBrand] No tenant in /config.js — deriving the workspace '
+        + 'from each user\'s email domain. Any domain may sign in. Define '
+        + '`tenant` in /config.js to lock this deployment to one customer.');
+    }
+  }
+
   global.OmegaBrand = {
     domainOf:      domainOf,
     esc:           esc,
     pinned:        pinned,
     configured:    configured,
+    autoTenant:    autoTenant,
+    warnIfAuto:    warnIfAuto,
     adminDomains:  adminDomains,
     defaultDomain: defaultDomain,
     googleHint:    googleHint,
