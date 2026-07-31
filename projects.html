@@ -354,7 +354,13 @@ let myEmail = '';
 // Tenant-neutral: nothing customer-specific is hardcoded here. The tenant is
 // window.OMEGA_WORKSPACE when we arrived from the portal in the same page
 // load, otherwise this deployment's /config.js (which survives navigation).
-var WS = window.OMEGA_WORKSPACE || OmegaBrand.pinned(null) || {};
+/* Registry, when this deployment is a multi-tenant hub. Normally empty. */
+var WORKSPACES = (window.CLEARSKY_CONFIG && window.CLEARSKY_CONFIG.workspaces) || {};
+
+/* Resolved for real in onAuthStateChanged, once we know who signed in.
+   Landing here directly (rather than via the portal) means
+   window.OMEGA_WORKSPACE is absent — it does not survive navigation. */
+var WS = window.OMEGA_WORKSPACE || OmegaBrand.pinned(WORKSPACES) || {};
 function domainOf(email){ return (email||'').split('@')[1] || ''; }
 
 function esc2(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -397,23 +403,42 @@ auth.onAuthStateChanged(user => {
   if (!user) { window.location.href = '/'; return; }
   if (window._omegaReady) window._omegaReady();
   // config.js is guaranteed loaded by now (Firebase init waited on it), so
-  // re-resolve the tenant in case it wasn't available at parse time.
-  WS = window.OMEGA_WORKSPACE || OmegaBrand.pinned(null) || WS || {};
+  // resolve the tenant properly. OmegaBrand.resolve() is what applies the
+  // deployment lock, the allowlists AND the zero-config fallback that derives
+  // a workspace from the user's email domain — pinned() alone skips all three,
+  // which is how WS.orgId ended up undefined here.
+  WORKSPACES = (window.CLEARSKY_CONFIG && window.CLEARSKY_CONFIG.workspaces) || WORKSPACES;
+  var resolved = OmegaBrand.resolve(user.email, WORKSPACES);
+  WS = window.OMEGA_WORKSPACE || resolved || WS || {};
   myEmail = (user.email || '').toLowerCase();
   paintTopbar(user);
-  // Only accounts on this workspace's domain may view its projects.
-  if (WS.allowedDomain && domainOf(user.email) !== WS.allowedDomain) {
+
+  // Access check. Defer entirely to the resolver, which already applies the
+  // deployment lock, allowedDomains AND allowedEmails — a hand-rolled
+  // allowedDomain comparison here would wrongly reject allowlisted Gmail and
+  // admin accounts that the portal itself lets through.
+  // window.OMEGA_WORKSPACE present = we arrived from the portal, already gated.
+  if (!resolved && !window.OMEGA_WORKSPACE) {
     document.getElementById('proj-table').innerHTML =
-      '<div class="empty"><p>This is the ' + esc2(WS.clientName||'') +
-      ' workspace. Sign in with your @' + WS.allowedDomain +
-      ' account to view projects.</p></div>';
-    document.getElementById('proj-sub').textContent = 'Access restricted to @' + WS.allowedDomain;
+      '<div class="empty"><p>' + esc2(OmegaBrand.accessMessage(user.email, WORKSPACES)) +
+      '</p></div>';
+    document.getElementById('proj-sub').textContent = 'Access restricted';
     return;
   }
   loadProjects();
 });
 
 async function loadProjects() {
+  // No orgId means the tenant never resolved. Say so plainly instead of
+  // letting the Firestore SDK throw "Unsupported field value: undefined".
+  if (!WS || !WS.orgId) {
+    document.getElementById('proj-table').innerHTML =
+      '<div class="empty"><p>No workspace could be resolved for this account. '
+      + 'If this deployment is meant to serve one customer, add a <code>tenant</code> '
+      + 'block to /config.js.</p></div>';
+    document.getElementById('proj-sub').textContent = 'No workspace resolved';
+    return;
+  }
   try {
     // Scope by orgId → matches Firestore security rules and the dashboard.
     const snap = await db.collection('projects').where('orgId','==',WS.orgId).get();
