@@ -2267,6 +2267,8 @@ window._omegaReady = function(){
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script src="/config.js"></script>
 <script src="/omega-brand.js"></script>
+<script src="/omega-legal-docs.js"></script>
+<script src="/omega-legal.js"></script>
 <script src="https://tools.csebuilders.com/omega-tools.js?v=8"></script>
 
 <script>
@@ -2354,6 +2356,34 @@ auth.onAuthStateChanged(user => {
     currentUser = user;
     currentOrg = ws.orgId;          // scopes this user's own data (developer) or partner org
 
+    // ── LEGAL GATE ──────────────────────────────────────────────────────────
+    // A resolved workspace is NOT yet an open workspace. Nothing below runs
+    // until this account has the current Terms of Service and NDA on file.
+    // Declining signs the user straight back out. See /omega-legal.js.
+    if (typeof OmegaLegal === 'undefined') {
+      // The gate script failed to load — fail closed rather than silently
+      // handing out an unsigned session.
+      showAuthErr('Access is on hold while the workspace agreements load. Please reload the page.');
+      auth.signOut();
+      return;
+    }
+    OmegaLegal.require({
+      db: db, firebase: firebase, user: user, ws: ws,
+      onDecline: function(){ auth.signOut(); }
+    }, function(){
+      _enterPortal(user, ws);
+    });
+  } else {
+    currentUser = null;
+    WORKSPACE = null; window.OMEGA_WORKSPACE = null;
+    showLogin();
+  }
+});
+}
+
+/* Everything that used to run inline at sign-in. Called only after the legal
+   gate passes, so an unsigned account never reaches the portal. */
+function _enterPortal(user, ws) {
     showApp(user);
     applyToolLocks();   // gate tools by workspace.unlockedTools (demo Enterprise = all unlocked)
 
@@ -2365,14 +2395,7 @@ auth.onAuthStateChanged(user => {
     } else {
       initTeamHub();
     }
-  } else {
-    currentUser = null;
-    WORKSPACE = null; window.OMEGA_WORKSPACE = null;
-    showLogin();
-  }
-});
 }
-
 function showRedirecting(name){
   document.getElementById('auth-screen').style.display = 'flex';
   document.getElementById('app').style.display = 'none';
@@ -4356,7 +4379,7 @@ function _paintDash(){
       desc:     ct.desc || '',
       category: ct.category || 'sales',
       icon:     ct.icon || 'M13 2L3 14h9l-1 8 10-12h-9l1-8z',
-      href:     ct.href || '#'
+      href:     _withOrg(ct.href || '#')   // carry the tenant to external tools
     });
     renderedKeys[ct.key] = true;
   }
@@ -4795,12 +4818,13 @@ function snToggleApps(ev){
 // Populate the sidebar's My Applications sublist from the same pinned/required tools.
 function _paintSideApps(){
   var list=document.getElementById('sn-apps-list'); if(!list) return;
-  var html='';
+  var html='', _seen={};
   try{
     if (typeof _qualifying==='function'){
       var tools=_qualifying(), n=0;
       for (var i=0;i<tools.length && n<DASH_MAX;i++){
         var t=tools[i];
+        _seen[t.key]=true;
         if (_required(t) || _pinned(t.key)){
           var label = (t.name||t.key);
           if (t.key==='editor'){ label='Site Map'; }
@@ -4813,6 +4837,18 @@ function _paintSideApps(){
           }
           n++;
         }
+      }
+      /* Tools declared on the tenant rather than in the shared catalog
+         (Grid Atlas, Financing Partners Portal) — same rule as the dashboard:
+         listed in customTools AND named in requiredTools. */
+      var _ct = (typeof _PORTAL_WS!=='undefined' && _PORTAL_WS && _PORTAL_WS.customTools) || [];
+      var _req = (typeof _PORTAL_WS!=='undefined' && _PORTAL_WS && _PORTAL_WS.requiredTools) || [];
+      for (var c=0;c<_ct.length && n<DASH_MAX;c++){
+        var ct=_ct[c];
+        if (!ct || !ct.key || _seen[ct.key]) continue;
+        if (_req.indexOf(ct.key) < 0) continue;
+        html += '<a class="sn-app" href="'+_withOrg(ct.href||'#')+'"><span class="sn-app-dot"></span>'+(ct.name||ct.key)+'</a>';
+        _seen[ct.key]=true; n++;
       }
     }
   }catch(e){}

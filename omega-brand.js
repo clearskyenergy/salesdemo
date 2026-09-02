@@ -150,11 +150,20 @@
     return out.join(' ');
   }
 
+  /* What a brand-new, self-provisioned account starts with. Set
+     `newAccountDefaults` in /config.js to change the tools every new workspace
+     gets on day one — requiredTools, customTools, tier, anything else on a
+     workspace object. Nothing here is deployment-specific, so this file still
+     ships byte-identical to every tenant. */
+  function newAccountDefaults() {
+    return cfg().newAccountDefaults || {};
+  }
+
   function autoTenant(email) {
     var dom = domainOf(email);
     if (!dom) return null;
     var label = titleCase(dom.replace(/\.[a-z.]+$/i, ''));
-    return {
+    var ws = {
       type:          'developer',
       orgId:         dom,              // scopes all data to this domain
       clientName:    label || dom,
@@ -164,6 +173,10 @@
       requiredTools: ['editor'],
       _auto:         true              // flag: derived, not configured
     };
+    /* Overlay the deployment's new-account defaults. */
+    var d = newAccountDefaults();
+    for (var k in d) { if (d.hasOwnProperty(k)) ws[k] = d[k]; }
+    return ws;
   }
 
   /* Authoritative gate. Returns the workspace this user may use, or null.
