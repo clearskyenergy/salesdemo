@@ -9402,6 +9402,29 @@ const SNAP_R=40;
 function getCenter(id){
   const el=S.elements.find(e=>e.id===id);
   const dom=document.querySelector(`[data-elid="${id}"]`);
+
+  /* SHAPES CAN BE CONDUIT HOSTS TOO.
+
+     This looked only in S.elements and returned null for anything else,
+     so every conduit bonded to a SHAPE silently stopped being re-bonded.
+     The guided build's PV leg is exactly that: when it snaps to an array
+     you already drew, the run is bonded to a dersolar SHAPE, not an
+     element. updateAttached() then found no centre, left the endpoint
+     where it was, and the line jumped away from the array on the next
+     pan, zoom or move — the array reprojected and the conduit end did not.
+
+     Shapes have no [data-elid] node, so the DOM path cannot serve them;
+     _elBox already knows how to centre one, in the same model pixel space
+     the conduit points use. */
+  if(!el){
+    try{
+      const sh=(S.shapes||[]).find(s=>s&&s.id===id);
+      if(sh && typeof _elBox==='function'){
+        const b=_elBox(sh);
+        if(b && isFinite(b.cx) && isFinite(b.cy)) return { x:b.cx, y:b.cy };
+      }
+    }catch(e){}
+  }
   if(!el||!dom)return null;
   const r=dom.getBoundingClientRect(),sr=document.getElementById('sc').getBoundingClientRect();
   var _z=(window._plotView&&window._plotView.z)?window._plotView.z:1;
@@ -9444,9 +9467,33 @@ function getCenter(id){
 function _elCenter(id){
   var el=null;
   try{ el=S.elements.find(function(e){return e.id===id;}); }catch(e){}
-  if(!el) return null;
-  var s=_elBoxSize(el);
-  return { x:(+el.x||0)+s.w/2, y:(+el.y||0)+s.h/2 };
+  if(el){
+    var s=_elBoxSize(el);
+    return { x:(+el.x||0)+s.w/2, y:(+el.y||0)+s.h/2 };
+  }
+
+  /* SHAPES ARE CONDUIT HOSTS TOO, AND THIS IS WHERE THE PV RUN JUMPED.
+
+     getCenter() was taught about shapes; this was not, and the ENDPOINT
+     WELD in _geoReprojectAll goes through here. So for a run bonded to a
+     dersolar SHAPE — which is exactly what the guided build makes when its
+     PV leg snaps to an array you already drew — this returned null, the
+     weld hit `if(!ctr) continue`, and the endpoint was never moved.
+
+     Reprojection then rebuilt the array's geometry from lat/lng while the
+     conduit end stayed on the old pixel. The array walked and the line did
+     not, so the run appeared to jump off it on every zoom or pan.
+
+     _elBox answers in the same model pixel space the conduit points use,
+     which is the whole reason getCenter uses it for shapes. */
+  try{
+    var sh=(S.shapes||[]).find(function(s){ return s && s.id===id; });
+    if(sh && typeof _elBox==='function'){
+      var b=_elBox(sh);
+      if(b && isFinite(b.cx) && isFinite(b.cy)) return { x:b.cx, y:b.cy };
+    }
+  }catch(e){}
+  return null;
 }
 
 /* Shared size lookup. _elRenderSize lives in a later script block, so it is
@@ -36238,7 +36285,8 @@ function _ppBuildModal(){
     '<p id="pp-note" style="font-size:10px;color:var(--sub);margin-bottom:12px"></p>'+
     '<div style="display:flex;gap:6px;justify-content:flex-end">'+
     '<button onclick="_ppClose()" style="padding:7px 14px;border-radius:5px;border:none;cursor:pointer;font-size:12px;background:var(--surface);color:var(--sub)">Cancel</button>'+
-    '<button id="pp-export-btn" onclick="_ppExport()" style="padding:7px 14px;border-radius:5px;border:none;cursor:pointer;font-size:12px;font-weight:700;background:var(--accent);color:var(--navy)">Export</button></div>'+
+    '<button id="pp-pptx-btn" onclick="_ppExportPPTX()" title="Same sheets as a PowerPoint \u2014 one sheet per slide, sized to the sheet rather than squeezed onto 16:9. For the meeting, not the permit." style="padding:7px 14px;border-radius:5px;border:1px solid var(--border);cursor:pointer;font-size:12px;font-weight:700;background:var(--surface);color:var(--text)">Export PPTX</button>'+
+    '<button id="pp-export-btn" onclick="_ppExport()" style="padding:7px 14px;border-radius:5px;border:none;cursor:pointer;font-size:12px;font-weight:700;background:var(--accent);color:var(--navy)">Export PDF</button></div>'+
     '</div>';
   document.body.appendChild(m);
   return m;
@@ -38785,6 +38833,16 @@ async function _ppCaptureLiveMap(){
   }catch(e){ console.warn('Live map capture failed:', e && e.message); return false; }
 }
 
+/* PPTX runs the SAME sheet assembly as the PDF path — it sets a flag and
+   calls it. Duplicating the assembly would give two lists that drift, and
+   a PowerPoint missing a sheet the PDF has is exactly the kind of quiet
+   disagreement that gets noticed in front of a customer. */
+window._ppExportPPTX = function(){
+  window.__ppWantPPTX = true;
+  try { return _ppExport(); }
+  catch (e) { window.__ppWantPPTX = false; throw e; }
+};
+
 async function _ppExport(){
   var _btn=document.getElementById('pp-export-btn');
   var _btnTxt=_btn?_btn.textContent:'';
@@ -38879,6 +38937,33 @@ async function _ppExport(){
   window._ppTempMapImg=null; window._ppCanvasCapture=null;
   _resetBtn();
   if(!sheets.length){ alert('Select at least one sheet.'); return; }
+
+  /* PPTX takes the SAME assembled sheet list and stops here — the SVG and
+     PDF writers are skipped so pressing it does not also drop a dozen files
+     in Downloads. */
+  if(window.__ppWantPPTX){
+    window.__ppWantPPTX=false;
+    if(!window.OmegaPlotPPT){
+      _resetBtn();
+      alert('The PowerPoint exporter is not loaded on this build.');
+      return;
+    }
+    var _pb=document.getElementById('pp-pptx-btn');
+    var _pbTxt=_pb?_pb.textContent:'';
+    if(_pb){ _pb.disabled=true; _pb.style.opacity='0.75'; }
+    OmegaPlotPPT.build(sheets, {
+      title: pname || 'Plot plan',
+      dpi: 200,
+      onProgress: function(i,n,no){
+        if(_pb) _pb.textContent='Sheet '+i+' of '+n+' \u2014 '+no;
+      }
+    }, function(count, err){
+      if(_pb){ _pb.textContent=_pbTxt||'Export PPTX'; _pb.disabled=false; _pb.style.opacity='1'; }
+      if(err){ alert('PowerPoint export failed: '+err); return; }
+      _ppClose();
+    });
+    return;
+  }
 
   _ppClose();
 
@@ -52677,6 +52762,25 @@ function _connectToEms(ems, el, eqId){
           fromId:ems.id, toId:el.id, fromElId:ems.id, toElId:el.id,
           chainFromEms:true, labelDx:50, labelDy:-28 };
   S.conduits.push(c);
+
+  /* Cut the ground anchor for CONDUITS only, and only when the map can
+     actually answer.
+
+     The first version fell back to _geoStampAll() when OmegaAnchorCond was
+     unavailable. That was a bad trade: _geoStampAll stamps SHAPES too, and
+     OmegaAnchorCond.stamp() returns 0 without doing anything whenever the
+     map is frozen — which is most of a build. So on a frozen map every
+     conduit creation fell through to re-anchoring every array on the
+     drawing, mid-build, from whatever pixel geometry existed at that
+     instant. The next reprojection then moved the arrays to those anchors
+     and they vanished off the sheet, and the trenches shifted with them.
+
+     A MISSING ANCHOR IS RECOVERABLE; A WRONG ONE IS NOT. The audit and the
+     post-build pass both re-cut anything unstamped a moment later, so
+     doing nothing here is strictly safer than guessing. */
+  try{
+    if(window.OmegaAnchorCond && typeof OmegaAnchorCond.stamp==='function') OmegaAnchorCond.stamp();
+  }catch(e){}
   if(typeof renderConduit==='function') renderConduit(c);
   if(typeof updCondStat==='function') updCondStat();
   return c;
@@ -54449,7 +54553,12 @@ function openDcfcBuild(){
           +'<input id="dcfc-spare" type="number" min="0" max="10" value="'+DCFC.spare+'" style="width:100%;background:#0A1628;border:1px solid #26364d;color:#E2EEF9;padding:7px 8px;border-radius:6px;font-size:13px;font-family:monospace;box-sizing:border-box"></div>'
       +'</div>'
       +'<div id="dcfc-summary" style="font-size:10px;color:#8FA3B8;background:rgba(245,166,35,.06);border:1px solid rgba(245,166,35,.2);border-radius:7px;padding:9px 11px;margin-bottom:14px;line-height:1.6"></div>'
-      +'<div style="font-size:9px;color:#8FA3B8;background:rgba(0,0,0,.2);border-radius:6px;padding:8px 10px;line-height:1.5;margin-bottom:14px">'
+      +'<div style="margin-bottom:12px">'
+        +'<label style="display:block;font-size:9px;color:#8FA3B8;text-transform:uppercase;letter-spacing:.5px;font-weight:700;margin-bottom:4px">Service</label>'
+        +'<select id="dcfc-tie" onchange="_dcfcTieNote()" style="width:100%;padding:9px;background:#0A1628;border:1px solid rgba(255,255,255,.15);border-radius:6px;color:#E8F0FE;font-size:12px">'
+        + (window.OmegaTieIn ? OmegaTieIn.optionsHtml('Utility POI \u2014 draw a new service and transformer') : '<option value="">Utility POI</option>')
+        +'</select></div>'
+      +'<div id="dcfc-tie-note" style="font-size:9px;color:#8FA3B8;background:rgba(0,0,0,.2);border-radius:6px;padding:8px 10px;line-height:1.5;margin-bottom:14px">'
         +'<span style="color:#F5A623;font-weight:700">Placement:</span> you\u2019ll click the map for each node in order \u2014 '
         +'<span style="color:#F59E0B">\u2b24 Utility Service</span> \u2192 <span style="color:#F59E0B">\u2b24 Transformer</span> \u2192 '
         +'<span style="color:#EF4444">\u2b24 Switchgear/Panel</span> \u2192 then each <span style="color:#2563EB">\u2b24 charger stall</span>. '
@@ -60330,7 +60439,7 @@ function _dcfcGuideRender(){
   var phase=DCFC.phase||'poi';
   // Build the step list: POI, Trench, then components.
   var lines=[];
-  lines.push({ label:(DCFC.level2?'Existing Meter Bank':'Utility Service (POI)'), color:'#F59E0B', state: DCFC.placed.service?'done':(phase==='poi'?'active':'todo') });
+  lines.push({ label:(DCFC.level2?_l2Svc().node:'Utility Service (POI)'), color:'#F59E0B', state: DCFC.placed.service?'done':(phase==='poi'?'active':'todo') });
   lines.push({ label:'Main trench run', color:'#F5A623', state: DCFC.trenchConfirmed?'done':(phase==='trench'?'active':(DCFC.placed.service?'todo':'todo')) });
   var nodeLabels={ xfmr:'Transformer', panel:_dcfcNodeLabel('panel') };
   var nodeColors={ xfmr:'#F59E0B', panel:'#EF4444' };
@@ -60491,12 +60600,77 @@ function _dcfcCancel(){
 }
 window._dcfcCancel=_dcfcCancel;
 
+/* Describe what the chosen tie-in actually changes. The stock blurb walks
+   through service → transformer → switchgear → stalls, which stops being
+   true the moment somebody ties in halfway down it. */
+window._dcfcTieNote=function(){
+  var n=document.getElementById('dcfc-tie-note');
+  var v=(document.getElementById('dcfc-tie')||{}).value||'';
+  if(!n) return;
+  if(!v || !window.OmegaTieIn){
+    n.innerHTML='<span style="color:#F5A623;font-weight:700">Placement:</span> you\u2019ll click the map for each node in order \u2014 '
+      +'<span style="color:#F59E0B">\u2b24 Utility Service</span> \u2192 <span style="color:#F59E0B">\u2b24 Transformer</span> \u2192 '
+      +'<span style="color:#EF4444">\u2b24 Switchgear/Panel</span> \u2192 then each <span style="color:#2563EB">\u2b24 charger stall</span>. '
+      +'Conduit auto-routes through one shared trench.';
+    return;
+  }
+  var d=OmegaTieIn.describe(v, DCFC.seq||['service','xfmr','panel']);
+  n.innerHTML='<span style="color:#F5A623;font-weight:700">Tie-in:</span> '
+    + (d ? String(d.text).replace(/[<>]/g,'') : 'starts at the selected equipment.')
+    + ' The first run starts there \u2014 click along the route, then place each charger stall.';
+};
+
+/* _dcfcDraw is block-scoped to this script. Anything outside it that needs
+   to seed a run has to come through here. */
+window._dcfcSetDraw=function(v){ _dcfcDraw=v; };
+
 function _dcfcStartPlacing(){
   _dcfcSyncPorts();
   var m=document.getElementById('dcfc-modal'); if(m) m.remove();
   DCFC.active=true;
   DCFC.phase='poi'; DCFC.stepIx=0; DCFC.placed={}; DCFC.chargerEls=[]; DCFC.chargersLeft=DCFC.chargers;
   DCFC.trench=null; DCFC.trenchConfirmed=false; DCFC.lastEl=null;
+  DCFC.tieKind=null; DCFC.tieEl=null;
+
+  /* Tie into existing equipment, same as the Solar + Storage build. The
+     stages already on the drawing are dropped from the sequence and the
+     first run starts at the real piece instead of at a second service. */
+  try{
+    var _tv=window.__omegaTiePick || (document.getElementById('dcfc-tie')||{}).value||'';
+    window.__omegaTiePick='';
+    if(_tv && window.OmegaTieIn){
+      /* The CALLER'S sequence, not a hardcoded one. DCFC runs
+         service\u2192xfmr\u2192panel; Level 2 runs service\u2192panel with no transformer
+         at all. Hardcoding the DCFC list meant a Level 2 tie-in filtered
+         against stages that job does not have. */
+      var _baseSeq=(DCFC.seq&&DCFC.seq.length)?DCFC.seq.slice():['service','xfmr','panel'];
+      /* The DCFC sequence names its middle stages differently to the BGB
+         one; map through so a switchgear reads as a switchgear either way. */
+      var _r=OmegaTieIn.resolve(_tv, ['service','utilxfmr','mainswgr']);
+      if(_r){
+        var _map={ service:'service', utilxfmr:'xfmr', mainswgr:'panel' };
+        var _stop=_map[_r.stage]||'service';
+        /* Tying into a transformer on a job whose sequence has none (Level 2)
+           still means everything upstream of the panel is built — fall to the
+           nearest stage the sequence actually contains. */
+        if(_baseSeq.indexOf(_stop)<0){
+          if(_r.stage==='utilxfmr') _stop=(_baseSeq.indexOf('service')>=0)?'service':_baseSeq[0];
+          else _stop=_baseSeq[0];
+        }
+        var _keep=[], _hit=false;
+        _baseSeq.forEach(function(k){
+          if(!_hit){ if(k===_stop){ _hit=true; } return; }
+          _keep.push(k);
+        });
+        DCFC.seq=_keep;
+        DCFC.tieKind=_stop; DCFC.tieEl=_r.el;
+        DCFC.placed[_stop]=_r.el; DCFC.lastEl=_r.el;
+        OmegaTieIn.seed(DCFC, _r.el, _stop);
+        DCFC.phase='drawtrench';
+      }
+    }
+  }catch(e){}
+
   _dcfcGuidePos=null;   // fresh build opens in the default corner
   if(typeof setMode==='function') setMode('dcfcplace'); else S.mode='dcfcplace';
   _dcfcGuideRender();
@@ -60599,7 +60773,7 @@ function _evAdd(kind, cx, cy, label, spec, img, fp){
 try{ window._evAdd=_evAdd; window._evPx=_evPx; }catch(e){}
 
 function _dcfcPrompt(){
-  if(DCFC.phase==='poi'){ _evBanner('\u2b1c Click the map to place the '+(DCFC.level2?'Existing Meter Bank':'Utility Service (POI)')+'.'); }
+  if(DCFC.phase==='poi'){ _evBanner('\u2b1c Click the map to place the '+(DCFC.level2?_l2Svc().node:'Utility Service (POI)')+'.'); }
   else if(DCFC.phase==='trench'){ _evBanner('\u2b1c Suggested trench shown \u2014 drag the end handle to adjust, then click \u201cConfirm Trench\u201d.'); }
   else if(DCFC.phase==='place'){
     if(DCFC.stepIx < DCFC.seq.length){ var n=DCFC_NODES[DCFC.seq[DCFC.stepIx]]; _evBanner('\u2b1c Click along the trench to place '+n.label+'. It snaps to the trench \u2014 use F to flip side, R to rotate.'); }
@@ -60629,7 +60803,7 @@ function placeDcfcAt(p){
   if(DCFC.phase==='poi'){
     var d=_evPx('service');
     var poi=_evAdd('service', p.x, p.y,
-      DCFC.level2 ? 'Existing Meter Bank' : 'Utility Service (POI)',
+      DCFC.level2 ? _l2Svc().node : 'Utility Service (POI)',
       DCFC.level2 ? '240/120V 1\u00D8 3-wire \u2014 existing, verify available capacity'
                   : 'Existing service / point of interconnection');
     DCFC.placed.service=poi;
@@ -60854,6 +61028,51 @@ function _l2Sync(){
 }
 window._l2Sync=_l2Sync;
 
+/* ── LEVEL 2 SERVICE SCENARIO ─────────────────────────────────────────
+   A Level 2 job does not tie into a transformer or a switchgear lineup;
+   those are not on a multifamily or small-commercial site. The only
+   question actually asked is what happens at the METER, and there are
+   three answers.
+
+   The distinction is not cosmetic. It changes what the load check is
+   measured against and what the estimate has to carry:
+
+     existing   no utility work. The job lives inside the spare capacity of
+                what is there, so the check is against the EXISTING rating
+                and a shortfall is a stop.
+     upgrade    the service is being raised. The check is against the NEW
+                rating, and the estimate has to carry utility coordination
+                and the upgrade itself — usually the largest single line on
+                a Level 2 job and the one most often left out.
+     new        a separate service for the chargers. Own meter, own account,
+                and the building's existing load does not constrain sizing.
+
+   Seven places hardcoded "Existing Meter Bank" — the guide list, the
+   banner, the node label and the stencil caption, twice each because the
+   multi-run flow overrides the single-spine one. All of them now ask. */
+var L2_SERVICE = {
+  existing: { key:'existing', label:'Existing meter — tap the service that is there',
+              node:'Existing Meter Bank',
+              spec:'240/120V 1Ø 3-wire — existing, verify available capacity',
+              note:'No utility work. Everything has to fit in the spare capacity of the '
+                 + 'existing service — the load check is against its present rating, and if '
+                 + 'it does not fit, it does not fit.' },
+  upgrade:  { key:'upgrade',  label:'Upgraded meter — service is being raised',
+              node:'Upgraded Meter Bank',
+              spec:'Service upgrade — new rating, utility coordination required',
+              note:'The load check is against the NEW rating, not the old one. Carry the '
+                 + 'utility coordination and the service upgrade in the estimate — on a Level 2 '
+                 + 'job that is usually the largest single line and the one most often left out.' },
+  'new':    { key:'new',      label:'New meter — separate service for the chargers',
+              node:'New Meter Bank',
+              spec:'New service — dedicated EVSE meter and account',
+              note:'A dedicated service for the chargers. The building’s existing load does not '
+                 + 'constrain the sizing, and the chargers get their own account — which is what '
+                 + 'makes a separate EV rate possible.' }
+};
+function _l2Svc(){ return L2_SERVICE[DCFC.l2Service] || L2_SERVICE.existing; }
+window._l2Svc=_l2Svc;
+
 function openLevel2Build(){
   DCFC.active=true; DCFC.stepIx=0; DCFC.placed={}; DCFC.chargerEls=[];
   DCFC.level2=true; DCFC.siteType='multifamily';
@@ -60892,7 +61111,14 @@ function openLevel2Build(){
       +'</label>'
       +'<div style="font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:#8FA3B8;margin-bottom:6px">Load Check</div>'
       +'<div id="l2-summary" style="font-size:10px;color:#8FA3B8;background:rgba(34,211,238,.06);border:1px solid rgba(34,211,238,.22);border-radius:7px;padding:9px 11px;line-height:1.6;margin-bottom:14px"></div>'
-      +'<div style="font-size:9px;color:#8FA3B8;background:rgba(0,0,0,.2);border-radius:6px;padding:8px 10px;line-height:1.5;margin-bottom:14px">'
+      +'<div style="margin-bottom:12px">'
+        +'<label style="display:block;font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:#8FA3B8;margin-bottom:6px">Start from</label>'
+        +'<select id="l2-svc" onchange="_l2TieNote()" style="width:100%;padding:9px;background:#0A1628;border:1px solid rgba(255,255,255,.15);border-radius:6px;color:#E8F0FE;font-size:12px">'
+        + ['existing','upgrade','new'].map(function(k){
+            return '<option value="'+k+'"'+(DCFC.l2Service===k?' selected':'')+'>'+L2_SERVICE[k].label+'</option>';
+          }).join('')
+        +'</select></div>'
+      +'<div id="l2-tie-note" style="font-size:9px;color:#8FA3B8;background:rgba(0,0,0,.2);border-radius:6px;padding:8px 10px;line-height:1.5;margin-bottom:14px">'
         +'<span style="color:#22D3EE;font-weight:700">You\u2019ll place:</span> '
         +'<span style="color:#F59E0B">\u2b24 Existing Meter Bank</span> \u2192 draw the trench \u2192 '
         +'<span style="color:#EF4444">\u2b24 Outdoor Panel</span> \u2192 '
@@ -60922,6 +61148,19 @@ function _l2ModelChanged(){
 }
 window._l2ModelChanged=_l2ModelChanged;
 
+window._l2TieNote=function(){
+  var n=document.getElementById('l2-tie-note');
+  var sel=document.getElementById('l2-svc');
+  if(sel) DCFC.l2Service=sel.value;
+  if(!n) return;
+  var S2=_l2Svc();
+  n.innerHTML='<span style="color:#22D3EE;font-weight:700">You\u2019ll place:</span> '
+    +'<span style="color:#F59E0B">\u2b24 '+S2.node+'</span> \u2192 draw the trench \u2192 '
+    +'<span style="color:#EF4444">\u2b24 Outdoor Panel</span> \u2192 <span style="color:#22D3EE">\u2b24 EVSE</span>'
+    +'<br>'+S2.note
+    +'<br>Conduit auto-routes: interior feed in yellow, trenched branch in cyan.';
+};
+
 function _l2StartPlacing(){
   _l2Sync();
   DCFC.level2=true;
@@ -60934,6 +61173,13 @@ function _l2StartPlacing(){
     if(typeof _cdElevFt   !=='undefined' && !_cdElevFt) _cdElevFt = 10;
   }catch(e){}
   DCFC.seq=['service','panel'];      /* no transformer on a Level 2 job */
+  /* The L2 modal is torn down before the shared start runs, so the choice
+     has to survive the dialog. Stashed rather than re-read. */
+  try{
+    var _sv=(document.getElementById('l2-svc')||{}).value;
+    if(_sv) DCFC.l2Service=_sv;
+  }catch(e){}
+  window.__omegaTiePick='';
   var m=document.getElementById('l2-modal'); if(m) m.remove();
   _dcfcStartPlacing();               /* HUD, trench spine, stencils, conduit */
 }
@@ -60983,7 +61229,7 @@ var _DCFC_LEG_NAME = { xfmr:'Main trench (service\u2192xfmr)', panel:'Feeder tre
 function _dcfcNodeLabel(kind){
   if(DCFC.level2){
     if(kind==='panel')   return 'Outdoor Panel / Disconnect';
-    if(kind==='service') return 'Existing Meter Bank';
+    if(kind==='service') return _l2Svc().node;
   }
   var n=DCFC_NODES[kind];
   return (n&&n.label)||kind;
@@ -61067,13 +61313,81 @@ function _dcfcConduitAlongRun(el, run, snap, condType, label){
   if(!el||!run||!run.pts||run.pts.length<2) return null;
   var b=(typeof _elBox==='function')?_elBox(el):null;
   var cx=b?b.cx:el.x, cy=b?b.cy:el.y;
+
+  /* A drawn PV array is a POLYGON. _elBox falls back to pts[0] plus a
+     nominal box for a shape with no lf/wf, which puts the tie point at a
+     corner rather than in the array — and if the shape carries neither,
+     at NaN, which stamps a broken anchor and is the other half of the
+     jumping. Use the polygon's own centroid when there is one. */
+  try{
+    if((!isFinite(cx)||!isFinite(cy)) || (el.pts && el.pts.length>2)){
+      if(typeof _shapeCenter==='function'){
+        var _sc=_shapeCenter(el);
+        if(_sc && isFinite(_sc.x) && isFinite(_sc.y)){ cx=_sc.x; cy=_sc.y; }
+      }
+    }
+  }catch(e){}
+  if(!isFinite(cx)||!isFinite(cy)){
+    /* Never stamp an anchor on a non-number. Fall back to the snap point,
+       which is at least on the trench. */
+    cx=snap.x; cy=snap.y;
+  }
   var pts=[{x:cx,y:cy,elId:el.id},{x:snap.x,y:snap.y}];
   for(var i=snap.seg-1;i>=0;i--){ pts.push({x:run.pts[i].x,y:run.pts[i].y}); }
   var c={ id:uid(), condType:condType, pts:pts, pxLen:_polyLen(pts),
           ftLen:+(_polyLen(pts)/((typeof S!=='undefined'&&S.pxPerFt)||6)).toFixed(1),
           fromId:el.id, toId:null, route:'trench', trenchIn:run.in||'soil',
           evRun:run.id, evRole:condType, label:label||'', labelDx:50, labelDy:-28 };
+  /* BOND THE FAR END, AND ANCHOR IT NOW.
+
+     Every run the guided build created was pushed with toId:null and no
+     _geoPts. Two consequences, both of which look like the trench
+     wandering off its equipment:
+
+       toId:null    the far end is bonded to nothing, so the ENDPOINT WELD
+                    in _geoReprojectAll has no element to hold it to and
+                    leaves it wherever the last pixel put it.
+       no _geoPts   the run has no ground reference, so on the next pan or
+                    zoom it is reprojected from an anchor that does not
+                    exist — which is to say, not reprojected at all.
+
+     A run made during a build is exactly the one about to be zoomed, so
+     this is the worst place to leave either undone. The far end terminates
+     at the node this leg came FROM, which the sequence already knows. */
+  try{
+    var _par=null;
+    var _pre=(typeof BGB!=='undefined' && typeof BGB_PRESETS!=='undefined') ? BGB_PRESETS[BGB.mode] : null;
+    if(_pre && _pre.parents && el && el.bgbRole){
+      var _pk=_pre.parents[el.bgbRole];
+      var _pe=_pk && BGB.placed && BGB.placed[_pk];
+      if(_pe && _pe.id) _par=_pe.id;
+    }
+    if(_par){
+      c.toId=_par;
+      if(c.pts && c.pts.length) c.pts[c.pts.length-1].elId=_par;
+    }
+  }catch(e){}
+
   S.conduits.push(c);
+
+  /* Cut the ground anchor for CONDUITS only, and only when the map can
+     actually answer.
+
+     The first version fell back to _geoStampAll() when OmegaAnchorCond was
+     unavailable. That was a bad trade: _geoStampAll stamps SHAPES too, and
+     OmegaAnchorCond.stamp() returns 0 without doing anything whenever the
+     map is frozen — which is most of a build. So on a frozen map every
+     conduit creation fell through to re-anchoring every array on the
+     drawing, mid-build, from whatever pixel geometry existed at that
+     instant. The next reprojection then moved the arrays to those anchors
+     and they vanished off the sheet, and the trenches shifted with them.
+
+     A MISSING ANCHOR IS RECOVERABLE; A WRONG ONE IS NOT. The audit and the
+     post-build pass both re-cut anything unstamped a moment later, so
+     doing nothing here is strictly safer than guessing. */
+  try{
+    if(window.OmegaAnchorCond && typeof OmegaAnchorCond.stamp==='function') OmegaAnchorCond.stamp();
+  }catch(e){}
   if(typeof renderConduit==='function') renderConduit(c);
   if(typeof updCondStat==='function') updCondStat();
   return c;
@@ -61141,7 +61455,7 @@ placeDcfcAt=function(p){
   if(!DCFC.active){ S.mode='select'; return; }
   if(DCFC.phase==='poi'){
     var poi=_evAdd('service', p.x, p.y,
-      DCFC.level2 ? 'Existing Meter Bank' : 'Utility Service (POI)',
+      DCFC.level2 ? _l2Svc().node : 'Utility Service (POI)',
       DCFC.level2 ? '240/120V 1\u00D8 3-wire \u2014 existing, verify available capacity'
                   : 'Existing service / point of interconnection');
     DCFC.placed.service=poi;
@@ -61244,7 +61558,7 @@ _dcfcGuideRender=function(){
   var nodeLabels={ xfmr:'Transformer', panel:_dcfcNodeLabel('panel') };
 
   var lines=[];
-  lines.push({ label:(DCFC.level2?'Existing Meter Bank':'Utility Service (POI)'), color:'#F59E0B', state: DCFC.placed.service?'done':(phase==='poi'?'active':'todo') });
+  lines.push({ label:(DCFC.level2?_l2Svc().node:'Utility Service (POI)'), color:'#F59E0B', state: DCFC.placed.service?'done':(phase==='poi'?'active':'todo') });
   var placeSeq=DCFC.seq.filter(function(k){return k!=='service';});
   for(var i=0;i<placeSeq.length;i++){
     var k=placeSeq[i]; var placed=!!DCFC.placed[k];
@@ -61312,7 +61626,7 @@ _dcfcGuideRender=function(){
 window._dcfcGuideRender=_dcfcGuideRender;
 
 _dcfcPrompt=function(){
-  if(DCFC.phase==='poi'){ _evBanner('\u2b1c Click the map to place the '+(DCFC.level2?'Existing Meter Bank':'Utility Service (POI)')+'.'); }
+  if(DCFC.phase==='poi'){ _evBanner('\u2b1c Click the map to place the '+(DCFC.level2?_l2Svc().node:'Utility Service (POI)')+'.'); }
   else if(DCFC.phase==='drawtrench'){ var k=_dcfcCurKind(); var nm=(k==='xfmr'?'MAIN':k==='panel'?'FEEDER':'BRANCH'); _evBanner('\u270f\ufe0f Draw the '+nm+' trench: click points to route it, then Enter. Backspace undoes a point.'); }
   else if(DCFC.phase==='placeon'){ var k2=_dcfcCurKind();
     if(k2==='charger'){ _evBanner('\u2b1c Click on the branch trench to drop each charger ('+DCFC.chargersLeft+' left). Enter finishes.'); }
@@ -61483,13 +61797,68 @@ var BGB_LEGNAME = {
 
 function _bgbSeq(){
   var base=(BGB_PRESETS[BGB.mode]||BGB_PRESETS.BTM).seq.slice();
-  return base.filter(function(k){
+
+  /* Tying into equipment that is already on the drawing: everything from
+     the utility down TO AND INCLUDING that piece is already built, so it
+     is dropped from the sequence rather than drawn a second time. The
+     piece itself is seeded into BGB.placed, so the first remaining step
+     still finds its parent and runs a real conduit to it. */
+  var tie=BGB.tieKind||null;
+  var upTo = tie==='mainswgr' ? ['service','utilxfmr','mainswgr']
+           : tie==='utilxfmr' ? ['service','utilxfmr']
+           : null;
+
+  var seq=base.filter(function(k){
+    if(upTo && upTo.indexOf(k)>=0) return false;
     if(k==='xfmr'  && BGB.incXfmr)  return false;
     if(k==='disco' && BGB.incDisco) return false;
     return true;
   });
+
+  /* MORE THAN ONE PV SYSTEM.
+     A site often carries several arrays that cannot share an inverter — a
+     roof and a carport, or two fields either side of a road. Each needs its
+     own inverter next to its own array, and its own DC run between them;
+     only the AC leg back to the switchgear is common. So the inverter and
+     array steps repeat as a PAIR, which keeps each DC run short and local
+     rather than dragging one home run across the site.
+
+     The pair repeats in place so the order stays inverter, array, inverter,
+     array — walking the user around one system at a time instead of
+     placing every inverter and then hunting for which array each belongs
+     to. Same reasoning as the charger loop. */
+  var n=Math.max(1, +BGB.pvSystems || 1);
+  if(n>1 && seq.indexOf('pvinv')>=0 && seq.indexOf('pv')>=0){
+    var out=[], i;
+    for(i=0;i<seq.length;i++){
+      if(seq[i]==='pvinv' && seq[i+1]==='pv'){
+        for(var r=0;r<n;r++) out.push('pvinv','pv');
+        i++;                       /* the 'pv' is consumed by the loop */
+      } else out.push(seq[i]);
+    }
+    seq=out;
+  }
+  return seq;
 }
 function _bgbCurKind(){ var sq=_bgbSeq(); return BGB.stepIx<sq.length ? sq[BGB.stepIx] : null; }
+
+/* Which PV system the current step belongs to, counting the pvinv/pv pairs
+   ahead of it. With several systems on a site, "PV Inverter" three times
+   over is not a drawing anybody can read — and the estimate cannot tell
+   which array a run belongs to either. */
+function _bgbPvSysNo(ix){
+  try{
+    var sq=_bgbSeq(), n=0, i;
+    if((+BGB.pvSystems||1) < 2) return 0;
+    for(i=0;i<=Math.min(ix,sq.length-1);i++) if(sq[i]==='pvinv') n++;
+    return n;
+  }catch(e){ return 0; }
+}
+function _bgbPvSuffix(){
+  var n=_bgbPvSysNo(BGB.stepIx);
+  return n ? ' \u00b7 System '+n : '';
+}
+window._bgbPvSysNo=_bgbPvSysNo;
 function _bgbLegCond(kind){ return (BGB_PRESETS[BGB.mode]||BGB_PRESETS.BTM).legs[kind]||'EV-FEEDER'; }
 function _bgbLegColor(kind){ var c=_bgbLegCond(kind); return c==='EV-MAIN'?'#FF0000':c==='EV-FEEDER'?'#FFFF00':c==='EV-BRANCH'?'#00FFFF':c==='EMT-BMS'?'#2563EB':c==='MV-UG'?'#EF4444':'#00FF00'; }
 
@@ -61714,6 +62083,22 @@ function _bgbGuideRender(){
       +'<div style="flex-shrink:0;width:20px;height:20px;border-radius:50%;background:'+icBg+';color:'+icCol+';font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center">'+ic+'</div>'
       +'<div style="font-size:11px;font-weight:'+(active?'800':'600')+';color:'+txtCol+'">'+BGB_NODES[k].label+'</div></div>';
   }).join('');
+
+  /* Show what the build is tying INTO as a completed step. It is not in the
+     sequence — it is already built — but leaving it off made the panel look
+     as though the choice had been ignored, which is exactly what it looked
+     like from the user's side. */
+  try{
+    if(BGB.tieEl){
+      rows = '<div style="display:flex;align-items:center;gap:9px;padding:6px 0;opacity:.85">'
+        +'<div style="flex-shrink:0;width:20px;height:20px;border-radius:50%;background:#22C55E;'
+        +'color:#0A1628;font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center">\u2713</div>'
+        +'<div><div style="font-size:11px;font-weight:600;color:#8FA3B8">'
+        + String(BGB.tieEl.label||'Existing equipment').replace(/[<>&]/g,'') + '</div>'
+        +'<div style="font-size:9px;color:#64748B">already on the drawing \u2014 tying in here</div></div></div>'
+        + rows;
+    }
+  }catch(e){}
   var legName={ 'EV-MAIN':'MAIN','EV-FEEDER':'FEEDER','EV-BRANCH':'COLLECTION','EMT-BMS':'DATA' }[_bgbLegCond(kind||'xfmr')]||'RUN';
   var legCol=_bgbLegColor(kind||'xfmr');
   var hint='', actions='';
@@ -61790,6 +62175,59 @@ function _bgbStartPlacing(){
   _bgbSync();
   var m=document.getElementById('bgb-modal'); if(m) m.remove();
   BGB.active=true; BGB.phase='poi'; BGB.stepIx=0; BGB.placed={}; BGB.lastEl=null;
+
+  /* Seed the tie-in so the first drawn leg has something real to start
+     from. Without this the sequence would begin with a step whose parent
+     was never placed, and the run would start at nothing. */
+  BGB.pvSysIx=0;
+  BGB.tieKind=null; BGB.tieEl=null;
+  try{
+    var _tieId=window.__omegaTieFrom; window.__omegaTieFrom=null;
+    if(_tieId && typeof S!=='undefined' && S.elements){
+      var _te=S.elements.filter(function(e){ return e && e.id===_tieId; })[0];
+      if(_te){
+        var _id=(_te.eqId||_te.evKind||'');
+        BGB.tieKind = (/swgr|switchgear|panel/i.test(_id) || /switchgear|panelboard/i.test(_te.label||''))
+                      ? 'mainswgr' : 'utilxfmr';
+        BGB.tieEl=_te;
+        BGB.placed[BGB.tieKind]=_te;
+        BGB.lastEl=_te;
+
+        /* START BY DRAWING THE RUN, NOT BY PLACING THE NEXT BOX.
+
+           Phase 'poi' means "drop the first piece", and it draws no conduit
+           because on a greenfield build there is nothing yet to run from.
+           With a tie-in there IS: the transformer is already on the drawing.
+           Leaving the phase at 'poi' put the switchgear down with nothing
+           connecting it to the equipment it was supposed to tie into — the
+           build looked like it had ignored the choice.
+
+           Starting in 'drawtrench' with the run seeded at the existing
+           equipment's centre gives the same gesture as every other leg:
+           click along the route, and placing the next piece lays the
+           conduit behind you. */
+        BGB.phase='drawtrench';
+        BGB.stepIx=0;
+        BGB._activeRun=null;
+        try{
+          var _sz=(typeof _elRenderSize==='function') ? _elRenderSize(_te)
+                 : { w:(_te.w||60), h:(_te.h||_te.w||60) };
+          var _cx=(+_te.x||0)+_sz.w/2, _cy=(+_te.y||0)+_sz.h/2;
+          if(typeof _dcfcDraw!=='undefined'){
+            _dcfcDraw={ pts:[{x:_cx,y:_cy}], preview:null,
+                        leg:(typeof _bgbLegColor==='function') ? _bgbLegColor(_bgbCurKind()) : '#FFFF00' };
+          }
+        }catch(e){}
+        try{ if(typeof _dcfcRenderTrenches==='function') _dcfcRenderTrenches(); }catch(e){}
+
+        try{ if(typeof _evBanner==='function'){
+          _evBanner('\u26a1 Tying into '+(_te.label||'existing equipment')
+                    +'. The run starts there \u2014 click along the route, then place the '
+                    +(BGB.tieKind==='mainswgr'?'BESS AC block':'switchgear')+' at the end of it.');
+        } }catch(e){}
+      }
+    }
+  }catch(e){}
   BGB._surface='soil'; BGB._activeRun=null; BGB._lastEnd=null;
   BGB.seq=_bgbSeq().slice();
   if(typeof _dcfcDraw!=='undefined') _dcfcDraw=null;
@@ -61955,12 +62393,16 @@ function placeBgbAt(p){
       if(_arr && _arr.shape){
         var _sh=_arr.shape;
         _sh._bgbUsedAsPv=true; _sh.bgbRole='pv';
+        var _sysN=_bgbPvSysNo(BGB.stepIx);
+        if(_sysN){ _sh.bgbPvSys=_sysN;
+          if(_sh.label && !/System \d/.test(_sh.label)) _sh.label=_sh.label+' \u00b7 System '+_sysN; }
         BGB.placed[kind]=_sh; BGB.lastEl=_sh;
         /* run the conduit from the trench to the array's connection point */
         try{ _dcfcConduitAlongRun(_sh, run, snap, _bgbLegCond(kind), (BGB_LEGNAME[kind]||n.label)); }catch(e){}
         /* mark the connection visibly + tell the user it snapped */
         try{ if(typeof renderShape==='function') renderShape(_sh); }catch(e){}
-        if(typeof _evBanner==='function') _evBanner('\u2713 Connected to your drawn PV array \u2014 no duplicate placed.');
+        if(typeof _evBanner==='function') _evBanner('\u2713 Connected to your drawn PV array'
+          + (_sysN? ' (System '+_sysN+' of '+(+BGB.pvSystems||1)+')' : '') + ' \u2014 no duplicate placed.');
         if(typeof _reRenderEl==='function' && _sh.id) { try{ _reRenderEl(_sh.id); }catch(e){} }
         BGB.stepIx++;
         if(BGB.stepIx>=sq.length){ _bgbFinish(); if(typeof updateSummaryPanel==='function') updateSummaryPanel(); return; }
@@ -62064,6 +62506,14 @@ function placeBgbAt(p){
       el.loadPue  = (BGB.loadKind==='datacenter') ? BGB.loadPue : null;
       el.loadHours= _bgbLoadHours();
     }
+    /* Tag and name the PV pair by system before it is filed. */
+    try{
+      if(kind==='pvinv'||kind==='pv'){
+        var _sn=_bgbPvSysNo(BGB.stepIx);
+        if(_sn){ el.bgbPvSys=_sn;
+          if(el.label && !/System \d/.test(el.label)) el.label=el.label+' \u00b7 System '+_sn; }
+      }
+    }catch(e){}
     BGB.placed[kind]=el; BGB.lastEl=el;
     _dcfcConduitAlongRun(el, run, snap, _bgbLegCond(kind), (BGB_LEGNAME[kind]||n.label));
     /* Bollards are protection detail, not topology - off unless asked for. */
@@ -74732,7 +75182,70 @@ if (_omPrevOmegaSite) { Object.keys(_omPrevOmegaSite).forEach(function (k) {
           +'not yet selected \u2014 the capacity above carries through the design '
           +'and the layout does not change when a real unit is chosen.</div>'):'');
   }
+  /* The note has always described a build that starts at the utility POI.
+     When a tie-in is chosen that is no longer what happens, and a note
+     describing the wrong sequence is worse than none. */
+  function _sosNote(){
+    var n=document.getElementById('sos-note'); if(!n) return;
+    var v=(document.getElementById('sos-start')||{}).value||'';
+    if(!v){
+      n.textContent='Builds AC-coupled: the BESS AC block and the solar inverter each tap the '
+        + 'main switchgear and share the interconnection. Seven pieces, starting at the utility '
+        + 'POI. Leave solar at 0 for storage only.';
+      return;
+    }
+    var c=_sosTieCandidates().filter(function(x){ return x.id===v; })[0];
+    var isSwgr = c && c.kind==='mainswgr';
+    n.textContent='Ties into '+((c&&c.label)||'existing equipment')+'. The service'
+      + (isSwgr?', transformer and switchgear are':' and transformer are')
+      + ' already on the drawing, so they are not drawn again — the build starts at the '
+      + (isSwgr?'AC block':'switchgear')+' and the first run comes off the existing equipment. '
+      + 'Check its spare capacity carries the new load before you commit to it.';
+  }
+  window._sosNote=_sosNote;
+  var _specInner=spec;
+  spec=function(){ try{ _specInner(); }catch(e){} try{ _sosNote(); }catch(e){} };
   window._sosSpec=spec;
+
+  /* ── START FROM EXISTING SERVICE ──────────────────────────────────
+     The build has always begun at the utility POI and drawn its own
+     service and transformer. That is right for a greenfield tie-in and
+     wrong the moment a service already exists — which it usually does by
+     the time somebody adds storage. A DCFC build that has already set a
+     750 kVA pad-mount is the common case: the transformer is on the
+     drawing, it is sized, and the BESS should land on it rather than
+     beside a second one nobody is going to build.
+
+     Anything already placed that can be tied into is offered here. The
+     sequence then starts below it, and the first leg runs from the real
+     equipment. */
+  function _sosTieCandidates(){
+    var s=S_(); if(!s || !s.elements) return [];
+    var out=[];
+    s.elements.forEach(function(e){
+      if(!e) return;
+      var kind=null;
+      var id=(e.eqId||e.evKind||'');
+      if(/xfmr|transformer/i.test(id) || /transformer/i.test(e.label||'')) kind='utilxfmr';
+      else if(/swgr|switchgear|panel/i.test(id) || /switchgear|panelboard/i.test(e.label||'')) kind='mainswgr';
+      if(!kind) return;
+      out.push({ id:e.id, kind:kind,
+                 label:(e.label||(kind==='utilxfmr'?'Transformer':'Switchgear'))
+                       + (e.spec ? ' \u2014 '+String(e.spec).split('\n')[0] : '') });
+    });
+    return out;
+  }
+  window._sosTieCandidates=_sosTieCandidates;
+
+  function _sosStartOptions(){
+    var list=_sosTieCandidates();
+    var o='<option value="">Utility POI \u2014 draw a new service and transformer</option>';
+    list.forEach(function(c){
+      o+='<option value="'+c.id+'">Tie into: '+String(c.label).replace(/[<>&"]/g,'')+'</option>';
+    });
+    return o;
+  }
+  window._sosStartOptions=_sosStartOptions;
 
   window.closeSolarStorage=function(){
     var m=document.getElementById('sos-modal'); if(m) m.remove();
@@ -74754,6 +75267,11 @@ if (_omPrevOmegaSite) { Object.keys(_omPrevOmegaSite).forEach(function (k) {
       +       '<input id="sos-units" type="number" min="1" step="1" value="1" oninput="_sosSpec()"></div>'
       +     '<div><label for="sos-pv">Solar (kW-DC)</label>'
       +       '<input id="sos-pv" type="number" min="0" step="10" value="0" oninput="_sosSpec()"></div>'
+      +   '</div>'
+      +   '<div class="sos-two">'
+      +     '<div><label for="sos-pvsys">PV systems</label>'
+      +       '<input id="sos-pvsys" type="number" min="1" max="12" step="1" value="1" oninput="_sosSpec()"></div>'
+      +     '<div></div>'
       +   '</div>'
       +   '<div class="sos-two">'
       +     '<div><label for="sos-load">Building load (kW)</label>'
@@ -74780,8 +75298,10 @@ if (_omPrevOmegaSite) { Object.keys(_omPrevOmegaSite).forEach(function (k) {
       +     '<div><label for="sos-gen-kw">Power (kW)</label>'
       +       '<input id="sos-gen-kw" type="number" min="0" step="10" value="1000" oninput="_sosSpec()"></div>'
       +   '</div>'
+      +   '<label for="sos-start">Start from</label>'
+      +   '<select id="sos-start" onchange="_sosSpec()">'+_sosStartOptions()+'</select>'
       +   '<div id="sos-spec">Select a battery system.</div>'
-      +   '<div class="sos-note">Builds AC-coupled: the BESS AC block and the solar inverter '
+      +   '<div class="sos-note" id="sos-note">Builds AC-coupled: the BESS AC block and the solar inverter '
       +     'each tap the main switchgear and share the interconnection. Seven pieces, '
       +     'starting at the utility POI. Leave solar at 0 for storage only.</div>'
       + '</div>'
@@ -74790,6 +75310,37 @@ if (_omPrevOmegaSite) { Object.keys(_omPrevOmegaSite).forEach(function (k) {
       +   '<button class="go" onclick="startSolarStorage()">Start build \u2192</button>'
       + '</div></div>';
     document.body.appendChild(d);
+
+    /* DEFAULT THE SYSTEM COUNT TO THE ARRAYS ALREADY DRAWN.
+
+       The field defaulted to 1, so a site with two arrays on it got one
+       inverter and one claimed array — which reads as the build refusing
+       to place the second inverter, when in fact it was asked for one.
+
+       If somebody has drawn two arrays they want two systems; that is what
+       drawing two arrays means. Still editable, and still 1 when there is
+       nothing drawn. */
+    try{
+      var _s=S_();
+      var _n=0;
+      if(_s && _s.shapes){
+        _s.shapes.forEach(function(sh){
+          if(!sh) return;
+          if(sh.kind!=='solar' && sh.kind!=='dersolar') return;
+          if(sh._bgbUsedAsPv) return;      /* already claimed by an earlier build */
+          _n++;
+        });
+      }
+      if(_n>1){
+        var _f=document.getElementById('sos-pvsys');
+        if(_f){
+          _f.value=Math.min(12,_n);
+          var _lb=document.querySelector('label[for="sos-pvsys"]');
+          if(_lb) _lb.textContent='PV systems ('+_n+' arrays drawn)';
+        }
+      }
+    }catch(e){}
+
     spec();
     return true;
   };
@@ -74869,11 +75420,25 @@ if (_omPrevOmegaSite) { Object.keys(_omPrevOmegaSite).forEach(function (k) {
                        model:(m&&m.model)||'', mfr:(m&&m.mfr)||'',
                        kwh:num(m&&m.kwh)*units, kw:num(m&&m.kw)*units };
       }
+      /* Tie-in point, if one was chosen. Kept on BGB so _bgbSeq() can drop
+         the steps that already exist and _bgbStartPlacing can seed them. */
+      try{
+        var _tie=(document.getElementById('sos-start')||{}).value||'';
+        window.__omegaTieFrom = _tie || null;
+      }catch(e){ window.__omegaTieFrom=null; }
+
       /* survives _bgbLoadConfig(), which runs inside _bgbStartPlacing */
       window.__omegaForceMode='SOLAR_BESS';
       if(typeof BGB!=='undefined'){
         BGB.mode='SOLAR_BESS';
         BGB.model=k; BGB.units=units; BGB.pvKw=pv;
+        /* Separate roofs, separate carports, separate fields — each wants its
+           own inverter beside its own array, exactly as a charger bank wants
+           its own runs. One number, and the sequence repeats the pair. */
+        try{
+          var _ns=parseInt((document.getElementById('sos-pvsys')||{}).value,10)||1;
+          BGB.pvSystems=Math.max(1,Math.min(12,_ns));
+        }catch(e){ BGB.pvSystems=1; }
         /* Typed here, so the loads step does not ask again. Facility load is
            what the design is sized against; the IT figure and PUE are kept so
            a data-centre sheet can show how it was derived. */
@@ -130891,10 +131456,45 @@ var EQ_ARCH = {
   dc_leviathan:'bess-container'
 };
 
+/* THE GUIDED BUILDS DO NOT SET eqId.
+
+   classifyElement read el.eqId and nothing else. Everything the Insert
+   palette drops carries one, so authored equipment resolved fine — but
+   every piece a guided build places is type:'evgear' with evKind and
+   bgbRole instead, and no eqId at all. All of it therefore fell through
+   to 'jbox' and rendered as an anonymous grey box.
+
+   That is why a site built through Solar + Storage or the DCFC flow shows
+   a field of identical boxes and reports 0 STORAGE while the 2D legend
+   plainly lists a 1 MW / 2 MWh battery: the 3D view was not failing to
+   draw the BESS, it had never been told which one it was.
+
+   bgbRole is the build's own name for the piece and is the more specific
+   of the two, so it is read first. */
+var ROLE_ARCH = {
+  /* guided-build roles (BGB / DCFC) */
+  bess:'bess-cabinet', acblock:'bess-cabinet', pcs:'pcs', ems:'ems',
+  xfmr:'xfmr', utilxfmr:'xfmr', stepup:'xfmr',
+  mainswgr:'switchgear', swgr:'switchgear', panel:'panel', mainpanel:'panel',
+  disco:'disco', meter:'meter', service:'meter', poi:'meter',
+  pvinv:'pcs', inverter:'pcs', solarinv:'pcs',
+  charger:'charger', evse:'charger', dcfc:'charger',
+  loads:'building', datacenter:'building', datactr:'building',
+  genset:'genset', ups:'ups', jbox:'jbox'
+};
+
 function classifyElement(el){
   if(el._visArch && ARCH[el._visArch]) return { arch:el._visArch, why:'explicit' };
   var id = String(el.eqId||'');
   if(EQ_ARCH[id]) return { arch:EQ_ARCH[id], why:'authored' };
+
+  /* Guided-build pieces: role first, then the gear kind. */
+  var role = String(el.bgbRole||el.evRole||'').toLowerCase();
+  if(ROLE_ARCH[role]) return { arch:ROLE_ARCH[role], why:'authored' };
+  var ek = String(el.evKind||'').toLowerCase();
+  if(ROLE_ARCH[ek]) return { arch:ROLE_ARCH[ek], why:'authored' };
+  if(EQ_ARCH[ek]) return { arch:EQ_ARCH[ek], why:'authored' };
+
   if(el.type==='logo') return { arch:'ignore', why:'authored' };
   return { arch:'jbox', why:'inferred' };
 }
@@ -132332,31 +132932,171 @@ function buildCabinet(it, arch, mat){
   return g;
 }
 
-function buildXfmr(it, arch){
-  var g = buildCabinet(it, arch, MAT.xfmr);
-  /* HV/LV bushing hump on top — the pad-mount tell */
-  var w = Math.max(2, it.wf), h = arch.h;
-  var hump = box(w*0.5, 0.8, Math.max(1.2, it.lf*0.5), MAT.xfmr);
-  hump.position.y = 0.45 + h + 0.4; g.add(hump);
-  for(var i=0;i<3;i++){
-    var b = cyl(0.16,0.2,0.7,MAT.cabinet,8);
-    b.position.set(-w*0.18 + i*w*0.18, 0.45+h+1.05, 0); g.add(b);
+/* PAD-MOUNT TRANSFORMER.
+
+   A pad-mount is not a cube with a bump. What makes one recognisable from
+   fifty feet is the SPLIT FRONT: a tall, narrow cabinet on one end housing
+   the HV and LV compartments behind hinged doors, with the lower oil tank
+   running back from it, and cooling fins down both flanks. That silhouette
+   is what an engineer reads, so that is what gets built. */
+/* BESS ENCLOSURE.
+
+   Routed to buildCabinet, which is the generic box used for a junction box
+   and a meter as well — so a 2 MWh battery drew as the same object as a
+   disconnect, only larger. That is the whole reason the storage on this
+   site looked like nothing.
+
+   A modern AC block is a walk-in or bay-access enclosure, and it is read by
+   the row of BATTERY BAY DOORS down the long face, the THERMAL MANAGEMENT
+   units breaking the roofline, and the fact that it stands on a skid. All
+   three are cheap to draw and none of them appear on a junction box. */
+function buildBessCabinet(it, arch){
+  var g = new THREE.Group();
+  var w = Math.max(6, it.wf), d = Math.max(3, it.lf), h = arch.h;
+
+  var pad = box(w+2.4, 0.5, d+2.4, MAT.concrete); pad.position.y=0.25; g.add(pad);
+  /* Skid: the enclosure is set on rails, not poured onto the slab. */
+  [-1,1].forEach(function(s){
+    var rail = box(w*0.96, 0.3, 0.45, MAT.darkSteel);
+    rail.position.set(0, 0.5+0.15, s*(d*0.34)); g.add(rail);
+  });
+  var y0 = 0.5+0.3;
+
+  var body = box(w, h, d, MAT.container);
+  body.position.y = y0 + h/2; g.add(body);
+
+  /* Battery bay doors down the long face — the identifying feature. */
+  var bays = Math.max(3, Math.round(w/3.4));
+  var bw = w/bays;
+  for(var i=0;i<bays;i++){
+    var cx = -w/2 + bw*(i+0.5);
+    var door = box(bw*0.84, h*0.74, 0.07, MAT.containerTop);
+    door.position.set(cx, y0+h*0.44, d/2+0.04); g.add(door);
+    var hn = box(0.09, 0.45, 0.11, MAT.galv);
+    hn.position.set(cx + bw*0.34, y0+h*0.46, d/2+0.10); g.add(hn);
+    /* Vent grille low on each bay. */
+    var vg = box(bw*0.46, 0.22, 0.05, MAT.darkSteel);
+    vg.position.set(cx, y0+h*0.14, d/2+0.07); g.add(vg);
   }
+
+  /* Thermal management: the units on the roof are what stop this reading
+     as a shipping crate, and every AC block has them. */
+  var hvN = Math.max(2, Math.round(w/6));
+  for(var k=0;k<hvN;k++){
+    var hx = -w/2 + (w/hvN)*(k+0.5);
+    var hvac = box(Math.min(2.6, w/hvN*0.62), 0.85, d*0.5, MAT.gear);
+    hvac.position.set(hx, y0+h+0.42, 0); g.add(hvac);
+    var fan = cyl(0.42,0.42,0.12, MAT.darkSteel, 12);
+    fan.position.set(hx, y0+h+0.88, 0); g.add(fan);
+  }
+  /* Roof lip and a cable-entry hood on the end. */
+  var lip = box(w+0.2, 0.16, d+0.2, MAT.containerTop);
+  lip.position.y = y0+h+0.08; g.add(lip);
+  var hood = box(w*0.16, h*0.34, 0.5, MAT.darkSteel);
+  hood.position.set(w/2 - w*0.10, y0+h*0.30, -d/2-0.22); g.add(hood);
+
   return g;
 }
 
+function buildXfmr(it, arch){
+  var g = new THREE.Group();
+  var w = Math.max(4, it.wf), d = Math.max(3, it.lf), h = arch.h;
+
+  /* Concrete pad with the cable-entry well the conduits actually land in. */
+  var pad = box(w+2.2, 0.5, d+2.2, MAT.concrete); pad.position.y=0.25; g.add(pad);
+  var well = box(w*0.42, 0.12, d*0.42, MAT.darkSteel);
+  well.position.set(-w*0.18, 0.51, 0); g.add(well);
+
+  /* Oil tank: the low body, two thirds of the footprint, slightly inset. */
+  var tankH = h*0.72, tankW = w*0.62;
+  var tank = box(tankW, tankH, d*0.94, MAT.xfmr);
+  tank.position.set(w/2 - tankW/2, 0.5 + tankH/2, 0); g.add(tank);
+  /* Sloped tank lid so rain sheds — and so it does not read as a crate. */
+  var lid = box(tankW+0.2, 0.16, d*0.96, MAT.xfmr);
+  lid.position.set(w/2 - tankW/2, 0.5 + tankH + 0.08, 0);
+  lid.rotation.z = -0.035; g.add(lid);
+
+  /* Cooling fins down both flanks — the single most identifying feature. */
+  var finN = Math.max(4, Math.round(tankW/1.1));
+  for(var f=0; f<finN; f++){
+    var fx = (w/2 - tankW) + (tankW/finN)*(f+0.5);
+    ['+','-'].forEach(function(side){
+      var fin = box(tankW/finN*0.55, tankH*0.66, 0.34, MAT.xfmr);
+      fin.position.set(fx, 0.5 + tankH*0.44, (side==='+'? 1:-1) * (d*0.47 + 0.17));
+      g.add(fin);
+    });
+  }
+
+  /* HV / LV cabinet: the tall front end, taller than the tank, with the
+     vertical seam between the two compartments. */
+  var cabW = w*0.38, cabH = h*1.02;
+  var cab = box(cabW, cabH, d*0.98, MAT.xfmr);
+  cab.position.set(-w/2 + cabW/2, 0.5 + cabH/2, 0); g.add(cab);
+  var hood = box(cabW+0.3, 0.22, d*1.02, MAT.darkSteel);
+  hood.position.set(-w/2 + cabW/2, 0.5 + cabH + 0.11, 0); g.add(hood);
+  /* Door split + handles, so the front reads as a door and not a face. */
+  var split = box(0.07, cabH*0.86, 0.09, MAT.darkSteel);
+  split.position.set(-w/2 + cabW/2, 0.5 + cabH/2, d*0.49 + 0.05); g.add(split);
+  [-1,1].forEach(function(s){
+    var hn = box(0.10, 0.5, 0.10, MAT.galv);
+    hn.position.set(-w/2 + cabW/2 + s*cabW*0.22, 0.5 + cabH*0.52, d*0.49+0.09);
+    g.add(hn);
+  });
+  /* Warning placard — small, but it is the thing on every one of these. */
+  var plc = box(cabW*0.4, 0.34, 0.05, MAT.yellow);
+  plc.position.set(-w/2 + cabW/2, 0.5 + cabH*0.78, d*0.49+0.07); g.add(plc);
+
+  return g;
+}
+
+/* SWITCHGEAR LINEUP.
+
+   Read from a distance by three things: it is a ROW of equal vertical
+   sections, each section has a full-height door with a handle, and the
+   whole run carries a continuous top hat and a base channel it stands on.
+   The old version was a row of plain boxes with one vent each, which is
+   the same silhouette as a row of anything. */
 function buildSwitchgear(it, arch){
   var g = new THREE.Group();
   var w = Math.max(6, it.wf), d = Math.max(3, it.lf), h = arch.h;
+
   var pad = box(w+2.5, 0.55, d+2.5, MAT.concrete); pad.position.y=0.27; g.add(pad);
-  var secs = Math.max(2, Math.round(w/6));
+  /* Base channel: the lineup sits proud of the pad, it is not poured in. */
+  var base = box(w+0.2, 0.35, d+0.2, MAT.darkSteel);
+  base.position.y = 0.55+0.17; g.add(base);
+  var y0 = 0.55+0.35;
+
+  var secs = Math.max(2, Math.round(w/3.2));
+  var sw = w/secs;
   for(var i=0;i<secs;i++){
-    var sw = w/secs;
-    var s = box(sw*0.96, h, d, MAT.gear);
-    s.position.set(-w/2 + sw*(i+0.5), 0.55+h/2, 0); g.add(s);
-    var v = box(sw*0.5, 0.5, 0.08, MAT.darkSteel);
-    v.position.set(-w/2 + sw*(i+0.5), 0.55+h*0.72, d/2+0.05); g.add(v);
+    var cx = -w/2 + sw*(i+0.5);
+    var s = box(sw*0.985, h, d, MAT.gear);
+    s.position.set(cx, y0+h/2, 0); g.add(s);
+
+    /* Door: inset panel with a seam all round, so the section reads as a
+       cubicle you could open rather than a solid block. */
+    var door = box(sw*0.82, h*0.80, 0.06, MAT.darkSteel);
+    door.position.set(cx, y0+h*0.46, d/2+0.035); g.add(door);
+    var hnd = box(0.10, 0.55, 0.12, MAT.galv);
+    hnd.position.set(cx + sw*0.33, y0+h*0.50, d/2+0.10); g.add(hnd);
+
+    /* Louvred vent band near the top of each section. */
+    for(var v=0; v<3; v++){
+      var lv = box(sw*0.5, 0.07, 0.05, MAT.darkSteel);
+      lv.position.set(cx, y0+h*0.80 + v*0.13, d/2+0.07); g.add(lv);
+    }
+    /* Section divider between cubicles. */
+    if(i<secs-1){
+      var dv = box(0.07, h, d*1.01, MAT.darkSteel);
+      dv.position.set(-w/2 + sw*(i+1), y0+h/2, 0); g.add(dv);
+    }
   }
+
+  /* Continuous top hat across the whole lineup. */
+  var hat = box(w+0.3, 0.4, d+0.3, MAT.gear);
+  hat.position.y = y0+h+0.2; g.add(hat);
+  var lip = box(w+0.45, 0.1, d+0.45, MAT.darkSteel);
+  lip.position.y = y0+h+0.42; g.add(lip);
   return g;
 }
 
@@ -132829,7 +133569,7 @@ function populate(site){
         it._impliedRoof = ru.implied;
         g = buildSolarRoof(it, arch, ru.y, ru.implied); break;
       case 'bess-container': g = buildContainer(it, arch); break;
-      case 'bess-cabinet':   g = buildCabinet(it, arch); break;
+      case 'bess-cabinet':   g = buildBessCabinet(it, arch); break;
       case 'pcs':            g = buildCabinet(it, arch); break;
       case 'ems':            g = buildCabinet(it, arch); break;
       case 'ups':            g = buildCabinet(it, arch); break;
@@ -140187,6 +140927,192 @@ root.OmegaContextBuildings = {
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
 
+<script id="omega-tiein-js">
+/* ══════════════════════════════════════════════════════════════════════════
+ *  TIE INTO WHAT IS ALREADY THERE  —  shared by every guided build
+ *
+ *  Solar + Storage learned to start from existing equipment instead of
+ *  always drawing its own service. That is not a solar problem: by the
+ *  time anybody runs a SECOND build on a site, the service exists. A DCFC
+ *  bank added to a site that already has a 4000 kVA pad-mount should hang
+ *  off that pad-mount, not stand up a parallel one nobody will build.
+ *
+ *  So the picker lives here once rather than being copied into each
+ *  dialog. Copies drift: the day somebody teaches one of them about a new
+ *  kind of tie point, the others quietly keep guessing.
+ *
+ *  ── WHAT COUNTS AS A TIE POINT ──────────────────────────────────────
+ *
+ *  Anything that can carry the new load and has a downstream side: a
+ *  service or POI, a transformer, a switchgear lineup or panel. Chargers,
+ *  bollards and arrays are not tie points \u2014 they are the things being fed.
+ *
+ *  Each candidate reports WHICH STAGE it represents, so the build can drop
+ *  the steps that already exist rather than asking the user to work out
+ *  which ones to skip.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+'use strict';
+
+/* stage keys are the build sequences' own names, so a caller can filter
+   its sequence directly against them. */
+var PATTERNS = [
+  { stage:'service',  re:/\b(service|poi|utility)\b/i,          eq:/^(service|poi|meter)$/i,  label:'Service / POI' },
+  { stage:'utilxfmr', re:/transformer|xfmr|pad[- ]?mount/i,     eq:/^(xfmr|transformer)$/i,   label:'Transformer' },
+  { stage:'mainswgr', re:/switchgear|swgr|panelboard|main panel/i, eq:/^(panel|swgr|switchgear)$/i, label:'Switchgear / Panel' }
+];
+
+function stageOf(el){
+  if (!el) return null;
+  var id  = String(el.eqId || el.evKind || '');
+  var role= String(el.bgbRole || el.evRole || '');
+  var lab = String(el.label || '');
+  for (var i = 0; i < PATTERNS.length; i++) {
+    var P = PATTERNS[i];
+    /* Role first \u2014 it is the build's own word for the piece and cannot be
+       confused by a label somebody retyped. */
+    if (role && (role === P.stage || P.re.test(role))) return P;
+    if (id && (P.eq.test(id) || P.re.test(id))) return P;
+    if (lab && P.re.test(lab)) return P;
+  }
+  return null;
+}
+
+/* Everything on the drawing worth offering, nearest-to-most-downstream. */
+function candidates(){
+  var out = [];
+  try {
+    (S.elements || []).forEach(function (e) {
+      if (!e || e.hidden) return;
+      var P = stageOf(e);
+      if (!P) return;
+      out.push({
+        id: e.id, stage: P.stage, kind: P.label, el: e,
+        label: (e.label || P.label) +
+               (e.spec ? ' \u2014 ' + String(e.spec).split('\n')[0] : '')
+      });
+    });
+  } catch (e) {}
+  /* Service, then transformer, then switchgear \u2014 the order they occur in
+     a one-line, so the list reads the way the system does. */
+  /* Service, then transformer, then switchgear — the order they occur in a
+     one-line, so the list reads the way the system does. Index carried as a
+     tiebreak so equal stages keep drawing order rather than relying on the
+     engine's sort being stable. */
+  var order = { service:0, utilxfmr:1, mainswgr:2 };
+  out.forEach(function (c, i) { c._i = i; });
+  out.sort(function (a, b) {
+    var d = (order[a.stage] == null ? 9 : order[a.stage]) -
+            (order[b.stage] == null ? 9 : order[b.stage]);
+    return d !== 0 ? d : a._i - b._i;
+  });
+  out.forEach(function (c) { delete c._i; });
+  return out;
+}
+
+function optionsHtml(placeholder){
+  var o = '<option value="">' + (placeholder || 'Utility POI \u2014 draw a new service') + '</option>';
+  candidates().forEach(function (c) {
+    o += '<option value="' + c.id + '">Tie into: ' +
+         String(c.label).replace(/[<>&"]/g, '') + '</option>';
+  });
+  return o;
+}
+
+/* A one-line description of what choosing this does, for the dialog note. */
+function describe(id, seq){
+  if (!id) return null;
+  var c = candidates().filter(function (x) { return x.id === id; })[0];
+  if (!c) return null;
+  var skipped = [], hit = false;
+  (seq || []).forEach(function (k) {
+    if (hit) return;
+    skipped.push(k);
+    if (k === c.stage) hit = true;
+  });
+  /* Say it in the words on the drawing, not the sequence's internal keys.
+     "The service, utilxfmr, mainswgr are already on the drawing" is a
+     sentence written for the code, not for the person reading it. */
+  var NAMES = { service:'service', poi:'service', utilxfmr:'transformer',
+                xfmr:'transformer', mainswgr:'switchgear', panel:'switchgear' };
+  var words = skipped.map(function (k) { return NAMES[k] || k; })
+                     .filter(function (v, i, a) { return a.indexOf(v) === i; });
+  var list = words.length <= 1 ? words[0]
+           : words.slice(0, -1).join(', ') + ' and ' + words[words.length - 1];
+
+  return {
+    cand: c,
+    skipped: skipped,
+    text: 'Ties into ' + c.label + '. ' +
+          (words.length
+            ? 'The ' + list + ' ' + (words.length === 1 ? 'is' : 'are') +
+              ' already on the drawing, so ' + (words.length === 1 ? 'it is' : 'they are') +
+              ' not drawn again \u2014 the first run starts at the existing equipment. '
+            : '') +
+          'Check its spare capacity carries the new load before you commit to it.'
+  };
+}
+
+/* Everything a build needs to begin AT an existing piece:
+   the element, the stage it occupies, and the steps to drop. */
+function resolve(id, seq){
+  if (!id) return null;
+  var c = candidates().filter(function (x) { return x.id === id; })[0];
+  if (!c) return null;
+  var drop = [], hit = false;
+  (seq || []).forEach(function (k) {
+    if (hit) return;
+    drop.push(k);
+    if (k === c.stage) hit = true;
+  });
+  return { el: c.el, stage: c.stage, drop: drop, label: c.label };
+}
+
+/* Seed a build's state so its first leg runs FROM the existing equipment.
+   Takes the build object (BGB, DCFC, \u2026) because they all keep the same
+   three things under the same names. */
+function seed(BUILD, el, stage){
+  if (!BUILD || !el) return false;
+  BUILD.tieKind = stage;
+  BUILD.tieEl = el;
+  BUILD.placed = BUILD.placed || {};
+  BUILD.placed[stage] = el;
+  BUILD.lastEl = el;
+  BUILD.phase = 'drawtrench';
+  BUILD.stepIx = 0;
+  BUILD._activeRun = null;
+  /* Seed the run at the equipment's centre.
+
+     _dcfcDraw is declared with `var` inside the build's own script block,
+     so assigning it from this module created a NEW global and left the real
+     one untouched — the run silently started nowhere. It has to be set
+     through the setter the build exposes, or on window where the build
+     actually reads it. */
+  try {
+    var sz = (typeof _elRenderSize === 'function')
+             ? _elRenderSize(el) : { w:(el.w||60), h:(el.h||el.w||60) };
+    var cx = (+el.x||0) + sz.w/2, cy = (+el.y||0) + sz.h/2;
+    var run = { pts:[{ x:cx, y:cy }], preview:null, leg:'#FFFF00' };
+    root._omegaSeedRun = { x:cx, y:cy };
+    if (typeof root._dcfcSetDraw === 'function') root._dcfcSetDraw(run);
+    else root._dcfcDraw = run;
+    try { if (typeof root._dcfcRenderTrenches === 'function') root._dcfcRenderTrenches(); } catch (e) {}
+  } catch (e) {}
+  return true;
+}
+
+root.OmegaTieIn = {
+  candidates: candidates, optionsHtml: optionsHtml,
+  describe: describe, resolve: resolve, seed: seed, stageOf: stageOf
+};
+
+if (root.console && console.info) {
+  console.info('[tie-in] shared picker ready \u2014 OmegaTieIn.candidates()');
+}
+
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
 <script id="omega-ev-future-js">
 /* ══════════════════════════════════════════════════════════════════════════
  *  FUTURE-PROOFED EV STALLS
@@ -141868,12 +142794,23 @@ function unbind(padId){
   return true;
 }
 
-/* Recompute one bound pad from its charger. */
-function apply(p){
+/* A signature of everything about the charger that the pad depends on.
+   Cheap to compute, and it is what makes the sync loop free when nothing
+   has moved — which is almost always. */
+function srcSig(el, clearFt, s){
+  return [el.x, el.y, el.w, el.h, el.rot || 0, clearFt, s].join(',');
+}
+
+/* Recompute one bound pad from its charger. Returns true only if it
+   actually CHANGED, so the caller can skip the redraw. */
+function apply(p, force){
   if (!p || !p.bindTo) return false;
   var el = (S.elements || []).find(function (e) { return e.id === p.bindTo; });
   if (!el) { delete p.bindTo; return false; }   /* charger deleted: release it */
   var s = ppf();
+  var sig = srcSig(el, p.bindClearFt, s);
+  if (!force && p._srcSig === sig) return false;   /* nothing moved */
+  p._srcSig = sig;
   var u = elCenter(el);
   var g = (p.bindClearFt != null ? +p.bindClearFt : 2.5) * s;
 
@@ -141900,14 +142837,36 @@ function apply(p){
 
 /* Recompute every bound pad. Cheap, and the only way to be sure a move
    that happened through a path we do not know about is still honoured. */
-function applyAll(){
-  var n = 0;
-  pads().forEach(function (p) { if (p.bindTo && apply(p)) n++; });
-  if (n) {
-    try { if (typeof renderShape === 'function') pads().forEach(function (p) { if (p.bindTo) renderShape(p); }); } catch (e) {}
-    try { if (typeof _geoStampAll === 'function') _geoStampAll(); } catch (e) {}
+/* commit=true means the gesture has finished: that is when the ground
+   anchor is worth re-cutting.
+
+   The first version called _geoStampAll() on every pass — which walks
+   every element, every shape and every conduit on the site — and it ran on
+   a 40 ms debounce during drags and again every three seconds. That is the
+   lag: the work was proportional to the whole drawing, repeated constantly,
+   to move one rectangle. Now only the pads that actually changed are
+   redrawn, and only at the end of a gesture is anything re-anchored. */
+function applyAll(commit){
+  var changed = [];
+  pads().forEach(function (p) { if (p.bindTo && apply(p)) changed.push(p); });
+  if (!changed.length) return 0;
+  try {
+    if (typeof renderShape === 'function') changed.forEach(function (p) { renderShape(p); });
+  } catch (e) {}
+  if (commit) {
+    /* Stamp just these pads rather than the whole site. */
+    try {
+      if (typeof _geoStampShape === 'function' && typeof _liveMapState === 'function') {
+        var ms = _liveMapState();
+        if (ms && typeof _pxToLatLng === 'function' && typeof _getCanvasSize === 'function') {
+          var sz = _getCanvasSize();
+          var toGeo = function (x, y) { return _pxToLatLng(x, y, ms, sz.w, sz.h); };
+          changed.forEach(function (p) { _geoStampShape(p, toGeo, true); });
+        }
+      }
+    } catch (e) {}
   }
-  return n;
+  return changed.length;
 }
 
 /* ── auto-bind ───────────────────────────────────────────────────────
@@ -141982,18 +142941,36 @@ root.OmegaPadBind = {
     if (got >= 2) clearInterval(iv);
   }, 400);
 
-  /* A drag fires hundreds of these; coalesce to one pass per frame. */
-  var q = null;
+  /* One pass per animation frame, not one per event. A drag fires hundreds
+     of these and a 40 ms timer both lagged behind the cursor and fired more
+     often than the screen refreshes. */
+  var q = 0;
   function schedule(){
     if (q) return;
-    q = setTimeout(function(){ q = null; applyAll(); }, 40);
+    q = (root.requestAnimationFrame || function (f) { return setTimeout(f, 16); })(function(){
+      q = 0; applyAll(false);
+    });
   }
 
-  /* Mouse-up covers drags that move the wrapper directly without going
-     through a render call. */
+  /* Track the pointer while a drag is in progress so the pad moves WITH the
+     charger instead of catching up when something else happens to trigger a
+     render. This is why it appeared to need a zoom out and back: nothing was
+     redrawing it in between. */
+  var dragging = false;
   try {
-    document.addEventListener('mouseup', function(){ setTimeout(applyAll, 60); }, true);
-    document.addEventListener('touchend', function(){ setTimeout(applyAll, 60); }, true);
+    document.addEventListener('mousedown', function(){ dragging = true; }, true);
+    document.addEventListener('mousemove', function(){ if (dragging) schedule(); }, true);
+    document.addEventListener('mouseup', function(){
+      dragging = false;
+      schedule();
+      setTimeout(function(){ applyAll(true); }, 50);   /* commit: re-anchor */
+    }, true);
+    document.addEventListener('touchstart', function(){ dragging = true; }, true);
+    document.addEventListener('touchmove', function(){ if (dragging) schedule(); }, true);
+    document.addEventListener('touchend', function(){
+      dragging = false;
+      setTimeout(function(){ applyAll(true); }, 50);
+    }, true);
   } catch (e) {}
 })();
 
@@ -142020,7 +142997,9 @@ root.OmegaPadBind = {
         console.info('[pad] linked ' + got.length + ' BESS pad' + (got.length === 1 ? '' : 's') +
                      ' to the charger standing on ' + (got.length === 1 ? 'it' : 'them'));
       }
-      applyAll();
+      /* Costs nothing when nothing moved — the signature check short-circuits
+         before any geometry is touched. */
+      applyAll(true);
     } catch (e) {}
   }
   setTimeout(tick, 2500);
@@ -142031,6 +143010,146 @@ if (root.console && console.info) {
   console.info('[pad] BESS pads follow the charger they sit under — ' +
                'OMEGA_PAD_AUTOBIND=false to disable, or untick per charger');
 }
+
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script id="omega-plotplan-pptx-js">
+/* ══════════════════════════════════════════════════════════════════════════
+ *  PLOT PLAN → POWERPOINT
+ *
+ *  The sheet set already renders to SVG and then to PDF. PDF is right for
+ *  a permit submittal and wrong for the meeting where somebody wants to
+ *  talk over the site plan, drop it into a client deck, or annotate a
+ *  sheet on a call.
+ *
+ *  Same sheets, same renderers, same numbers — only the container changes.
+ *  Nothing here re-derives geometry, so a PPTX and a PDF exported a second
+ *  apart cannot disagree.
+ *
+ *  ── WHY THE SHEETS ARE RASTERISED ──────────────────────────────────
+ *
+ *  Each sheet becomes a full-bleed PNG at 200 DPI rather than embedded
+ *  vector. PowerPoint has no SVG import that survives a round trip
+ *  through Keynote and Google Slides, and this deck is going to be opened
+ *  in all three. A sheet that renders everywhere beats a sheet that stays
+ *  vector in one application and disappears in the other two — the same
+ *  reasoning that fixed the blank charts in the DER deck.
+ *
+ *  Sheet size drives the slide size, so a D-size sheet gets a 34x22
+ *  slide rather than being squeezed onto 16:9 and becoming unreadable.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+'use strict';
+
+/* Rasterise one SVG string to a PNG data URL at print resolution. */
+function svgToPng(svg, dpi, cb){
+  try {
+    var wIn = 34, hIn = 22;
+    var vb = /viewBox\s*=\s*["']([\d.\-\s]+)["']/i.exec(svg);
+    var wA = /\swidth\s*=\s*["']([\d.]+)/i.exec(svg);
+    var hA = /\sheight\s*=\s*["']([\d.]+)/i.exec(svg);
+    if (vb) {
+      var p = vb[1].trim().split(/\s+/).map(Number);
+      if (p.length === 4 && p[2] > 0 && p[3] > 0) { wIn = p[2]; hIn = p[3]; }
+    } else if (wA && hA) { wIn = +wA[1]; hIn = +hA[1]; }
+
+    /* The sheet renderers work in points at 72/in; a D sheet comes out
+       2448 x 1584. Treat those units as the aspect source and scale to
+       the requested DPI. */
+    var aspect = wIn / hIn;
+    var pxW = Math.min(4400, Math.round((wIn / 72) * dpi));
+    var pxH = Math.round(pxW / aspect);
+
+    var blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    var done = false;
+    var to = setTimeout(function(){ if (!done) { done = true; URL.revokeObjectURL(url); cb(null); } }, 15000);
+    img.onload = function(){
+      if (done) return; done = true; clearTimeout(to);
+      try {
+        var cv = document.createElement('canvas');
+        cv.width = pxW; cv.height = pxH;
+        var g = cv.getContext('2d');
+        /* White, not transparent: a permit sheet on a dark slide theme with
+           black linework is unreadable, and these are line drawings. */
+        g.fillStyle = '#ffffff'; g.fillRect(0, 0, pxW, pxH);
+        g.drawImage(img, 0, 0, pxW, pxH);
+        URL.revokeObjectURL(url);
+        cb({ data: cv.toDataURL('image/png'), w: pxW, h: pxH, aspect: aspect });
+      } catch (e) { URL.revokeObjectURL(url); cb(null); }
+    };
+    img.onerror = function(){
+      if (done) return; done = true; clearTimeout(to);
+      URL.revokeObjectURL(url); cb(null);
+    };
+    img.src = url;
+  } catch (e) { cb(null); }
+}
+
+/* Rasterise a list in sequence. Parallel decoding of a dozen D-size sheets
+   is a reliable way to run a browser tab out of memory. */
+function rasterise(sheets, dpi, onProgress, cb){
+  var out = [], i = 0;
+  (function next(){
+    if (i >= sheets.length) return cb(out);
+    var s = sheets[i];
+    if (onProgress) onProgress(i + 1, sheets.length, s.no);
+    svgToPng(s.svg, dpi, function (png) {
+      if (png) out.push({ no: s.no, png: png });
+      i++;
+      /* Yield so the progress text can paint between sheets. */
+      setTimeout(next, 0);
+    });
+  })();
+}
+
+function build(sheets, opts, cb){
+  opts = opts || {};
+  var PptxGenJS = root.PptxGenJS;
+  if (!PptxGenJS) { cb(null, 'The PowerPoint library did not load \u2014 it comes from a CDN, so this needs a network connection.'); return; }
+  if (!sheets || !sheets.length) { cb(null, 'No sheets were rendered.'); return; }
+
+  rasterise(sheets, opts.dpi || 200, opts.onProgress, function (imgs) {
+    if (!imgs.length) { cb(null, 'The sheets could not be rasterised.'); return; }
+    try {
+      var pptx = new PptxGenJS();
+      /* Slide matches the sheet, so the drawing is not squeezed into 16:9.
+         Capped at PowerPoint's 56 in limit. */
+      var a = imgs[0].png.aspect || (34 / 22);
+      var sw = Math.min(56, opts.slideWidthIn || 34);
+      var sh = +(sw / a).toFixed(2);
+      pptx.defineLayout({ name: 'SHEET', width: sw, height: sh });
+      pptx.layout = 'SHEET';
+      pptx.author = 'ClearSky OMEGA';
+      pptx.title = opts.title || 'Plot plan';
+
+      imgs.forEach(function (r) {
+        var s = pptx.addSlide();
+        s.background = { color: 'FFFFFF' };
+        /* Full bleed: the sheet already carries its own border and title
+           block, so a second frame around it just wastes the page. */
+        var ia = r.png.aspect || a;
+        var w = sw, h = sw / ia;
+        if (h > sh) { h = sh; w = sh * ia; }
+        s.addImage({ data: r.png.data, x: (sw - w) / 2, y: (sh - h) / 2, w: w, h: h });
+        try { s.addNotes('Sheet ' + r.no + (opts.title ? ' \u2014 ' + opts.title : '')); } catch (e) {}
+      });
+
+      var base = (opts.title || 'Plot-Plan').replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').slice(0, 48);
+      var slug = 'ClearSky';
+      try { if (typeof brandSlug === 'function') slug = brandSlug(); } catch (e) {}
+      pptx.writeFile({ fileName: base + '-' + slug + '-Sheets.pptx' })
+        .then(function(){ cb(imgs.length, null); })
+        .catch(function (e) { cb(null, (e && e.message) || 'Could not write the file.'); });
+    } catch (e) {
+      cb(null, (e && e.message) || 'Could not build the presentation.');
+    }
+  });
+}
+
+root.OmegaPlotPPT = { build: build, svgToPng: svgToPng, rasterise: rasterise };
 
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
