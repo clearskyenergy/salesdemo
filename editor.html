@@ -145452,6 +145452,286 @@ if (root.console && console.info) {
 
 <script>
 /* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 51 — LIVE SITE: CALIBRATED WITHOUT FREEZING
+ *  ---------------------------------------------------------------------
+ *  WHAT GOES WRONG TODAY
+ *  Site Quick-Build ends in applyMosaic(), which does three things:
+ *
+ *      window._userLockedMap = true;
+ *      setMapInteractive(false, true);
+ *      S.pxPerFt = m.plan.pxPerFt;          // scale from the mosaic
+ *
+ *  The first two kill pan and zoom. Worse, the mosaic sets
+ *  window._committedPlot, and _liveMapState() returns null the moment
+ *  mapLockState().hasPlot is true — so the entire geo-anchoring system
+ *  switches off with it. That is why capturing a site "takes away the
+ *  live site and anchoring system": it is not a bug in the capture, it
+ *  is the capture working as designed.
+ *
+ *  The design has a reason. A mosaic is a fixed image, and the drawing
+ *  scale is derived from its projection, so panning underneath it would
+ *  silently invalidate every dimension on the canvas.
+ *
+ *  WHAT THIS DOES INSTEAD
+ *  The lock is only necessary because the scale is pinned to a still
+ *  image. If the scale is instead derived from the live map's own
+ *  projection, and re-derived every time the map settles, then panning
+ *  and zooming stay correct by construction. All the machinery for that
+ *  already exists and is simply never used on this path:
+ *
+ *      _setScaleFromZoomLat(zoom, lat)   scale from the live view
+ *      _geoStampAll()                    anchor drawn objects to ground
+ *      _geoReprojectAll()                move them when the view moves
+ *
+ *  So Site Setup gains a mode. LIVE frames the parcel, calibrates from
+ *  the live projection and leaves everything interactive. FROZEN is the
+ *  original mosaic path, still needed for the 3D ground texture and for
+ *  a print backdrop that must not move.
+ *
+ *  unfreeze() converts an already-frozen project back to live, because
+ *  projects are already saved in that state.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[LiveSite]';
+
+  var MODE_KEY = 'omega.site.mode';   /* 'live' | 'frozen' */
+  var idleHooked = false;
+
+  function mode() {
+    try { return localStorage.getItem(MODE_KEY) === 'frozen' ? 'frozen' : 'live'; }
+    catch (e) { return 'live'; }
+  }
+  function setMode(m) {
+    try { localStorage.setItem(MODE_KEY, m === 'frozen' ? 'frozen' : 'live'); } catch (e) {}
+    return mode();
+  }
+
+  function map() {
+    try { if (typeof _omegaMap === 'function') { var m = _omegaMap(); if (m) return m; } } catch (e) {}
+    return root._gmap || null;
+  }
+
+  function canvasSize() {
+    var sc = document.getElementById('sc');
+    return sc ? { w: sc.offsetWidth, h: sc.offsetHeight } : { w: 1200, h: 800 };
+  }
+
+  /* Zoom at which siteFt spans the canvas width. Google's Web Mercator:
+     one pixel is 156543.03392 * cos(lat) / 2^zoom metres. Same constant
+     _setScaleFromZoomLat uses, inverted. */
+  function zoomForSite(siteFt, lat) {
+    var w = canvasSize().w;
+    if (!(siteFt > 0) || !(w > 0)) return null;
+    var ftPerPx = siteFt / w;
+    var mPerPx = ftPerPx / 3.28084;
+    var cosLat = Math.cos((lat || 41.5) * Math.PI / 180);
+    if (!mPerPx || !cosLat) return null;
+    var z = Math.log2(156543.03392 * cosLat / mPerPx);
+    if (!isFinite(z)) return null;
+    return Math.max(1, Math.min(21, Math.round(z)));
+  }
+
+  /* ── keeping scale honest as the view moves ─────────────────────────── */
+
+  function recalibrate() {
+    var m = map();
+    if (!m || typeof m.getCenter !== 'function') return false;
+    var c, z;
+    try { c = m.getCenter(); z = m.getZoom(); } catch (e) { return false; }
+    if (!c) return false;
+    try {
+      if (typeof _setScaleFromZoomLat === 'function') _setScaleFromZoomLat(z, c.lat());
+      else if (typeof _gmapAutoScale === 'function') _gmapAutoScale();
+    } catch (e) { if (root.console) console.warn(TAG + ' scale', e && e.message); }
+    /* Anchor anything drawn before this view, then move everything that
+       is anchored. Stamp first: an object with no anchor cannot be
+       reprojected, and would sit still while the ground slid under it. */
+    try { if (typeof _geoStampAll === 'function') _geoStampAll(); } catch (e) {}
+    try { if (typeof root._geoReprojectAll === 'function') root._geoReprojectAll(); } catch (e) {}
+    return true;
+  }
+
+  function hookIdle() {
+    if (idleHooked) return true;
+    var m = map();
+    if (!m || !(root.google && google.maps && google.maps.event)) return false;
+    try {
+      google.maps.event.addListener(m, 'idle', function () {
+        if (mode() !== 'live') return;
+        if (root._committedPlot) return;      /* frozen: scale is the image's */
+        recalibrate();
+      });
+      idleHooked = true;
+      return true;
+    } catch (e) { return false; }
+  }
+
+  /* ── live capture ───────────────────────────────────────────────────── */
+
+  function goLive(opts) {
+    opts = opts || {};
+    var m = map();
+    if (!m) {
+      if (typeof showBanner === 'function') {
+        showBanner('cal', 'No live map yet \u2014 enter a site address first.');
+      }
+      return false;
+    }
+    var lat = opts.lat, lng = opts.lng;
+    if (lat == null || lng == null) {
+      try { var c = m.getCenter(); lat = c.lat(); lng = c.lng(); } catch (e) { return false; }
+    }
+    var siteFt = +opts.siteFt || 2600;
+
+    /* Nothing is frozen in this mode, so no plot and no lock. Clearing
+       these is what lets _liveMapState() start returning a view again. */
+    try {
+      root._committedPlot = null;
+      root._frozenMapImg = null;
+      root._userLockedMap = false;
+      root._mosaic = null;
+    } catch (e) {}
+
+    try {
+      m.setCenter({ lat: +lat, lng: +lng });
+      var z = zoomForSite(siteFt, lat);
+      if (z) m.setZoom(z);
+    } catch (e) { if (root.console) console.warn(TAG + ' pan', e && e.message); }
+
+    try { if (typeof root.setMapInteractive === 'function') root.setMapInteractive(true); } catch (e) {}
+
+    /* setCenter/setZoom are async; the projection is only trustworthy
+       once the map has settled, so calibrate on idle rather than now. */
+    hookIdle();
+    setTimeout(recalibrate, 350);
+    setTimeout(recalibrate, 1200);
+
+    if (typeof showBanner === 'function') {
+      showBanner('cal', 'Live site \u2014 scale calibrated and tracking. '
+        + 'Pan and zoom stay on; lengths stay in real feet. Next: Trace Boundary.');
+    }
+    if (root.console) console.info(TAG + ' live at ' + (+lat).toFixed(5) + ', ' + (+lng).toFixed(5));
+    return true;
+  }
+
+  /* Convert an already-frozen project back to a live map. */
+  function unfreeze() {
+    try {
+      root._committedPlot = null;
+      root._frozenMapImg = null;
+      root._userLockedMap = false;
+      root._ovLocked = false;
+      root._mapLocked = false;
+      root._mosaic = null;
+    } catch (e) {}
+    var bd = document.getElementById('backdrop');
+    if (bd) bd.style.display = 'none';
+    var mi = document.getElementById('map-img');
+    if (mi) mi.style.display = 'none';
+    try { if (typeof root.setMapInteractive === 'function') root.setMapInteractive(true); } catch (e) {}
+    hookIdle();
+    var ok = recalibrate();
+    if (typeof showBanner === 'function') {
+      showBanner('cal', ok
+        ? 'Live map restored \u2014 pan and zoom are back, scale is tracking the view.'
+        : 'Unfrozen, but no live map is loaded \u2014 enter a site address to re-establish one.');
+    }
+    return ok;
+  }
+
+  /* ── mode switch inside Site Quick-Build ────────────────────────────── */
+
+  /* sqbRun() ends in applyMosaic(). In live mode the mosaic is skipped
+     entirely: no tiles fetched, no API calls, no lock. */
+  function wrapRun() {
+    if (typeof root.sqbRun !== 'function' || root.sqbRun.__live) return;
+    var orig = root.sqbRun;
+    root.sqbRun = function () {
+      if (mode() !== 'live') return orig.apply(this, arguments);
+      var ft = 2600;
+      try {
+        var el = document.getElementById('sqb-ft');
+        if (el && +el.value > 0) ft = +el.value;
+      } catch (e) {}
+      return goLive({ lat: root._sqbLat, lng: root._sqbLng, siteFt: ft });
+    };
+    root.sqbRun.__live = true;
+  }
+
+  function injectToggle() {
+    var btn = document.getElementById('sqb-go')
+      || document.querySelector('button[onclick*="sqbRun"]');
+    if (!btn || !btn.parentNode) return false;
+    if (document.getElementById('sqb-mode')) return true;
+
+    var box = document.createElement('div');
+    box.id = 'sqb-mode';
+    box.style.cssText = 'display:flex;gap:8px;margin-bottom:10px';
+    box.innerHTML = ''
+      + '<button type="button" data-m="live" style="flex:1;padding:9px;border-radius:7px;'
+      + 'cursor:pointer;font-family:inherit;font-size:11px;font-weight:700;text-align:left">'
+      + 'Live map<br><span style="font-weight:400;opacity:.75">Pan, zoom and anchoring stay on</span></button>'
+      + '<button type="button" data-m="frozen" style="flex:1;padding:9px;border-radius:7px;'
+      + 'cursor:pointer;font-family:inherit;font-size:11px;font-weight:700;text-align:left">'
+      + 'Freeze to image<br><span style="font-weight:400;opacity:.75">Fixed backdrop for 3D and print</span></button>';
+
+    function paint() {
+      var cur = mode();
+      Array.prototype.forEach.call(box.querySelectorAll('button'), function (b) {
+        var on = b.getAttribute('data-m') === cur;
+        b.style.background = on ? 'rgba(47,181,74,.16)' : 'rgba(255,255,255,.04)';
+        b.style.border = '1px solid ' + (on ? '#2FB54A' : '#3A3A3A');
+        b.style.color = on ? '#E0E0E0' : '#9A9A9A';
+      });
+      var run = document.getElementById('sqb-go');
+      if (run) {
+        run.innerHTML = cur === 'live' ? '\u25b6 Set Live Site' : '\u25b6 Capture Site';
+      }
+    }
+    box.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-m]') : null;
+      if (!b) return;
+      setMode(b.getAttribute('data-m'));
+      paint();
+      try { if (typeof sqbUpdate === 'function') sqbUpdate(); } catch (e2) {}
+      setTimeout(paint, 30);
+    });
+    btn.parentNode.insertBefore(box, btn);
+    paint();
+    return true;
+  }
+
+  function boot() {
+    wrapRun();
+    hookIdle();
+    var n = 0, iv = setInterval(function () {
+      wrapRun(); injectToggle(); hookIdle();
+      if (++n > 30) clearInterval(iv);
+    }, 500);
+    if (root.console) {
+      console.info(TAG + ' ready \u2014 mode "' + mode() + '". '
+        + 'OmegaLiveSite.unfreeze() restores a frozen project.');
+    }
+  }
+
+  root.OmegaLiveSite = {
+    goLive: goLive,
+    unfreeze: unfreeze,
+    recalibrate: recalibrate,
+    mode: mode,
+    setMode: function (m) { var r = setMode(m); try { injectToggle(); } catch (e) {} return r; },
+    zoomForSite: zoomForSite,
+    isFrozen: function () { return !!root._committedPlot || !!root._mapLocked; }
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
  *  OMEGA PATCH 46 — SITE ROLES: BOUNDARY AND EXCLUSION
  *  ---------------------------------------------------------------------
  *  The auto-layout chain reads window._alExclusions in five places and
