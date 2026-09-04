@@ -145452,6 +145452,214 @@ if (root.console && console.info) {
 
 <script>
 /* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 55 — SITE LOCATION, AND GAS
+ *  ---------------------------------------------------------------------
+ *  THE ROOT CAUSE BEHIND SEVERAL BROKEN TOOLS
+ *  S.lat is read in sixteen places and written in none. The file even
+ *  says so out loud:
+ *
+ *      "S.lat is usually empty: the position lives on the live Google
+ *       Map, not on the project record."
+ *
+ *  So every tool that needs a location falls through to
+ *  _gmap.getCenter(), and the moment there is no live map object — a
+ *  restored project, a frozen backdrop, a reload before the map boots —
+ *  the location is simply gone. That is why Network Proximity says
+ *  "place or lock the satellite view first" while a traced parcel is
+ *  sitting on screen, and it is the same hole under the substation
+ *  lookup, the sun path and the climate call.
+ *
+ *  A site has a location the moment it has an address. That fact
+ *  belongs on the project record, not on a map widget that may not
+ *  exist yet. This stamps S.lat / S.lng from whichever source is
+ *  available, in order of trustworthiness, and keeps them current.
+ *
+ *  GAS
+ *  A load-siting screen for a gas-served compute site needs the
+ *  distance to a transmission main. There is no gas dataset wired into
+ *  this build and inventing one would be worse than useless: a fake
+ *  0.4 mi is exactly the kind of number that gets repeated into a
+ *  capacity letter. So the field is entered, stored on the project and
+ *  labelled as entered. OmegaGas.setMain() takes it, and a real
+ *  dataset can replace the input later without changing anything
+ *  downstream.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[SiteLocation]';
+
+  function S_() { try { return (typeof S !== 'undefined') ? S : null; } catch (e) { return null; } }
+
+  function valid(lat, lng) {
+    return isFinite(+lat) && isFinite(+lng) && +lat !== 0 && Math.abs(+lat) <= 90
+      && Math.abs(+lng) <= 180;
+  }
+
+  /* Sources in order of trustworthiness. A geocoded address is a fact
+     about the site; a map centre is wherever the user last dragged to,
+     which is close enough to seed from but should never overwrite a
+     geocode. */
+  function resolve() {
+    var out = null;
+
+    try {
+      var ctx = root.OmegaSiteContext && root.OmegaSiteContext.get();
+      if (ctx && valid(ctx.lat, ctx.lng)) out = { lat: +ctx.lat, lng: +ctx.lng, src: 'geocode' };
+    } catch (e) {}
+
+    if (!out) {
+      try {
+        var m = root._mosaic;
+        if (m && valid(m.lat, m.lng)) out = { lat: +m.lat, lng: +m.lng, src: 'capture' };
+      } catch (e) {}
+    }
+    if (!out) {
+      try {
+        var c = root._lastCenter;
+        if (c && valid(c.lat, c.lng)) out = { lat: +c.lat, lng: +c.lng, src: 'gps' };
+      } catch (e) {}
+    }
+    if (!out) {
+      try {
+        var g = (typeof _omegaMap === 'function') ? _omegaMap() : root._gmap;
+        if (g && g.getCenter) {
+          var cc = g.getCenter();
+          if (cc && valid(cc.lat(), cc.lng())) {
+            out = { lat: cc.lat(), lng: cc.lng(), src: 'map centre' };
+          }
+        }
+      } catch (e) {}
+    }
+    return out;
+  }
+
+  /* Writes to the project record. Once stamped, every downstream tool
+     that already checks S.lat first stops falling through to the map. */
+  function stamp(force) {
+    var S0 = S_();
+    if (!S0) return null;
+    if (!force && valid(S0.lat, S0.lng)) return { lat: +S0.lat, lng: +S0.lng, src: 'already set' };
+    var r = resolve();
+    if (!r) return null;
+    S0.lat = r.lat;
+    S0.lng = r.lng;
+    S0.latSrc = r.src;
+    if (root.console) {
+      console.info(TAG + ' ' + r.lat.toFixed(5) + ', ' + r.lng.toFixed(5) + '  (' + r.src + ')');
+    }
+    return r;
+  }
+
+  function get() {
+    var S0 = S_();
+    if (S0 && valid(S0.lat, S0.lng)) return { lat: +S0.lat, lng: +S0.lng, src: S0.latSrc || 'record' };
+    return resolve();
+  }
+
+  /* A geocode is better than whatever seeded the record earlier, so it
+     overwrites. Everything else only fills a gap. */
+  function upgradeOnGeocode() {
+    if (!root.OmegaSiteContext || root.OmegaSiteContext.__loc) return;
+    var orig = root.OmegaSiteContext.resolve;
+    if (typeof orig !== 'function') return;
+    root.OmegaSiteContext.resolve = function (addr, cb) {
+      return orig.call(this, addr, function (ctx) {
+        try { if (ctx && valid(ctx.lat, ctx.lng)) stamp(true); } catch (e) {}
+        if (cb) cb(ctx);
+      });
+    };
+    root.OmegaSiteContext.__loc = true;
+  }
+
+  /* ── gas ────────────────────────────────────────────────────────────── */
+
+  var GAS_KEY = 'gasMain';
+
+  function gas() {
+    var S0 = S_();
+    return (S0 && S0[GAS_KEY]) ? S0[GAS_KEY] : null;
+  }
+
+  function setMain(miles, bearing, note) {
+    var S0 = S_();
+    if (!S0) return null;
+    var mi = +miles;
+    if (!isFinite(mi) || mi < 0) { delete S0[GAS_KEY]; return null; }
+    S0[GAS_KEY] = {
+      miles: mi,
+      bearing: (bearing || '').toUpperCase() || null,
+      note: note || null,
+      /* Provenance travels with the number. Anything printed from an
+         entered figure has to be able to say so on the page. */
+      source: 'entered',
+      at: Date.now()
+    };
+    try { if (typeof pushHist === 'function') pushHist(); } catch (e) {}
+    try { if (root.OmegaComputeHUD) root.OmegaComputeHUD.refresh(); } catch (e) {}
+    if (typeof showBanner === 'function') {
+      showBanner('cal', 'Gas main recorded \u2014 ' + mi.toFixed(1) + ' mi'
+        + (bearing ? ' ' + bearing.toUpperCase() : '')
+        + '. Marked as entered, not surveyed.');
+    }
+    return S0[GAS_KEY];
+  }
+
+  /* Volume at ~1020 Btu/scf, the same constant the sizer uses, so the
+     fuel line in the report and the sizer cannot disagree. */
+  function demand() {
+    var r = root._omegaComputeLast;
+    if (!r || !(r.gasMmbtuHr > 0)) return null;
+    return {
+      mmbtuHr: r.gasMmbtuHr,
+      scfh: r.gasScfh || Math.round(r.gasMmbtuHr * 1e6 / 1020),
+      main: gas()
+    };
+  }
+
+  function boot() {
+    upgradeOnGeocode();
+    stamp();
+    /* The map and the geocoder both arrive late, and a restored project
+       arrives later still, so this keeps trying for a while. */
+    var n = 0, iv = setInterval(function () {
+      upgradeOnGeocode();
+      var S0 = S_();
+      if (S0 && !valid(S0.lat, S0.lng)) stamp();
+      if (++n > 40) clearInterval(iv);
+    }, 1000);
+    if (root.console) {
+      console.info(TAG + ' ready \u2014 OmegaSiteLocation.get() / OmegaGas.setMain(mi, bearing)');
+    }
+  }
+
+  root.OmegaSiteLocation = {
+    get: get,
+    stamp: stamp,
+    resolve: resolve,
+    /* Manual override, for a parcel whose address geocodes to the wrong
+       side of a section line. */
+    set: function (lat, lng) {
+      var S0 = S_();
+      if (!S0 || !valid(lat, lng)) return null;
+      S0.lat = +lat; S0.lng = +lng; S0.latSrc = 'manual';
+      return { lat: +lat, lng: +lng, src: 'manual' };
+    }
+  };
+
+  root.OmegaGas = {
+    main: gas,
+    setMain: setMain,
+    demand: demand,
+    clear: function () { var S0 = S_(); if (S0) delete S0[GAS_KEY]; return true; }
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
  *  OMEGA PATCH 51 — LIVE SITE: CALIBRATED WITHOUT FREEZING
  *  ---------------------------------------------------------------------
  *  WHAT GOES WRONG TODAY
@@ -145625,10 +145833,18 @@ if (root.console && console.info) {
       root._mapLocked = false;
       root._mosaic = null;
     } catch (e) {}
-    var bd = document.getElementById('backdrop');
-    if (bd) bd.style.display = 'none';
-    var mi = document.getElementById('map-img');
-    if (mi) mi.style.display = 'none';
+    /* Only hide the captured backdrop if there is a live map underneath
+       it. Hiding it unconditionally left a black canvas with the parcel
+       floating on nothing whenever no map object had loaded — a
+       restored project, or a reload before Maps boots. A stale backdrop
+       is far better than no backdrop. */
+    var live = !!map();
+    if (live) {
+      var bd = document.getElementById('backdrop');
+      if (bd) bd.style.display = 'none';
+      var mi = document.getElementById('map-img');
+      if (mi) mi.style.display = 'none';
+    }
     try { if (typeof root.setMapInteractive === 'function') root.setMapInteractive(true); } catch (e) {}
     hookIdle();
     var ok = recalibrate();
@@ -146351,6 +146567,985 @@ if (root.console && console.info) {
 
 <script>
 /* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 53 — COMPUTE AUTO-PLACEMENT INSIDE THE PARCEL
+ *  ---------------------------------------------------------------------
+ *  WHAT place() DOES TODAY
+ *      var x0 = Math.max(40, W*0.18), y0 = Math.max(40, H*0.18);
+ *
+ *  Everything is laid out from a fixed fraction of the VIEWPORT. It
+ *  never reads the boundary, never tests an exclusion and never checks
+ *  that anything landed on the parcel. Pods appear in the top-left of
+ *  whatever you happen to be looking at, and if you have traced a
+ *  wetland they go straight through it.
+ *
+ *  WHAT THIS DOES
+ *  The same greedy pack the solar layout already uses, applied to
+ *  compute. computeGroundLayout() proves the approach: step a candidate
+ *  rectangle across the parcel, reject it if any corner falls outside
+ *  the boundary or inside an exclusion, reject it if it collides with
+ *  something already placed, otherwise keep it. _gmPointInPoly() is the
+ *  same containment test, so a pod and a PV table agree about where the
+ *  parcel is.
+ *
+ *  Order matters and is deliberate: pods first because this is a
+ *  load-led build, then the fuel cells that close the gap, then the
+ *  ride-through BESS, then a substation pad on the boundary edge
+ *  nearest the real substation.
+ *
+ *  THE HONEST PART
+ *  A parcel that cannot hold the load must say so. If 40 pods are
+ *  required and 28 fit, this places 28 and reports the shortfall rather
+ *  than overlapping them or spilling past the boundary to make the
+ *  number come out right. A layout that claims capacity the land does
+ *  not have is worse than no layout.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[ComputePlace]';
+
+  /* Tunables, exposed live on OmegaComputePlace.config so a tight
+     parcel can be retried with a smaller clearance without a rebuild. */
+  var CFG = {
+    clearanceFt: 15,   /* gap between equipment blocks     */
+    setbackFt: 25,     /* keep off the parcel line         */
+    stepFt: 10         /* scan granularity; smaller packs
+                          tighter and costs more time      */
+  };
+
+  function ppf() {
+    try { return (S.pxPerFt && S.pxPerFt > 0) ? S.pxPerFt : 6; } catch (e) { return 6; }
+  }
+
+  function boundary() {
+    try {
+      if (root.OmegaSiteRoles && root.OmegaSiteRoles.boundary) {
+        var b = root.OmegaSiteRoles.boundary();
+        if (b && typeof _alShapePts === 'function') {
+          var p = _alShapePts(b);
+          if (p && p.length >= 3) return p;
+        }
+      }
+    } catch (e) {}
+    try { return (typeof _alFindBoundary === 'function') ? _alFindBoundary() : null; }
+    catch (e) { return null; }
+  }
+
+  function exclusions() {
+    try { return root._alExclusions || []; } catch (e) { return []; }
+  }
+
+  function bbox(poly) {
+    var x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+    for (var i = 0; i < poly.length; i++) {
+      x1 = Math.min(x1, poly[i].x); y1 = Math.min(y1, poly[i].y);
+      x2 = Math.max(x2, poly[i].x); y2 = Math.max(y2, poly[i].y);
+    }
+    return { x1: x1, y1: y1, x2: x2, y2: y2 };
+  }
+
+  /* Same shape of test as _gmRectPlaceable: all four corners in, none
+     inside an exclusion. Corner testing rather than centre testing is
+     what stops a block hanging over the parcel line on a diagonal
+     boundary. */
+  function fits(cx, cy, w, h, poly, excl, taken) {
+    var c = [
+      { x: cx, y: cy }, { x: cx + w, y: cy },
+      { x: cx + w, y: cy + h }, { x: cx, y: cy + h }
+    ];
+    var i, e;
+    for (i = 0; i < 4; i++) {
+      if (!_gmPointInPoly(c[i].x, c[i].y, poly)) return false;
+    }
+    for (e = 0; e < excl.length; e++) {
+      for (i = 0; i < 4; i++) {
+        if (_gmPointInPoly(c[i].x, c[i].y, excl[e])) return false;
+      }
+      /* An exclusion smaller than the block would sit entirely inside it
+         with no corner of ours in it, so test the other way too. */
+      for (i = 0; i < excl[e].length; i++) {
+        var p = excl[e][i];
+        if (p.x >= cx && p.x <= cx + w && p.y >= cy && p.y <= cy + h) return false;
+      }
+    }
+    for (i = 0; i < taken.length; i++) {
+      var t = taken[i];
+      if (cx < t.x + t.w && cx + w > t.x && cy < t.y + t.h && cy + h > t.y) return false;
+    }
+    return true;
+  }
+
+  /* Greedy row-major pack. Returns the slots it found, up to count. */
+  function pack(count, wFt, hFt, poly, excl, taken, startY) {
+    var P = ppf();
+    var w = wFt * P, h = hFt * P;
+    var clear = CFG.clearanceFt * P, step = Math.max(4, CFG.stepFt * P);
+    var bb = bbox(poly);
+    var out = [];
+    if (count < 1) return out;
+    for (var y = (startY != null ? startY : bb.y1); y < bb.y2 - h; y += step) {
+      for (var x = bb.x1; x < bb.x2 - w; x += step) {
+        if (out.length >= count) return out;
+        if (fits(x, y, w, h, poly, excl, taken)) {
+          var slot = { x: x, y: y, w: w + clear, h: h + clear, dw: w, dh: h };
+          out.push(slot); taken.push(slot);
+          x += w + clear - step;      /* jump past what we just filled */
+        }
+      }
+      if (out.length >= count) return out;
+    }
+    return out;
+  }
+
+  function clearPrevious() {
+    try {
+      if (typeof S === 'undefined' || !S.shapes) return 0;
+      var before = S.shapes.length;
+      for (var i = S.shapes.length - 1; i >= 0; i--) {
+        if (S.shapes[i] && S.shapes[i].omegaCompute) {
+          var id = S.shapes[i].id;
+          S.shapes.splice(i, 1);
+          var el = document.querySelector('#csvg [data-shid="' + id + '"]');
+          if (el && el.parentNode) el.parentNode.removeChild(el);
+        }
+      }
+      return before - S.shapes.length;
+    } catch (e) { return 0; }
+  }
+
+  function push(shape) {
+    S.shapes.push(shape);
+    try { if (typeof renderShape === 'function') renderShape(shape); } catch (e) {}
+    return shape;
+  }
+
+  /* ── the build ──────────────────────────────────────────────────────── */
+
+  function build(opts) {
+    opts = opts || {};
+    var r = null;
+    try {
+      if (root.OmegaCompute && typeof root.OmegaCompute.size === 'function') {
+        r = root._omegaComputeLast || null;
+        if (!r && typeof root.OmegaCompute.recalc === 'function') r = root.OmegaCompute.recalc();
+      }
+    } catch (e) {}
+    if (!r || !(r.facKw > 0)) {
+      if (typeof showBanner === 'function') showBanner('cal', 'Set an IT load in Compute Build first.');
+      return null;
+    }
+
+    var poly = boundary();
+    if (!poly || poly.length < 3) {
+      if (typeof showBanner === 'function') {
+        showBanner('cal', 'No parcel yet \u2014 use Trace Boundary, then run this again. '
+          + 'Without a boundary there is nothing to build inside.');
+      }
+      return null;
+    }
+
+    var excl = exclusions();
+    var P = ppf();
+    var taken = [];
+
+    /* Setback: shrink the working polygon by pulling the test inward.
+       Cheaper and more predictable than a true polygon offset, and it
+       matches what _gmRectPlaceable does for the solar layout. */
+    var sb = CFG.setbackFt * P;
+    var bb = bbox(poly);
+    bb = { x1: bb.x1 + sb, y1: bb.y1 + sb, x2: bb.x2 - sb, y2: bb.y2 - sb };
+
+    clearPrevious();
+
+    var pSpec = r.podSpec || { id: 'dc_leviathan', label: 'MDC', kw: 1000, lf: 40, wf: 10 };
+    var fSpec = r.fcSpec || { label: 'SOFC Fuel Cell (NG)', kw: 300, lf: 9, wf: 6,
+                              abbr: 'FC', fuel: 'natural gas' };
+
+    /* 1. Compute pods. Load-led build: the load lands first and
+          everything else is arranged to serve it. */
+    var podSlots = pack(r.pods, pSpec.lf, pSpec.wf, poly, excl, taken);
+    podSlots.forEach(function (s, i) {
+      push({
+        id: (typeof uid === 'function' ? uid() : 'p' + i + Date.now()),
+        kind: 'derdc', dcId: pSpec.id || 'dc_leviathan',
+        pts: [{ x: s.x, y: s.y }],
+        style: (S.shapeStyle || ''), lf: pSpec.lf, wf: pSpec.wf,
+        model: pSpec.label, kw: pSpec.kw,
+        scaled: !!(S.pxPerFt > 0), omegaCompute: true
+      });
+    });
+
+    /* 2. Fuel cells, starting below the pods so the two read as
+          separate blocks rather than one interleaved mass. */
+    var fcStartY = taken.length
+      ? Math.max.apply(null, taken.map(function (t) { return t.y + t.h; })) + 20 * P
+      : null;
+    var fcSlots = pack(r.fcBlocks, fSpec.lf, fSpec.wf, poly, excl, taken, fcStartY);
+    /* If the band below is full the remainder wraps anywhere it fits,
+       which beats refusing to place them. */
+    if (fcSlots.length < r.fcBlocks) {
+      var more = pack(r.fcBlocks - fcSlots.length, fSpec.lf, fSpec.wf, poly, excl, taken);
+      fcSlots = fcSlots.concat(more);
+    }
+    fcSlots.forEach(function (s, j) {
+      push({
+        id: (typeof uid === 'function' ? uid() : 'f' + j + Date.now()),
+        kind: 'deralt', altId: 'fuelcell_sofc',
+        pts: [{ x: s.x, y: s.y }],
+        style: (S.shapeStyle || ''), lf: fSpec.lf, wf: fSpec.wf,
+        model: fSpec.label, kw: fSpec.kw, abbr: fSpec.abbr, fuel: fSpec.fuel,
+        scaled: !!(S.pxPerFt > 0), omegaCompute: true
+      });
+    });
+
+    /* 3. Ride-through storage, one pad sized off the energy. */
+    var bessSlots = [];
+    if (r.bessKwh > 0) {
+      var bw = Math.max(40, Math.min(200, Math.sqrt(r.bessKwh) * 1.4));
+      bessSlots = pack(1, bw, bw * 0.4, poly, excl, taken);
+      bessSlots.forEach(function (s) {
+        push({
+          id: (typeof uid === 'function' ? uid() : 'b' + Date.now()),
+          kind: 'bespad', pts: [{ x: s.x, y: s.y }],
+          style: (S.shapeStyle || ''), lf: bw, wf: bw * 0.4,
+          model: 'Ride-through BESS', kw: r.bessKw, kwh: r.bessKwh,
+          scaled: !!(S.pxPerFt > 0), omegaCompute: true
+        });
+      });
+    }
+
+    var placed = {
+      pods: podSlots.length, podsWanted: r.pods,
+      fc: fcSlots.length, fcWanted: r.fcBlocks,
+      bess: bessSlots.length,
+      itKwPlaced: podSlots.length * (pSpec.kw || 1000),
+      genKwPlaced: fcSlots.length * (fSpec.kw || 300)
+    };
+
+    try { if (typeof updShapeCount === 'function') updShapeCount(); } catch (e) {}
+    try { if (typeof pushHist === 'function') pushHist(); } catch (e) {}
+    try { if (typeof updateSummaryPanel === 'function') updateSummaryPanel(); } catch (e) {}
+
+    report(placed, r);
+    root._omegaComputePlaced = placed;
+    return placed;
+  }
+
+  /* A shortfall is the whole point of running this, so it is said
+     plainly and in the units the decision is made in. */
+  function report(p, r) {
+    var short = [];
+    if (p.pods < p.podsWanted) {
+      short.push((p.podsWanted - p.pods) + ' of ' + p.podsWanted + ' pods ('
+        + ((p.podsWanted - p.pods) * 1000 / 1000).toFixed(0) + ' MW IT)');
+    }
+    if (p.fc < p.fcWanted) {
+      short.push((p.fcWanted - p.fc) + ' of ' + p.fcWanted + ' SOFC blocks');
+    }
+    var msg;
+    if (!short.length) {
+      msg = 'Placed ' + p.pods + ' pods and ' + p.fc + ' SOFC blocks inside the parcel'
+        + (p.bess ? ' plus ride-through storage' : '') + '. Everything fits.';
+    } else {
+      msg = 'Parcel is short \u2014 could not place ' + short.join(' and ')
+        + '. Placed what fits: ' + p.pods + ' pods, ' + p.fc + ' blocks. '
+        + 'Enlarge the boundary, remove an exclusion, or reduce the load.';
+    }
+    if (typeof showBanner === 'function') showBanner('cal', msg);
+    if (root.console) console.info(TAG + ' ' + msg);
+  }
+
+  /* ── substation ─────────────────────────────────────────────────────── */
+
+  /* Placed on the parcel edge nearest the real substation, so the tie
+     line leaves the site pointing at where the tap actually is. */
+  function placeSubstation() {
+    var poly = boundary();
+    if (!poly) {
+      if (typeof showBanner === 'function') showBanner('cal', 'Trace the parcel boundary first.');
+      return null;
+    }
+    var bb = bbox(poly), P = ppf();
+    var dir = 'E';
+    try {
+      var L = S.substationLookup;
+      if (L && L.dir) dir = String(L.dir).toUpperCase();
+    } catch (e) {}
+    var cx = (bb.x1 + bb.x2) / 2, cy = (bb.y1 + bb.y2) / 2;
+    if (dir.indexOf('E') > -1) cx = bb.x2 - 60 * P;
+    if (dir.indexOf('W') > -1) cx = bb.x1 + 60 * P;
+    if (dir.indexOf('N') > -1) cy = bb.y1 + 60 * P;
+    if (dir.indexOf('S') > -1) cy = bb.y2 - 60 * P;
+    /* Walk inward until the pad is genuinely on the parcel: a bbox
+       corner is outside the polygon whenever the parcel is not a
+       rectangle, which is most of the time. */
+    var tries = 0;
+    while (!_gmPointInPoly(cx, cy, poly) && tries++ < 60) {
+      cx += (bb.x1 + bb.x2) / 2 > cx ? 10 * P : -10 * P;
+      cy += (bb.y1 + bb.y2) / 2 > cy ? 10 * P : -10 * P;
+    }
+    var name = 'Substation', mw = null;
+    try {
+      var LK = S.substationLookup;
+      if (LK) { name = LK.name || name; mw = LK.capMw; }
+    } catch (e) {}
+    var sh = push({
+      id: (typeof uid === 'function' ? uid() : 'sub' + Date.now()),
+      kind: 'substation', pts: [{ x: cx, y: cy }],
+      style: (S.shapeStyle || ''), lf: 80, wf: 60,
+      model: name, capMw: mw,
+      scaled: !!(S.pxPerFt > 0), omegaCompute: true
+    });
+    try { if (typeof pushHist === 'function') pushHist(); } catch (e) {}
+    if (typeof showBanner === 'function') {
+      showBanner('cal', 'Substation pad placed on the ' + dir + ' edge'
+        + (mw != null ? ' \u2014 ' + mw + ' MW screening basis' : '') + '.');
+    }
+    return sh;
+  }
+
+  /* ── wire into the existing dialog ──────────────────────────────────── */
+
+  /* OmegaCompute.place() is replaced rather than wrapped: running both
+     would place every pod twice, once in the parcel and once in the
+     corner of the viewport. The original is kept for comparison. */
+  var legacyPlace = null;
+
+  function install() {
+    if (!root.OmegaCompute || typeof root.OmegaCompute.place !== 'function') return false;
+    if (root.OmegaCompute.place.__placed) return true;
+    legacyPlace = root.OmegaCompute.place;
+    root.OmegaCompute.place = function () { return build(); };
+    root.OmegaCompute.place.__placed = true;
+    root.OmegaCompute.placeSubstation = placeSubstation;
+    if (root.console) console.info(TAG + ' ready \u2014 placement is now parcel-aware');
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      if (install() || ++n > 30) clearInterval(iv);
+    }, 500);
+  }
+
+  root.OmegaComputePlace = {
+    build: build,
+    placeSubstation: placeSubstation,
+    clear: clearPrevious,
+    boundary: boundary,
+    lastResult: function () { return root._omegaComputePlaced || null; },
+    legacy: function () { return legacyPlace ? legacyPlace.apply(this, arguments) : null; },
+    config: CFG
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 54 — COMPUTE HUD: THE RAIL, THE LADDER, THE GAP
+ *  ---------------------------------------------------------------------
+ *  Patch 53 made the build land inside the parcel. This is the surface
+ *  that makes it readable while you work, which is the whole reason the
+ *  screenshots feel like a tool and the editor did not.
+ *
+ *  THREE PIECES
+ *
+ *  1. THE RAIL. A read-only column above the existing controls:
+ *     LOAD / GRID / ON-SITE / NETWORK. Every row starts as an em dash
+ *     and fills as the answer arrives. An em dash is not a zero: zero
+ *     is a measurement, absent is not, and a siting decision made
+ *     against a zero that was really an absence is the expensive kind
+ *     of mistake.
+ *
+ *  2. THE LADDER. LOAD vs GRID CEILING as a stacked bar. Green is what
+ *     the grid will take, red hatched is the gap, purple is generation
+ *     once it covers the gap. It is one picture answering the only
+ *     question that matters before a capacity letter: can this site
+ *     carry the load, and if not, by how much does it miss.
+ *
+ *  3. THE GAP IN THE STATUS BAR. Persistent, because it stays true
+ *     whichever dialog happens to be open.
+ *
+ *  Nothing here computes. OmegaCompute.size() already produced every
+ *  number; this reads them. If the rail and the dialog ever disagree,
+ *  the rail is wrong, because the dialog is upstream of it.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[ComputeHUD]';
+
+  var DASH = '\u2014';
+  var netCache = null;      /* {facility, metro, route, rtt} */
+
+  function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+  function n0(v) { return Math.round(v).toLocaleString(); }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
+  function compute() {
+    try {
+      if (root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute) {
+        return root.OmegaLayoutFacts.compute();
+      }
+    } catch (e) {}
+    return root._omegaComputeLast || null;
+  }
+
+  function substation() {
+    try { return S.substationLookup || null; } catch (e) { return null; }
+  }
+
+  /* ── the rail ───────────────────────────────────────────────────────── */
+
+  function row(label, value, colour) {
+    var v = (value == null || value === '') ? DASH : value;
+    var col = (value == null || value === '') ? 'var(--sub)' : (colour || 'var(--text)');
+    return '<div style="display:flex;justify-content:space-between;align-items:baseline;'
+      + 'gap:10px;padding:3px 0;font-size:11px">'
+      + '<span style="color:var(--sub)">' + esc(label) + '</span>'
+      + '<span style="color:' + col + ';font-family:\'IBM Plex Mono\',monospace;'
+      + 'white-space:nowrap">' + v + '</span></div>';
+  }
+
+  function head(t) {
+    return '<div style="font-size:9px;letter-spacing:1.3px;text-transform:uppercase;'
+      + 'color:#8B7BD8;margin:12px 0 5px;padding-top:9px;'
+      + 'border-top:1px solid var(--border)">' + esc(t) + '</div>';
+  }
+
+  function railHtml() {
+    var r = compute(), sub = substation();
+    var mw = function (kw) { return kw != null ? n1(kw / 1000) + ' MW' : null; };
+
+    var h = '';
+    h += '<div style="font-size:9px;letter-spacing:1.3px;text-transform:uppercase;'
+      + 'color:#8B7BD8;margin-bottom:5px">Load</div>';
+    h += row('IT load', r ? n0(r.itKw / 1000) + ' MW' : null);
+    h += row('PUE', r ? (+r.pue).toFixed(2) : null);
+    h += row('Facility', r ? mw(r.facKw) : null, '#A78BFA');
+    h += row('Critical (UPS)', r ? mw(r.critKw) : null);
+
+    h += head('Grid');
+    h += row('Substation', sub ? esc(sub.name || 'found') : null);
+    h += row('Ceiling', (r && r.utilKw != null) ? mw(r.utilKw)
+      : (sub && sub.capMw != null ? n1(sub.capMw) + ' MW' : null), '#4ADE80');
+    h += row('Gap', (r && r.genNeedKw != null) ? mw(r.genNeedKw) : null,
+      (r && r.genNeedKw > 0) ? '#F87171' : '#4ADE80');
+
+    h += head('On-site');
+    h += row('SOFC blocks', (r && r.fcBlocks) ? r.fcBlocks + ' \u00d7 '
+      + n0(r.fcKw / r.fcBlocks) + ' kW' : null);
+    h += row('Generation', (r && r.fcKw) ? mw(r.fcKw) : null, '#A78BFA');
+    h += row('Gas demand', (r && r.gasMmbtuHr) ? n1(r.gasMmbtuHr) + ' MMBtu/h' : null, '#F59E0B');
+    h += row('Ride-through', (r && r.bessKwh) ? mw(r.bessKw) + ' / ' + r.rideMin + ' min' : null);
+
+    h += head('Network');
+    h += row('Carrier hotel', netCache ? esc(netCache.facility) : null);
+    h += row('Est. fibre RTT', netCache ? esc(netCache.rtt) : null);
+
+    /* Placement reality check. The sizer says what is needed; patch 53
+       says what fits. When they differ the rail must show the smaller
+       number, because that is the one the site can actually deliver. */
+    var p = root._omegaComputePlaced;
+    if (p && (p.pods < p.podsWanted || p.fc < p.fcWanted)) {
+      h += '<div style="margin-top:10px;padding:7px 8px;background:rgba(248,113,113,.10);'
+        + 'border:1px solid rgba(248,113,113,.32);border-radius:6px;font-size:10px;'
+        + 'color:#F87171;line-height:1.5">Parcel fits ' + p.pods + ' of ' + p.podsWanted
+        + ' pods and ' + p.fc + ' of ' + p.fcWanted + ' blocks. '
+        + 'Sizing above is what the load needs, not what the land holds.</div>';
+    }
+    return h;
+  }
+
+  function paintRail() {
+    var lp = document.getElementById('lp');
+    if (!lp) return;
+    var r = compute();
+    var box = document.getElementById('omega-rail');
+    /* Only appears once there is something to say. An empty rail above
+       the controls is just lost height. */
+    if (!r && !substation()) { if (box) box.remove(); return; }
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'omega-rail';
+      box.style.cssText = 'padding:11px 12px 13px;border-bottom:1px solid var(--border);'
+        + 'background:rgba(0,0,0,.16)';
+      var after = document.getElementById('lp-float-bar');
+      if (after && after.nextSibling) lp.insertBefore(box, after.nextSibling);
+      else lp.insertBefore(box, lp.firstChild);
+    }
+    box.innerHTML = railHtml();
+  }
+
+  /* ── the ladder ─────────────────────────────────────────────────────── */
+
+  function ladderHtml(r) {
+    var fac = r.facKw, util = r.utilKw || 0, gen = r.fcKw || 0;
+    var gap = Math.max(0, r.genNeedKw || 0);
+    if (!(fac > 0)) return '';
+    var pct = function (kw) { return Math.max(0, Math.min(100, kw / fac * 100)); };
+    var covered = gen >= gap && gap > 0;
+
+    var bar = '<div style="display:flex;height:42px;border-radius:5px;overflow:hidden;'
+      + 'border:1px solid var(--border)">'
+      + '<div style="width:' + pct(util) + '%;background:#4ADE80"></div>';
+    if (covered) {
+      bar += '<div style="flex:1;background:#7C3AED;display:flex;align-items:center;'
+        + 'padding:0 12px;font-size:12px;font-weight:700;color:#fff;line-height:1.25">'
+        + n1(gen / 1000) + ' MW on site closes a ' + n1(gap / 1000) + ' MW gap</div>';
+    } else {
+      bar += '<div style="flex:1;display:flex;align-items:center;padding:0 12px;'
+        + 'font-size:12px;font-weight:700;color:#fff;'
+        + 'background:repeating-linear-gradient(45deg,#B91C1C,#B91C1C 6px,#7F1D1D 6px,#7F1D1D 12px)">'
+        + 'GAP ' + n1(gap / 1000) + ' MW</div>';
+    }
+    bar += '</div>';
+
+    var key = function (c, l, v) {
+      return '<span style="display:inline-flex;align-items:center;gap:5px;margin-right:16px">'
+        + '<span style="width:9px;height:9px;border-radius:2px;background:' + c + '"></span>'
+        + '<span style="color:var(--sub)">' + l + '</span>'
+        + '<span style="font-family:\'IBM Plex Mono\',monospace">' + v + '</span></span>';
+    };
+
+    return '<div style="display:flex;justify-content:space-between;align-items:baseline;'
+      + 'margin-bottom:9px"><span style="font-size:10px;letter-spacing:1.2px;'
+      + 'text-transform:uppercase;color:var(--sub)">Load vs grid ceiling</span>'
+      + '<span style="font-size:11px;color:#A78BFA;font-family:\'IBM Plex Mono\',monospace">'
+      + n1(fac / 1000) + ' MW facility</span></div>'
+      + bar
+      + '<div style="display:flex;justify-content:space-between;font-size:9px;'
+      + 'color:var(--sub);font-family:\'IBM Plex Mono\',monospace;margin-top:5px">'
+      + '<span>0</span><span>' + n1(fac / 2000) + ' MW</span><span>'
+      + n1(fac / 1000) + ' MW</span></div>'
+      + '<div style="margin-top:9px;font-size:10px">'
+      + key('#4ADE80', 'Grid', n1(util / 1000))
+      + key('#B91C1C', 'Gap', n1(gap / 1000))
+      + key('#7C3AED', 'On-site', n1(gen / 1000))
+      + '</div>';
+  }
+
+  function paintLadder() {
+    var r = compute();
+    var box = document.getElementById('omega-ladder');
+    if (!r || !(r.facKw > 0)) { if (box) box.remove(); return; }
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'omega-ladder';
+      box.style.cssText = 'position:absolute;left:18px;bottom:44px;width:400px;z-index:40;'
+        + 'background:rgba(14,18,26,.95);border:1px solid var(--border);border-radius:8px;'
+        + 'padding:12px 14px;backdrop-filter:blur(6px);pointer-events:auto';
+      var host = document.getElementById('sc') || document.body;
+      host.appendChild(box);
+      box.addEventListener('dblclick', function () { box.remove(); });
+      box.title = 'Double-click to dismiss';
+    }
+    box.innerHTML = ladderHtml(r);
+  }
+
+  /* ── the status bar ─────────────────────────────────────────────────── */
+
+  function paintStatus() {
+    var sb = document.getElementById('statusbar');
+    if (!sb) return;
+    var r = compute();
+    var el = document.getElementById('sb-gap');
+    if (!r || !(r.genNeedKw > 0)) { if (el) el.remove(); return; }
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'sb-gap';
+      el.style.cssText = 'padding:0 10px;font-size:10px;font-family:\'IBM Plex Mono\',monospace;'
+        + 'white-space:nowrap';
+      var right = document.getElementById('sb-right');
+      if (right && right.parentNode) right.parentNode.insertBefore(el, right);
+      else sb.appendChild(el);
+    }
+    var covered = (r.fcKw || 0) >= r.genNeedKw;
+    el.style.color = covered ? '#4ADE80' : '#F87171';
+    el.innerHTML = 'GAP ' + n1(r.genNeedKw / 1000) + ' MW \u2014 '
+      + (covered ? 'CLOSED ON SITE' : 'ON-SITE GENERATION REQUIRED');
+  }
+
+  /* ── network cache ──────────────────────────────────────────────────── */
+
+  /* _npxInner() returns a table and caches nothing, so the top row is
+     read back out of the DOM it just wrote. Fragile by nature, so a
+     failure leaves the cache null and the rail shows an em dash rather
+     than a wrong carrier. */
+  function wrapNetwork() {
+    if (typeof root._npxInner !== 'function' || root._npxInner.__hud) return;
+    var orig = root._npxInner;
+    root._npxInner = function () {
+      var out = orig.apply(this, arguments);
+      setTimeout(function () {
+        try {
+          var rows = document.querySelectorAll('#sc table tr, .omega-dialog table tr');
+          for (var i = 0; i < rows.length; i++) {
+            var td = rows[i].querySelectorAll('td');
+            if (td.length >= 5) {
+              netCache = {
+                facility: (td[0].textContent || '').trim(),
+                metro: (td[1].textContent || '').trim(),
+                route: (td[3].textContent || '').trim(),
+                rtt: (td[4].textContent || '').trim()
+              };
+              break;
+            }
+          }
+        } catch (e) { netCache = null; }
+        paintAll();
+      }, 120);
+      return out;
+    };
+    root._npxInner.__hud = true;
+  }
+
+  /* ── repaint ────────────────────────────────────────────────────────── */
+
+  function paintAll() {
+    try { paintRail(); } catch (e) { if (root.console) console.warn(TAG + ' rail', e && e.message); }
+    try { paintLadder(); } catch (e) {}
+    try { paintStatus(); } catch (e) {}
+  }
+
+  /* The sizer is the single source of truth, so every repaint hangs off
+     it rather than off a timer guessing when numbers changed. */
+  function wrapSize() {
+    if (!root.OmegaCompute || typeof root.OmegaCompute.size !== 'function') return false;
+    if (root.OmegaCompute.size.__hud) return true;
+    var orig = root.OmegaCompute.size;
+    root.OmegaCompute.size = function () {
+      var r = orig.apply(this, arguments);
+      setTimeout(paintAll, 0);
+      return r;
+    };
+    root.OmegaCompute.size.__hud = true;
+    return true;
+  }
+
+  function wrapPlace() {
+    if (!root.OmegaComputePlace || root.OmegaComputePlace.build.__hud) return;
+    var orig = root.OmegaComputePlace.build;
+    root.OmegaComputePlace.build = function () {
+      var r = orig.apply(this, arguments);
+      setTimeout(paintAll, 0);
+      return r;
+    };
+    root.OmegaComputePlace.build.__hud = true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      wrapSize(); wrapPlace(); wrapNetwork();
+      if (++n > 30) clearInterval(iv);
+    }, 500);
+    setTimeout(paintAll, 1500);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaComputeHUD.refresh()');
+  }
+
+  root.OmegaComputeHUD = {
+    refresh: paintAll,
+    rail: paintRail,
+    ladder: paintLadder,
+    network: function () { return netCache; },
+    hide: function () {
+      ['omega-rail', 'omega-ladder', 'sb-gap'].forEach(function (id) {
+        var e = document.getElementById(id); if (e) e.remove();
+      });
+      return true;
+    }
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 56 — LOAD SITING SCREEN
+ *  ---------------------------------------------------------------------
+ *  The compute-side report: CAPACITY, FUEL, NETWORK, SCREEN RESULT.
+ *  Every figure already exists somewhere in the build — this assembles
+ *  them onto one page a developer can send.
+ *
+ *  THE GATE LADDER IS THE ONLY NEW THINKING HERE, SO IT IS WRITTEN OUT
+ *  OmegaCompute.size() returns a prose verdict and a level of 'ok' or
+ *  'warn'. That is right for a dialog and useless on a screening sheet,
+ *  which has to answer two questions in a form somebody can act on:
+ *  does this site advance, and what is the next thing that has to be
+ *  true. So the label and the gate are derived here, from facts, in a
+ *  fixed order:
+ *
+ *    no substation      -> Incomplete, grid unknown        HOLD
+ *    land cannot hold   -> Land-constrained                HOLD
+ *    facility <= 70%    -> Viable, grid-served             ADVANCE
+ *    facility <= 100%   -> Viable, tight margin            ADVANCE
+ *    gap, gen short     -> Not viable as configured        HOLD
+ *    gap, gen ok, gas?  -> Viable, gas unconfirmed         VERIFY
+ *    gap, gen ok, gas   -> Viable, gas-constrained         ADVANCE
+ *
+ *  The two HOLDs and the VERIFY are the point of the exercise. A screen
+ *  that only ever says ADVANCE is a brochure.
+ *
+ *  PROVENANCE IS PRINTED
+ *  The substation capacity is a screening estimate, the fibre RTT is a
+ *  propagation figure and the gas main distance is typed in by hand.
+ *  Each is labelled on the page. This sheet exists to be forwarded, and
+ *  it will be read by somebody who was not in the room.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[LoadScreen]';
+
+  function n0(v) { return Math.round(v).toLocaleString(); }
+  function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+  var DASH = '\u2014';
+
+  function compute() {
+    try {
+      if (root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute) {
+        return root.OmegaLayoutFacts.compute();
+      }
+    } catch (e) {}
+    return root._omegaComputeLast || null;
+  }
+  function sub() { try { return S.substationLookup || null; } catch (e) { return null; } }
+  function gas() { try { return root.OmegaGas && root.OmegaGas.main(); } catch (e) { return null; } }
+  function net() {
+    try { return root.OmegaComputeHUD && root.OmegaComputeHUD.network(); } catch (e) { return null; }
+  }
+  function ctx() { try { return root._SITE_DATA || {}; } catch (e) { return {}; } }
+
+  /* ── the gate ladder ────────────────────────────────────────────────── */
+
+  function screen(r) {
+    var u = r.utilKw, fac = r.facKw, gap = r.genNeedKw || 0, gen = r.fcKw || 0;
+    var placed = root._omegaComputePlaced;
+
+    if (u == null) {
+      return { label: 'Incomplete ' + DASH + ' grid unknown', act: 'HOLD',
+               gate: 'Run Find Substation to establish the ceiling', tone: 'warn' };
+    }
+    if (placed && (placed.pods < placed.podsWanted)) {
+      return { label: 'Land-constrained', act: 'HOLD',
+               gate: 'Parcel holds ' + placed.pods + ' of ' + placed.podsWanted
+                 + ' pods \u2014 enlarge the boundary or reduce the load', tone: 'bad' };
+    }
+    if (fac <= u * 0.7) {
+      return { label: 'Viable ' + DASH + ' grid-served', act: 'ADVANCE',
+               gate: 'Interconnection application', tone: 'ok' };
+    }
+    if (fac <= u) {
+      return { label: 'Viable ' + DASH + ' tight margin', act: 'ADVANCE',
+               gate: 'System impact study (SIS)', tone: 'ok' };
+    }
+    if (gen < gap) {
+      return { label: 'Not viable as configured', act: 'HOLD',
+               gate: 'On-site generation covers ' + n1(gen / 1000) + ' of '
+                 + n1(gap / 1000) + ' MW \u2014 add generation or reduce load', tone: 'bad' };
+    }
+    if (!gas()) {
+      return { label: 'Viable ' + DASH + ' gas unconfirmed', act: 'VERIFY',
+               gate: 'Locate the transmission main, then a gas capacity letter',
+               tone: 'warn' };
+    }
+    return { label: 'Viable ' + DASH + ' gas-constrained', act: 'ADVANCE',
+             gate: 'Gas capacity letter, then SIS', tone: 'ok' };
+  }
+
+  /* ── page furniture ─────────────────────────────────────────────────── */
+
+  function head(t) {
+    return '<div style="font-size:10px;letter-spacing:1.4px;text-transform:uppercase;'
+      + 'color:var(--sub);margin:30px 0 10px">' + esc(t) + '</div>';
+  }
+
+  function row(label, value, note) {
+    return '<div style="display:flex;justify-content:space-between;align-items:baseline;'
+      + 'gap:18px;padding:12px 2px;border-bottom:1px solid var(--border)">'
+      + '<span style="font-size:13.5px;color:var(--text)">' + label
+      + (note ? '<span style="display:block;font-size:10px;color:var(--sub);margin-top:2px">'
+        + esc(note) + '</span>' : '') + '</span>'
+      + '<span style="font-size:13.5px;color:var(--text);font-family:\'IBM Plex Mono\',monospace;'
+      + 'white-space:nowrap">' + (value == null ? DASH : value) + '</span></div>';
+  }
+
+  function capacityBar(r) {
+    var fac = r.facKw, u = r.utilKw || 0, gen = r.fcKw || 0, gap = r.genNeedKw || 0;
+    if (!(fac > 0)) return '';
+    var p = function (kw) { return Math.max(0, Math.min(100, kw / fac * 100)); };
+    var covered = gen >= gap && gap > 0;
+    return '<div style="display:flex;height:30px;border-radius:5px;overflow:hidden;'
+      + 'border:1px solid var(--border);margin-bottom:6px">'
+      + '<div style="width:' + p(u) + '%;background:#4ADE80"></div>'
+      + '<div style="flex:1;background:' + (covered ? '#7C3AED'
+        : 'repeating-linear-gradient(45deg,#B91C1C,#B91C1C 6px,#7F1D1D 6px,#7F1D1D 12px)')
+      + '"></div></div>';
+  }
+
+  /* ── the page ───────────────────────────────────────────────────────── */
+
+  function html() {
+    var r = compute();
+    if (!r || !(r.facKw > 0)) {
+      return '<div style="max-width:760px;margin:0 auto;padding:40px 0;color:var(--sub);'
+        + 'font-size:13px">No compute build on this project yet. Open Compute Build, '
+        + 'set an IT load, then reopen this screen.</div>';
+    }
+    var s = sub(), g = gas(), nw = net(), c = ctx(), sc = screen(r);
+    var iso = null;
+    try {
+      if (typeof computeInterconnectScore === 'function') iso = computeInterconnectScore().iso;
+    } catch (e) {}
+
+    var project = (document.getElementById('pname') || {}).value || 'Load siting screen';
+    var line2 = [];
+    if (c.county) line2.push(c.county + (c.state ? ', ' + c.state : ''));
+    if (s && s.kv) line2.push(s.kv + ' kV');
+    if (iso) line2.push(iso);
+
+    var toneCol = { ok: '#4ADE80', warn: '#F59E0B', bad: '#F87171' }[sc.tone] || 'var(--text)';
+
+    var h = '<div style="max-width:760px;margin:0 auto">';
+
+    h += '<div style="display:flex;justify-content:space-between;align-items:baseline;'
+      + 'border-bottom:1px solid var(--border);padding-bottom:12px;margin-bottom:22px">'
+      + '<span style="font-size:14px;font-weight:800;letter-spacing:.5px;color:var(--text)">'
+      + 'CLEARSKY OMEGA</span>'
+      + '<span style="font-size:10px;letter-spacing:1.4px;color:var(--sub);'
+      + 'font-family:\'IBM Plex Mono\',monospace">LOAD SITING SCREEN \u00b7 REV A</span></div>';
+
+    h += '<h2 style="font-size:26px;font-weight:700;margin:0 0 6px;color:var(--text)">'
+      + esc(project) + '</h2>';
+    if (line2.length) {
+      h += '<div style="font-size:13px;color:var(--sub);font-family:\'IBM Plex Mono\',monospace">'
+        + esc(line2.join(' \u00b7 ')) + '</div>';
+    }
+
+    /* CAPACITY */
+    h += head('Capacity') + capacityBar(r);
+    h += row('Facility load \u2014 ' + n0(r.itKw / 1000) + ' MW IT at PUE '
+      + (+r.pue).toFixed(2), n1(r.facKw / 1000) + ' MW');
+    h += row('Utility screening ceiling' + (s && s.name ? ' \u2014 ' + esc(s.name) : ''),
+      r.utilKw != null ? n1(r.utilKw / 1000) + ' MW' : null,
+      s ? 'Screening estimate, not an interconnection study' : null);
+    h += row('Gap closed on site', n1((r.genNeedKw || 0) / 1000) + ' MW');
+    if (r.fcBlocks > 0) {
+      h += row('SOFC \u2014 ' + r.fcBlocks + ' \u00d7 ' + n0(r.fcKw / r.fcBlocks) + ' kW'
+        + (r.redundancy ? ', ' + esc(r.redundancy) : ''), n1(r.fcKw / 1000) + ' MW');
+    }
+    if (r.bessKwh > 0) {
+      h += row('Ride-through \u2014 ' + r.rideMin + ' min on critical bus',
+        n1(r.bessKw / 1000) + ' MW / ' + n0(r.bessKwh) + ' kWh');
+    }
+
+    /* FUEL */
+    if (r.gasMmbtuHr > 0) {
+      h += head('Fuel');
+      h += row('Natural gas demand at full generation', n1(r.gasMmbtuHr) + ' MMBtu/hr');
+      h += row('Approximate volume', n0(r.gasScfh || (r.gasMmbtuHr * 1e6 / 1020)) + ' scfh',
+        'At ~1,020 Btu/scf');
+      h += row('Nearest transmission main',
+        g ? n1(g.miles) + ' mi' + (g.bearing ? ' ' + esc(g.bearing) : '') : null,
+        g ? 'Entered by hand, not surveyed' : 'Not recorded \u2014 OmegaGas.setMain(miles, bearing)');
+    }
+
+    /* NETWORK */
+    h += head('Network');
+    h += row('Nearest carrier hotel' + (nw && nw.facility ? ' \u2014 ' + esc(nw.facility) : ''),
+      nw && nw.route ? esc(nw.route) + ' route' : null,
+      nw ? null : 'Run Network Proximity');
+    h += row('Estimated fibre RTT', nw && nw.rtt ? esc(nw.rtt) : null,
+      nw ? 'Propagation estimate from route distance, not a measured path' : null);
+
+    /* SCREEN RESULT */
+    h += head('Screen result');
+    h += '<div style="display:flex;justify-content:space-between;align-items:baseline;'
+      + 'gap:18px;padding:14px 2px;border-bottom:1px solid var(--border)">'
+      + '<span style="font-size:16px;font-weight:700;color:var(--text)">' + esc(sc.label) + '</span>'
+      + '<span style="font-size:13px;font-weight:800;letter-spacing:1.2px;color:' + toneCol
+      + ';font-family:\'IBM Plex Mono\',monospace">' + sc.act + '</span></div>';
+    h += row('Next gate', '<span style="color:var(--sub)">' + esc(sc.gate) + '</span>');
+
+    h += '<div style="margin-top:26px;padding-top:14px;border-top:1px solid var(--border);'
+      + 'font-size:10px;color:var(--sub);line-height:1.7">'
+      + 'Screening only. Capacity is an estimate against a published voltage class and is not a '
+      + 'substitute for a utility system impact study. Gas service depends on a capacity letter '
+      + 'from the serving utility. Fibre latency is derived from route distance, not measured.'
+      + '</div></div>';
+    return h;
+  }
+
+  /* ── open ───────────────────────────────────────────────────────────── */
+
+  /* Renders into the report overlay so the existing Download report
+     button exports it with no extra work: patch 49 serialises whatever
+     is in #report-body. */
+  function open() {
+    var ov = document.getElementById('report-overlay');
+    if (!ov) { if (root.console) console.warn(TAG + ' no report overlay'); return false; }
+    if (typeof openReport === 'function') { try { openReport('location'); } catch (e) {} }
+    ov.style.display = 'flex';
+    var body = document.getElementById('report-body');
+    if (body) body.innerHTML = html();
+    var tabs = document.querySelectorAll('.report-tab');
+    for (var i = 0; i < tabs.length; i++) tabs[i].style.display = 'none';
+    return true;
+  }
+
+  function injectButton() {
+    if (document.getElementById('rb-load-screen')) return true;
+    var host = document.querySelector('#ribbon .ribbon-page[data-page="analyze"]');
+    if (!host) return false;
+    var caps = host.querySelectorAll('.rpanel-cap'), body = null;
+    for (var i = 0; i < caps.length; i++) {
+      if (/output|connect/i.test(caps[i].textContent)) {
+        body = caps[i].parentNode.querySelector('.rpanel-body'); break;
+      }
+    }
+    if (!body) body = host.querySelector('.rpanel-body');
+    if (!body) return false;
+    var b = document.createElement('button');
+    b.className = 'rbtn'; b.id = 'rb-load-screen';
+    b.title = 'Load Siting Screen \u2014 capacity, fuel, network and a go/no-go with the next gate';
+    b.onclick = open;
+    b.innerHTML = '<span class="rb-ico" style="color:#A78BFA">\u25A4</span>'
+      + '<span class="rb-lbl">Load<br>Screen</span>';
+    body.appendChild(b);
+    try { if (root.OmegaMode && root.OmegaMode.keep) root.OmegaMode.keep(/rb-load-screen/); } catch (e) {}
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      injectButton();
+      if (++n > 30) clearInterval(iv);
+    }, 600);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaLoadScreen.open()');
+  }
+
+  root.OmegaLoadScreen = { open: open, html: html, screen: function () {
+    var r = compute(); return r ? screen(r) : null;
+  } };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
  *  OMEGA PATCH 47 — SITE FACTS + SINGLE-SCROLL REPORT
  *  ---------------------------------------------------------------------
  *  Two things, in dependency order.
@@ -146981,14 +148176,16 @@ if (root.console && console.info) {
     { label: 'clear plot',      to: 'home', panel: 'Ground' },
     { label: 'recenter',        to: 'home', panel: 'Ground' },
     { label: 'calibrate scale', to: 'home', panel: 'Ground', from: 'modify' },
-    { label: 'clear scale',     to: 'home', panel: 'Ground', from: 'modify' },
+    { label: 'clear scale',     to: 'home', panel: 'Ground', from: 'modify' }
 
-    /* --- drafting verbs collapse into one tab ------------------------- */
-    { label: 'text note',       to: 'draw', panel: 'Annotate' },
-    { label: 'callout arrow',   to: 'draw', panel: 'Annotate' },
-    { label: 'dimension',       to: 'draw', panel: 'Annotate' },
-    { label: 'zone box',        to: 'draw', panel: 'Annotate' },
-    { label: 'building net-zero', to: 'draw', panel: 'Annotate' }
+    /* ANNOTATE STAYS PUT.
+       An earlier version of this table folded Text Note, Callout Arrow,
+       Dimension, Zone Box and Building Net-Zero into Draw. That was
+       wrong twice over. It gutted a tab people already knew how to use,
+       and it did not even empty it cleanly: Site Plan Styles is injected
+       by a later patch on a timer, so it landed after the shelf had run
+       and was left sitting alone under two captions with nothing beneath
+       them. Annotation is its own job and keeps its own tab. */
   ];
 
   /* Duplicates. The FIRST occurrence in document order is kept; every
@@ -147003,7 +148200,6 @@ if (root.console && console.info) {
     'assessment': '1 \u00b7 Screening',
     'connectivity': '2 \u00b7 Grid & Network',
     'operations': '3 \u00b7 Operations',
-    'markup': 'Annotate',
     'edit': 'Edit',
     'scale': 'Scale'
   };
