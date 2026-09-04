@@ -148602,6 +148602,269 @@ if (root.console && console.info) {
 
 <script>
 /* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 69 — MAXIMUM SITEABLE LOAD
+ *  ---------------------------------------------------------------------
+ *  1. PLACING A SUBSTATION DID NOT RE-SIZE ANYTHING.
+ *  Patch 68 hooked _subApply, the panel's Apply button. Placing a
+ *  substation goes through a different path entirely, so the cached
+ *  sizing kept utilKw null and the CSV printed "grid unknown" on a
+ *  project whose results rail was showing 10,000 kW firm two inches
+ *  away. Two readouts, one truth, and the wrong one was in the export.
+ *
+ *  2. THE QUESTION NOBODY COULD ASK YET.
+ *  "What is the largest load this site can carry" is not what the load
+ *  is, and not what the land holds. It is a joint constraint, and the
+ *  two halves fight each other:
+ *
+ *      facility(IT)  =  IT x PUE
+ *      served        =  utility ceiling + on-site generation
+ *      feasible      <=> facility <= served  AND  everything fits
+ *
+ *  Adding a pod adds load AND consumes ground that generation needs to
+ *  cover it. Past a point each extra megawatt of IT costs more than a
+ *  megawatt of ground. That crossover is the site's real capacity and
+ *  it cannot be read off either number alone.
+ *
+ *  So this searches for it. Binary search on IT: at each candidate, run
+ *  the real sizer, run the real packer, and ask whether both fit. Every
+ *  probe is a full evaluation — no surrogate model, no curve fit —
+ *  because the packer is the only thing that knows what a diagonal
+ *  boundary and three exclusions do to a row of containers.
+ *
+ *  It reports which constraint bound the answer, because "the grid" and
+ *  "the land" send you to different phone calls.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Capacity]';
+
+  function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+  function CP() { return root.OmegaComputePlace; }
+
+  /* ── 1. keep the ceiling live ───────────────────────────────────────── */
+
+  function resync() {
+    try {
+      if (root.OmegaCeilingSync && root.OmegaCeilingSync.resize) {
+        return root.OmegaCeilingSync.resize();
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  /* Every path that can create or remove a substation, not just the one
+     with an Apply button. */
+  function wrapSubstationPaths() {
+    var C = CP();
+    if (C && C.placeSubstation && !C.placeSubstation.__sync) {
+      var op = C.placeSubstation;
+      C.placeSubstation = function () {
+        var r = op.apply(this, arguments);
+        setTimeout(resync, 30);
+        return r;
+      };
+      C.placeSubstation.__sync = true;
+    }
+    if (typeof root._subDelete === 'function' && !root._subDelete.__sync) {
+      var od = root._subDelete;
+      root._subDelete = function () {
+        var r = od.apply(this, arguments);
+        setTimeout(resync, 30);
+        return r;
+      };
+      root._subDelete.__sync = true;
+    }
+    /* A hand-drawn yard commits through the two-point path. */
+    if (typeof root._commitTwoPoint === 'function' && !root._commitTwoPoint.__subsync) {
+      var oc = root._commitTwoPoint;
+      root._commitTwoPoint = function () {
+        var r = oc.apply(this, arguments);
+        try {
+          var last = (S.shapes || [])[S.shapes.length - 1];
+          if (last && last.kind === 'substation') setTimeout(resync, 30);
+        } catch (e) {}
+        return r;
+      };
+      root._commitTwoPoint.__subsync = true;
+    }
+  }
+
+  /* ── 2. the solver ──────────────────────────────────────────────────── */
+
+  function ceilingKw() {
+    var kw = 0;
+    try {
+      if (S.substationLookup && isFinite(+S.substationLookup.capMw)) {
+        kw = +S.substationLookup.capMw * 1000;
+      }
+    } catch (e) {}
+    if (!kw) {
+      try { kw = root.OmegaLayout ? root.OmegaLayout.ceilingKw() : 0; } catch (e) {}
+    }
+    return kw || 0;
+  }
+
+  /* One full evaluation at a candidate IT load. Returns what actually
+     landed, not what was asked for. */
+  function evaluate(itMw, opts) {
+    var sized = null;
+    try {
+      sized = root.OmegaCompute.size({
+        itMw: itMw, pue: opts.pue, rideMin: opts.rideMin,
+        redundancy: opts.redundancy, island: opts.island
+      });
+    } catch (e) { return null; }
+    if (!sized) return null;
+
+    var placed = null;
+    try { placed = CP().build(); } catch (e) { return null; }
+    if (!placed) return null;
+    if (placed.blocked) {
+      return { itMw: itMw, feasible: false, why: 'drawing budget',
+               wouldDraw: placed.wouldDraw };
+    }
+
+    var podsOk = placed.pods >= placed.podsWanted;
+    var genOk = placed.fc >= placed.fcWanted;
+    var served = (sized.utilKw || 0) + placed.fc * (sized.fcBlocks
+      ? sized.fcKw / sized.fcBlocks : 300);
+    var powerOk = served + 1 >= sized.facKw;   /* 1 kW slack for rounding */
+
+    return {
+      itMw: itMw, feasible: podsOk && genOk && powerOk,
+      pods: placed.pods, podsWanted: placed.podsWanted,
+      fc: placed.fc, fcWanted: placed.fcWanted,
+      facKw: sized.facKw, utilKw: sized.utilKw || 0, servedKw: served,
+      why: !podsOk ? 'land (pods)' : !genOk ? 'land (generation)'
+           : !powerOk ? 'power' : null,
+      sized: sized
+    };
+  }
+
+  function solve(opts) {
+    opts = opts || {};
+    opts.pue = +opts.pue || 1.3;
+    opts.rideMin = +opts.rideMin || 10;
+    opts.redundancy = opts.redundancy || 'n1';
+    opts.island = opts.island || 'parallel';
+
+    if (!CP() || !CP().boundary()) {
+      if (typeof showBanner === 'function') showBanner('cal', 'Trace the parcel boundary first.');
+      return null;
+    }
+    try { if (!(+S.pxPerFt > 0)) {
+      if (typeof showBanner === 'function') showBanner('cal', 'Calibrate the drawing scale first.');
+      return null;
+    } } catch (e) {}
+
+    var util = ceilingKw();
+    if (typeof showBanner === 'function') {
+      showBanner('cal', 'Searching for the largest load this parcel can carry\u2026');
+    }
+
+    /* Bracket. lo is known feasible (or zero), hi is known infeasible.
+       Doubling finds hi rather than assuming one, so a large parcel is
+       not silently capped by a guess. */
+    var lo = 0, hi = Math.max(4, +opts.startMw || 20), best = null, evals = 0;
+    var guard = 0;
+    while (guard++ < 8) {
+      var e = evaluate(hi, opts); evals++;
+      if (!e) break;
+      if (!e.feasible) break;
+      best = e; lo = hi; hi *= 2;
+    }
+
+    /* Bisect to 1 MW. Twelve evaluations at most, each a real pack. */
+    guard = 0;
+    while (hi - lo > 1 && guard++ < 12) {
+      var mid = Math.floor((lo + hi) / 2);
+      if (mid <= lo) break;
+      var r = evaluate(mid, opts); evals++;
+      if (r && r.feasible) { best = r; lo = mid; } else { hi = mid; }
+    }
+
+    if (!best) {
+      /* Nothing fits at all: report why the smallest probe failed. */
+      var f = evaluate(Math.max(1, Math.round(lo) || 1), opts); evals++;
+      var msg = 'This parcel cannot carry even 1 MW as configured'
+        + (f && f.why ? ' \u2014 bound by ' + f.why + '.' : '.');
+      if (typeof showBanner === 'function') showBanner('cal', msg);
+      if (root.console) console.warn(TAG + ' ' + msg);
+      return { maxItMw: 0, evals: evals };
+    }
+
+    /* Re-run the winner so the canvas shows it. */
+    evaluate(best.itMw, opts);
+    try { if (root.OmegaComputeHUD) root.OmegaComputeHUD.refresh(); } catch (e) {}
+    try { if (root.OmegaBuildLabels) root.OmegaBuildLabels.draw(); } catch (e) {}
+
+    /* What stopped it going higher: evaluate one MW above the answer. */
+    var over = evaluate(best.itMw + 1, opts); evals++;
+    evaluate(best.itMw, opts);                 /* restore the winner */
+    var bound = (over && over.why) ? over.why : 'unknown';
+
+    var out = {
+      maxItMw: best.itMw,
+      facilityMw: best.facKw / 1000,
+      utilityMw: util / 1000,
+      onSiteMw: (best.servedKw - best.utilKw) / 1000,
+      pods: best.pods, sofc: best.fc,
+      boundBy: bound, evals: evals
+    };
+    root._omegaCapacity = out;
+
+    var msg = 'Maximum siteable load: ' + out.maxItMw + ' MW IT ('
+      + n1(out.facilityMw) + ' MW facility) \u2014 '
+      + n1(out.utilityMw) + ' MW from the utility plus '
+      + n1(out.onSiteMw) + ' MW generated on site. '
+      + out.pods + ' pods, ' + out.sofc + ' SOFC blocks. '
+      + 'Bound by ' + bound + ' after ' + evals + ' layout evaluations.';
+    if (typeof showBanner === 'function') showBanner('cal', msg);
+    if (root.console) { console.info(TAG + ' ' + msg); console.table([out]); }
+    return out;
+  }
+
+  /* ── button ─────────────────────────────────────────────────────────── */
+
+  function inject() {
+    if (document.getElementById('rb-max-load')) return true;
+    var host = document.getElementById('rb-optimise') || document.getElementById('rb-max-fit');
+    if (!host || !host.parentNode) return false;
+    var b = document.createElement('button');
+    b.className = 'rbtn'; b.id = 'rb-max-load';
+    b.title = 'Max Load \u2014 searches for the largest IT load this parcel can carry on the '
+      + 'utility ceiling plus what can be generated on site, packing the layout at every '
+      + 'candidate. Reports whether land or power bound the answer.';
+    b.onclick = function () { return solve(); };
+    b.innerHTML = '<span class="rb-ico" style="color:#4ADE80">\u25B2</span>'
+      + '<span class="rb-lbl">Max<br>Load</span>';
+    host.parentNode.insertBefore(b, host.nextSibling);
+    try {
+      if (root.OmegaMode && root.OmegaMode.keep) root.OmegaMode.keep(/rb-max-load/);
+    } catch (e) {}
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      wrapSubstationPaths(); inject();
+      if (++n > 40) clearInterval(iv);
+    }, 500);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaCapacity.solve()');
+  }
+
+  root.OmegaCapacity = {
+    solve: solve, evaluate: evaluate, ceilingKw: ceilingKw, resync: resync,
+    last: function () { return root._omegaCapacity || null; }
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
  *  OMEGA PATCH 54 — COMPUTE HUD: THE RAIL, THE LADDER, THE GAP
  *  ---------------------------------------------------------------------
  *  Patch 53 made the build land inside the parcel. This is the surface
