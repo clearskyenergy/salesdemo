@@ -147080,8 +147080,16 @@ if (root.console && console.info) {
   var CFG = {
     clearanceFt: 15,   /* gap between equipment blocks     */
     setbackFt: 25,     /* keep off the parcel line         */
-    stepFt: 10         /* scan granularity; smaller packs
+    stepFt: 10,        /* scan granularity; smaller packs
                           tighter and costs more time      */
+    /* ACCESS. Without these the packer tiles the parcel edge to edge
+       and reports a capacity nobody could build: no fire lane, no
+       delivery route, no crane pad, no way to pull a failed container.
+       A block of rows and columns then a road is what a real yard
+       looks like, and it is also what makes the drawing legible. */
+    aisleFt: 30,       /* road width between blocks        */
+    blockCols: 6,      /* containers per row before a road */
+    blockRows: 4       /* rows before a cross road         */
   };
 
   function ppf() {
@@ -147154,21 +147162,34 @@ if (root.console && console.info) {
     var P = ppf();
     var w = wFt * P, h = hFt * P;
     var clear = CFG.clearanceFt * P, step = Math.max(4, CFG.stepFt * P);
+    var aisle = CFG.aisleFt * P;
     var bb = bbox(poly);
     var x0 = (xMin != null) ? Math.max(bb.x1, xMin) : bb.x1;
     var x1 = (xMax != null) ? Math.min(bb.x2, xMax) : bb.x2;
     var out = [];
     if (count < 1) return out;
+    var rowIdx = 0;
     for (var y = (startY != null ? startY : bb.y1); y < bb.y2 - h; y += step) {
+      var colIdx = 0, placedThisRow = 0;
       for (var x = x0; x < x1 - w; x += step) {
         if (out.length >= count) return out;
         if (fits(x, y, w, h, poly, excl, taken)) {
           var slot = { x: x, y: y, w: w + clear, h: h + clear, dw: w, dh: h };
           out.push(slot); taken.push(slot);
-          x += w + clear - step;      /* jump past what we just filled */
+          colIdx++; placedThisRow++;
+          /* Road every blockCols containers, otherwise the usual gap. */
+          var jump = (CFG.blockCols > 0 && colIdx % CFG.blockCols === 0)
+            ? w + aisle : w + clear;
+          x += jump - step;
         }
       }
       if (out.length >= count) return out;
+      if (placedThisRow > 0) {
+        rowIdx++;
+        /* Cross road every blockRows rows. */
+        y += (CFG.blockRows > 0 && rowIdx % CFG.blockRows === 0)
+          ? h + aisle - step : h + clear - step;
+      }
     }
     return out;
   }
@@ -147196,6 +147217,18 @@ if (root.console && console.info) {
   }
 
   /* ── the build ──────────────────────────────────────────────────────── */
+
+  /* A HARD CEILING ON WHAT GETS DRAWN.
+     The density cap bounds the megawatts. It does not bound the shape
+     count, and those are different failures. 498 MW is a defensible
+     capacity; 498 pods plus 4,900 fuel cells is 5,400 SVG nodes, which
+     locks the browser, breaks save, and stops being a site plan.
+
+     Capacity is a NUMBER. You do not have to draw 1,138 containers to
+     know that 1,138 fit. Past this budget the run reports the count and
+     declines to draw it, because a drawing nobody can pan is not a
+     design and a project nobody can save is worse than no project. */
+  var SHAPE_BUDGET = 600;
 
   function build(opts) {
     opts = opts || {};
@@ -147267,6 +147300,23 @@ if (root.console && console.info) {
       podSlots = podSlots.concat(
         pack(r.pods - podSlots.length, pSpec.lf, pSpec.wf, poly, excl, taken));
     }
+    /* Slots are geometry; shapes are DOM. Everything above this line is
+       free, so the budget is checked before a single node is created. */
+    var fcProbe = pack(r.fcBlocks, fSpec.lf, fSpec.wf, poly, excl,
+                       taken.slice(), bb.y1, split + gutter / 2, bb.x2);
+    var wouldDraw = podSlots.length + fcProbe.length + (r.bessKwh > 0 ? 1 : 0);
+    if (wouldDraw > SHAPE_BUDGET && !(opts && opts.force)) {
+      var msg = 'This build needs ' + wouldDraw.toLocaleString() + ' shapes ('
+        + podSlots.length + ' pods, ' + fcProbe.length + ' fuel cells). '
+        + 'The parcel holds them, but the drawing will not: past '
+        + SHAPE_BUDGET + ' the canvas locks and the project stops saving. '
+        + 'Reduce the IT load, or run with {force:true} if you accept that.';
+      if (typeof showBanner === 'function') showBanner('cal', msg);
+      if (root.console) console.warn(TAG + ' ' + msg);
+      return { blocked: true, wouldDraw: wouldDraw,
+               pods: podSlots.length, fc: fcProbe.length, drawn: false };
+    }
+
     podSlots.forEach(function (s, i) {
       push({
         id: (typeof uid === 'function' ? uid() : 'p' + i + Date.now()),
@@ -147449,6 +147499,28 @@ if (root.console && console.info) {
 
   root.OmegaComputePlace = {
     build: build,
+    /* Wipes everything the engine placed AND any auto-layout solar,
+       which build() alone leaves behind. For undoing a run that filled
+       the parcel with a thousand shapes. */
+    clearAll: function () {
+      var n = clearPrevious();
+      try {
+        for (var i = S.shapes.length - 1; i >= 0; i--) {
+          var s = S.shapes[i];
+          if (!s || (!s.autoLayout && !s.omegaCompute && !s.omegaGasTie)) continue;
+          var id = s.id;
+          S.shapes.splice(i, 1); n++;
+          var el = document.querySelector('#csvg [data-shid="' + id + '"]');
+          if (el && el.parentNode) el.parentNode.removeChild(el);
+        }
+        if (typeof updShapeCount === 'function') updShapeCount();
+        if (typeof pushHist === 'function') pushHist();
+      } catch (e) {}
+      if (typeof showBanner === 'function') {
+        showBanner('cal', 'Cleared ' + n + ' placed shapes. Hand-drawn work is untouched.');
+      }
+      return n;
+    },
     placeSubstation: placeSubstation,
     drawSubstation: drawSubstation,
     clear: clearPrevious,
@@ -147508,21 +147580,103 @@ if (root.console && console.info) {
      is the binding constraint, then reads back how many actually landed.
      Sizing to a wild figure and letting geometry cut it down is simpler
      and more honest than trying to predict the count analytically. */
+  /* PREFLIGHT.
+     What Fits once reported 1,138 pods and 1,138 MW IT on a fifty-acre
+     parcel, with a grid ceiling of zero and 1,270 generators placed to
+     close a gap it had invented. The packer was not wrong — that many
+     containers do tile into that much ground. The ANSWER was worthless,
+     because the two things that bound a real site were missing: a
+     calibrated scale, so feet meant nothing, and a substation, so the
+     entire facility read as a gap to be closed on site.
+
+     A tool that produces a confident absurd number is worse than one
+     that refuses, because somebody forwards the number. */
+  function preflight(opts) {
+    var stop = [], warn = [];
+
+    if (!boundary()) {
+      stop.push('No parcel boundary. Trace one first \u2014 there is nothing to fill.');
+    }
+
+    var ppf = 0;
+    try { ppf = +S.pxPerFt || 0; } catch (e) {}
+    if (!(ppf > 0)) {
+      stop.push('Drawing scale is not calibrated. Every footprint would be measured in '
+        + 'pixels, so the count would be arbitrary. Use Calibrate Scale, or capture a '
+        + 'site through Site Setup.');
+    }
+
+    var sub = null;
+    try { sub = S.substationLookup; } catch (e) {}
+    var placedSub = false;
+    try {
+      placedSub = (S.shapes || []).some(function (s) { return s && s.kind === 'substation'; });
+    } catch (e) {}
+    if (!sub && !placedSub) {
+      stop.push('No substation. With no grid ceiling the whole facility counts as a gap '
+        + 'and the run fills the parcel with generation. Run Find Substation, or '
+        + 'Place Substation and set its firm MW.');
+    }
+
+    /* An acreage this run cannot exceed on any defensible basis. */
+    var acres = null;
+    try {
+      if (root.OmegaSiteRoles && root.OmegaSiteRoles.netAcres) acres = root.OmegaSiteRoles.netAcres();
+    } catch (e) {}
+    if (acres != null && acres < 1) {
+      warn.push('Buildable area reads ' + acres.toFixed(2) + ' acres \u2014 check the scale '
+        + 'before trusting anything downstream.');
+    }
+    return { stop: stop, warn: warn, acres: acres };
+  }
+
+  /* THE DENSITY CEILING IS AN ASSUMPTION, AND IT IS THE ONE THAT MATTERS.
+     Geometry alone allows about 31 containers per acre: a 40x10 ft unit
+     with 15 ft of clearance occupies 1,375 sqft, and an acre is 43,560.
+     That is why the unbounded run reported 22.8 MW/acre and thought it
+     was fine. Access roads only remove about 9% of it.
+
+     What actually bounds a containerised campus is everything that is
+     not the container: cooling plant, electrical rooms, fire lanes,
+     laydown, the substation yard, and setbacks. Published modular
+     builds land nearer 5 to 10 MW of IT per acre all-in. 10 is used
+     here as a planning figure, not a fact, and it is the first thing to
+     replace with a number from your own reference builds:
+
+         OmegaMaxFit.densityCeiling(7)
+
+     The run reports which constraint bound it, because "limited by
+     land" and "limited by the density assumption" lead to completely
+     different next moves. */
+  var MW_PER_ACRE_CEILING = 10;
+
   function run(opts) {
     opts = opts || {};
-    var poly = boundary();
-    if (!poly) {
-      if (typeof showBanner === 'function') {
-        showBanner('cal', 'Trace the parcel boundary first \u2014 there is nothing to fill.');
+    var pre = preflight(opts);
+    if (pre.stop.length && !opts.force) {
+      var msg = 'Cannot size this parcel yet. ' + pre.stop[0];
+      if (typeof showBanner === 'function') showBanner('cal', msg);
+      if (root.console) {
+        console.warn(TAG + ' preflight stopped the run:');
+        pre.stop.forEach(function (s) { console.warn('  \u2022 ' + s); });
+        console.info('  OmegaMaxFit.run({force:true}) overrides, but the result will not '
+          + 'mean anything.');
       }
-      return null;
+      return { blocked: pre.stop };
     }
+    pre.warn.forEach(function (w) { if (root.console) console.warn(TAG + ' ' + w); });
+
+    var poly = boundary();
     if (!root.OmegaCompute || !CP()) return null;
 
     var probe = +opts.probeMw || 200;
     var pue = +opts.pue || 1.3;
     var ride = +opts.rideMin || 10;
-    var cap = +opts.maxProbeMw || 3200;
+    /* The ceiling is the smaller of a generous probe bound and what the
+       land could carry at a real density. */
+    var landCap = (pre.acres != null && pre.acres > 0)
+      ? Math.ceil(pre.acres * MW_PER_ACRE_CEILING) : 3200;
+    var cap = Math.min(+opts.maxProbeMw || 3200, landCap);
 
     /* THE PROBE MUST NOT BE THE ANSWER.
        Sizing to a big number and reading back what landed only works if
@@ -147544,6 +147698,17 @@ if (root.console && console.info) {
       if (!sized) break;
       try { placed = CP().build(); } catch (e) { if (root.console) console.warn(TAG, e); break; }
       if (!placed) break;
+      /* build() refuses to draw past its shape budget and says so.
+         Treat that as the binding constraint and stop, rather than
+         doubling into a run that can never be drawn. */
+      if (placed.blocked) {
+        if (root.console) {
+          console.warn(TAG + ' stopped at ' + probe + ' MW \u2014 the drawing budget '
+            + 'binds before the land does (' + placed.wouldDraw + ' shapes needed).');
+        }
+        saturated = false;
+        break;
+      }
       saturated = placed.pods >= placed.podsWanted;
       if (saturated) probe *= 2;
     }
@@ -147576,7 +147741,13 @@ if (root.console && console.info) {
       solar: solar,
       sizing: real,
       probeMw: probe,
-      probeWasBinding: saturated
+      probeWasBinding: saturated,
+      acres: pre.acres,
+      /* Naming the binding constraint matters more than the number:
+         "limited by land" and "limited by the density ceiling" lead to
+         completely different next moves. */
+      boundBy: saturated ? 'the ' + MW_PER_ACRE_CEILING + ' MW/acre density ceiling'
+                         : 'available land'
     };
     root._omegaMaxFit = out;
     report(out);
@@ -147643,6 +147814,11 @@ if (root.console && console.info) {
       bits.push(n1(o.sizing.genNeedKw / 1000) + ' MW gap to close on site');
     }
     var msg = 'This parcel holds ' + bits.join(', ') + '.';
+    if (o.acres && o.itMw) {
+      var dens = o.itMw / o.acres;
+      msg += '  ' + dens.toFixed(1) + ' MW IT per acre over ' + o.acres.toFixed(1) + ' ac';
+      msg += o.boundBy ? ' \u2014 limited by ' + o.boundBy + '.' : '.';
+    }
     if (typeof showBanner === 'function') showBanner('cal', msg);
     if (root.console) console.info(TAG + ' ' + msg);
   }
@@ -147751,9 +147927,219 @@ if (root.console && console.info) {
   }
 
   root.OmegaMaxFit = {
-    run: run, fillSolar: fillSolar, gasTieIn: gasTieIn,
+    run: run, preflight: preflight,
+    densityCeiling: function (v) { if (v > 0) MW_PER_ACRE_CEILING = +v; return MW_PER_ACRE_CEILING; }, fillSolar: fillSolar, gasTieIn: gasTieIn,
     last: function () { return root._omegaMaxFit || null; }
   };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 63 — THE VIDEO 4 BUILD
+ *  ---------------------------------------------------------------------
+ *  What Fits answers "how much could this parcel carry", and on a large
+ *  parcel the honest answer is thousands of containers, which is a
+ *  number worth having and a drawing nobody can use.
+ *
+ *  This is the other button. A stated load, drawn properly:
+ *
+ *      40 x 1 MW MDC pods in a block
+ *      115 x 300 kW SOFC at N+1 in a block beside it
+ *      one ride-through BESS pad
+ *      the substation on the edge facing the tap
+ *      a gas tie-in marker
+ *
+ *  156 shapes. It pans, it saves, and every figure on it is defensible.
+ *  That is the design the videos show, and it is what a screening
+ *  package actually needs.
+ *
+ *  WHY A SEPARATE BUTTON RATHER THAN A FLAG
+ *  The two ask different questions. What Fits asks what the land is
+ *  worth and should be free to report a number too large to draw.
+ *  This asks the site to be laid out at a load somebody has committed
+ *  to. Collapsing them into one control with an option would make the
+ *  dangerous default easy to reach by accident, which is exactly how
+ *  the canvas ended up with 1,273 shapes on it.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[SiteBuild]';
+
+  function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+
+  function ready() {
+    var stop = [];
+    try {
+      if (!(root.OmegaComputePlace && root.OmegaComputePlace.boundary())) {
+        stop.push('Trace the parcel boundary first.');
+      }
+    } catch (e) { stop.push('Trace the parcel boundary first.'); }
+    try { if (!(+S.pxPerFt > 0)) stop.push('Calibrate the drawing scale first.'); }
+    catch (e) { stop.push('Calibrate the drawing scale first.'); }
+    return stop;
+  }
+
+  /* Clears anything a previous run left, so repeated presses replace
+     rather than stack. Stacking is how 1,273 shapes happen. */
+  function reset() {
+    try { if (root.OmegaComputePlace && root.OmegaComputePlace.clearAll) {
+      return root.OmegaComputePlace.clearAll();
+    } } catch (e) {}
+    return 0;
+  }
+
+  function build(opts) {
+    opts = opts || {};
+    var stop = ready();
+    if (stop.length) {
+      if (typeof showBanner === 'function') showBanner('cal', stop[0]);
+      return null;
+    }
+
+    var itMw = +opts.itMw || 40;
+    var pue = +opts.pue || 1.3;
+    var ride = +opts.rideMin || 10;
+
+    reset();
+
+    var sized = null;
+    try {
+      sized = root.OmegaCompute.size({
+        itMw: itMw, pue: pue, rideMin: ride,
+        redundancy: opts.redundancy || 'n1',
+        island: opts.island || 'parallel'
+      });
+    } catch (e) { if (root.console) console.warn(TAG + ' size', e && e.message); }
+    if (!sized) return null;
+
+    var placed = null;
+    try { placed = root.OmegaComputePlace.build(); } catch (e) {}
+    if (!placed) return null;
+    if (placed.blocked) {
+      if (typeof showBanner === 'function') {
+        showBanner('cal', itMw + ' MW needs ' + placed.wouldDraw.toLocaleString()
+          + ' shapes \u2014 more than the drawing can carry. Try a smaller load.');
+      }
+      return placed;
+    }
+
+    /* Substation on the edge facing the tap, so the tie line leaves the
+       site pointing at where the tap actually is. */
+    var sub = null;
+    try {
+      var has = (S.shapes || []).some(function (s) { return s && s.kind === 'substation'; });
+      if (!has) sub = root.OmegaComputePlace.placeSubstation();
+    } catch (e) {}
+
+    var gas = null;
+    if (opts.gas !== false) {
+      try { gas = root.OmegaMaxFit && root.OmegaMaxFit.gasTieIn(); } catch (e) {}
+    }
+
+    try { if (root.OmegaComputeHUD) root.OmegaComputeHUD.refresh(); } catch (e) {}
+    try { if (root.OmegaSited) root.OmegaSited.refresh(); } catch (e) {}
+
+    var total = 0;
+    try { total = (S.shapes || []).filter(function (s) { return s && s.omegaCompute; }).length; }
+    catch (e) {}
+
+    var msg = itMw + ' MW IT laid out \u2014 ' + placed.pods + ' pods, ' + placed.fc
+      + ' SOFC blocks'
+      + (sized.bessKwh ? ', ' + Math.round(sized.bessKwh).toLocaleString() + ' kWh ride-through' : '')
+      + (sub ? ', substation on the ' + (sub.label ? 'edge' : 'edge') : '')
+      + '. ' + total + ' shapes.';
+    if (sized.genNeedKw > 0) {
+      msg += '  Gap to close on site: ' + n1(sized.genNeedKw / 1000) + ' MW.';
+    }
+    if (typeof showBanner === 'function') showBanner('cal', msg);
+    if (root.console) console.info(TAG + ' ' + msg);
+
+    return { sized: sized, placed: placed, substation: sub, gas: gas, shapes: total };
+  }
+
+  /* Ask for the load rather than assuming it. One field, because the
+     rest of the ladder follows from it. */
+  function prompt() {
+    var stop = ready();
+    if (stop.length) {
+      if (typeof showBanner === 'function') showBanner('cal', stop[0]);
+      return false;
+    }
+    var old = document.getElementById('omega-sitebuild');
+    if (old) old.remove();
+    var w = document.createElement('div');
+    w.id = 'omega-sitebuild';
+    w.style.cssText = 'position:fixed;inset:0;z-index:9000;background:rgba(0,0,0,.55);'
+      + 'display:flex;align-items:center;justify-content:center';
+    w.innerHTML = '<div style="background:#1E1E1E;border:1px solid #3A3A3A;border-radius:11px;'
+      + 'padding:20px;max-width:400px;width:100%;font-family:inherit">'
+      + '<div style="font-size:15px;font-weight:700;color:#E0E0E0;margin-bottom:3px">'
+      + 'Lay out the site</div>'
+      + '<div style="font-size:11px;color:#9A9A9A;margin-bottom:16px;line-height:1.5">'
+      + 'Pods, fuel cells to close the grid gap, ride-through storage, and the '
+      + 'substation \u2014 drawn inside the parcel and around the exclusions.</div>'
+      + '<label style="font-size:10px;color:#9A9A9A;text-transform:uppercase;'
+      + 'letter-spacing:.6px">IT load (MW)</label>'
+      + '<input id="osb-it" type="number" value="40" min="1" max="200" step="1" '
+      + 'style="width:100%;background:#0B1626;border:1px solid #3A3A3A;color:#E0E0E0;'
+      + 'border-radius:6px;padding:9px;font-size:16px;font-family:inherit;'
+      + 'box-sizing:border-box;margin:5px 0 14px">'
+      + '<div style="display:flex;gap:8px">'
+      + '<button data-a="go" style="flex:1;padding:11px;background:#2FB54A;color:#0A1628;'
+      + 'border:none;border-radius:7px;font-weight:800;cursor:pointer;font-family:inherit;'
+      + 'font-size:12px">Build it</button>'
+      + '<button data-a="x" style="padding:11px 16px;background:none;border:1px solid #3A3A3A;'
+      + 'color:#9A9A9A;border-radius:7px;cursor:pointer;font-family:inherit;font-size:12px">'
+      + 'Cancel</button></div></div>';
+    w.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-a]') : null;
+      if (!b) { if (e.target === w) w.remove(); return; }
+      var a = b.getAttribute('data-a');
+      var mw = 40;
+      var f = document.getElementById('osb-it');
+      if (f && +f.value > 0) mw = +f.value;
+      w.remove();
+      if (a === 'go') setTimeout(function () { build({ itMw: mw }); }, 30);
+    });
+    document.body.appendChild(w);
+    setTimeout(function () {
+      var f = document.getElementById('osb-it');
+      if (f) { f.focus(); f.select(); }
+    }, 40);
+    return true;
+  }
+
+  function inject() {
+    if (document.getElementById('rb-site-build')) return true;
+    var host = document.getElementById('rb-max-fit') || document.getElementById('rb-place-sub');
+    if (!host || !host.parentNode) return false;
+    var b = document.createElement('button');
+    b.className = 'rbtn'; b.id = 'rb-site-build';
+    b.title = 'Lay Out Site \u2014 pods, fuel cells, storage and the substation for a load '
+      + 'you name, drawn inside the parcel. Replaces any previous layout.';
+    b.onclick = prompt;
+    b.innerHTML = '<span class="rb-ico" style="color:#2FB54A">\u25A6</span>'
+      + '<span class="rb-lbl">Lay Out<br>Site</span>';
+    host.parentNode.insertBefore(b, host);
+    try {
+      if (root.OmegaMode && root.OmegaMode.keep) root.OmegaMode.keep(/rb-site-build/);
+    } catch (e) {}
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      inject();
+      if (++n > 40) clearInterval(iv);
+    }, 600);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaSiteBuild.build({itMw:40})');
+  }
+
+  root.OmegaSiteBuild = { build: build, prompt: prompt, reset: reset, ready: ready };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
