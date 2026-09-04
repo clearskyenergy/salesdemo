@@ -147270,6 +147270,13 @@ if (root.console && console.info) {
   }
 
   function push(shape) {
+    /* The shape renderer prints lf and wf straight into a dimension
+       label: sh.lf + "' x " + sh.wf + "'". Any float reaches the drawing
+       verbatim, which is how a BESS pad came to be labelled
+       197.67286196889526' x 79.0697448455514'. Rounding here means no
+       caller has to remember. */
+    if (shape && shape.lf != null) shape.lf = Math.round(+shape.lf * 10) / 10;
+    if (shape && shape.wf != null) shape.wf = Math.round(+shape.wf * 10) / 10;
     S.shapes.push(shape);
     try { if (typeof renderShape === 'function') renderShape(shape); } catch (e) {}
     return shape;
@@ -148310,8 +148317,21 @@ if (root.console && console.info) {
 
   var locked = true;   /* placed equipment starts locked */
 
+  /* WHAT THE LOCK IS FOR.
+     The problem it solves is nudging one of two hundred identical
+     containers while trying to pan. That argument does not apply to the
+     things there is exactly one of and whose position is a decision:
+     the substation, the gas tie-in, the parcel boundary, the
+     exclusions. Locking those made the substation undraggable, which is
+     worse than the problem the lock was added to fix.
+
+     So the lock covers the generated field and nothing else. */
   function isPlaced(sh) {
-    return !!(sh && (sh.omegaCompute || sh.autoLayout));
+    if (!sh) return false;
+    if (sh.kind === 'substation') return false;   /* sited by hand */
+    if (sh.omegaGasTie) return false;             /* a bearing you set  */
+    if (sh.omegaRole) return false;               /* boundary, exclusion */
+    return !!(sh.omegaCompute || sh.autoLayout);
   }
 
   /* Blocks the gesture at capture, before the editor's own handlers see
@@ -148341,9 +148361,9 @@ if (root.console && console.info) {
     badge();
     if (typeof showBanner === 'function') {
       showBanner('cal', locked
-        ? 'Layout locked \u2014 pan and zoom freely, placed equipment will not move. '
-          + 'Hand-drawn shapes are still editable.'
-        : 'Layout unlocked \u2014 placed equipment can be dragged again.');
+        ? 'Field locked \u2014 pods, fuel cells and storage will not move when you pan. '
+          + 'Substation, gas tie-in, boundary and exclusions are still draggable.'
+        : 'Everything unlocked \u2014 the placed field can be dragged again.');
     }
     return locked;
   }
@@ -148362,11 +148382,12 @@ if (root.console && console.info) {
       if (right && right.parentNode) right.parentNode.insertBefore(b, right);
       else sb.appendChild(b);
     }
-    b.textContent = locked ? '\u25A0 LAYOUT LOCKED' : '\u25A1 LAYOUT UNLOCKED';
+    b.textContent = locked ? '\u25A0 FIELD LOCKED' : '\u25A1 FIELD UNLOCKED';
     b.style.color = locked ? '#4ADE80' : '#F59E0B';
     b.title = locked
-      ? 'Placed equipment is locked so panning does not drag it. Click to unlock.'
-      : 'Placed equipment can be dragged. Click to lock.';
+      ? 'Pods, fuel cells and storage are locked so panning does not nudge them. '
+        + 'The substation, gas tie-in, boundary and exclusions stay draggable. Click to unlock all.'
+      : 'Everything is draggable, including the placed field. Click to lock the field.';
   }
 
   /* ── 3. optimise ────────────────────────────────────────────────────── */
@@ -150088,6 +150109,180 @@ if (root.console && console.info) {
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', enable);
   } else { enable(); }
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 67 — THE REPORT IS A DELIVERABLE
+ *  ---------------------------------------------------------------------
+ *  Three faults, all of them visible the moment somebody outside the
+ *  room opens the file.
+ *
+ *  1. THE DESIGN IMAGE IS A SCREENSHOT OF THE APPLICATION.
+ *  _captureFullCanvas() renders #sc, and #sc holds every overlay: the
+ *  "Results not updated" toast, the load-vs-ceiling panel, the legend,
+ *  the compass, the zoom buttons, the ruler. A client opens the report
+ *  and sees a picture of software rather than a picture of their site.
+ *  The overlays are hidden for the duration of the capture and put
+ *  back, which also removes the toast that says the numbers are stale
+ *  from a document whose whole job is to present numbers.
+ *
+ *  2. THE SCREEN RESULT PRINTS THE SIZER'S PROSE.
+ *  "No substation lookup on this project - grid capacity unknown. Run
+ *  Find Substation first..." is an instruction to the operator. It is
+ *  correct, and it does not belong on a page going to a lender. The
+ *  gate ladder already turns that state into "Incomplete - grid
+ *  unknown / HOLD / Run Find Substation", which is the same fact in a
+ *  form somebody can act on.
+ *
+ *  3. EMPTY SECTIONS LEAVE ORPHAN ROWS.
+ *  With no solar the DESIGN block prints one lonely acreage row under a
+ *  full-width image and then stops. A section with one row is not a
+ *  section; either it has content or it should not be on the page.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[ReportFix]';
+
+  /* Everything in #sc that is chrome rather than site. */
+  var OVERLAYS = [
+    'omega-ladder', 'rr-stale', 'lgd', 'lgd-items', 'eng-legend',
+    'zc', 'zc-unlock', 'zpct', 'ruler', 'ruler-bar', 'ruler-lbl',
+    'banner', 'rr-mapbadge', 'o2-coords', 'tl-key', 'snapring',
+    'cal-ov', 'sub-props', 'omega-extype'
+  ];
+
+  function hideChrome() {
+    var hidden = [];
+    OVERLAYS.forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el && el.style.display !== 'none') {
+        hidden.push([el, el.style.display]);
+        el.style.display = 'none';
+      }
+    });
+    /* Class-based overlays the ids miss. */
+    ['.cel', '.omega-toast', '.map-attrib'].forEach(function (sel) {
+      var els = document.querySelectorAll('#sc ' + sel);
+      for (var i = 0; i < els.length; i++) {
+        if (els[i].style.display !== 'none') {
+          hidden.push([els[i], els[i].style.display]);
+          els[i].style.display = 'none';
+        }
+      }
+    });
+    return hidden;
+  }
+
+  function restore(hidden) {
+    hidden.forEach(function (h) { try { h[0].style.display = h[1] || ''; } catch (e) {} });
+  }
+
+  function wrapCapture() {
+    if (typeof root._captureFullCanvas !== 'function' || root._captureFullCanvas.__clean) return;
+    var orig = root._captureFullCanvas;
+    root._captureFullCanvas = function () {
+      var hidden = hideChrome();
+      var done = function (v) { restore(hidden); return v; };
+      var fail = function (e) { restore(hidden); throw e; };
+      try {
+        var out = orig.apply(this, arguments);
+        if (out && typeof out.then === 'function') return out.then(done, fail);
+        return done(out);
+      } catch (e) { return fail(e); }
+    };
+    root._captureFullCanvas.__clean = true;
+    if (root.console) console.info(TAG + ' capture now excludes UI chrome');
+  }
+
+  /* ── verdict ────────────────────────────────────────────────────────── */
+
+  /* Replaces the prose verdict in the site report's compute block with
+     the gate ladder, so both documents say the same thing in the same
+     words. */
+  function patchComputeBlock() {
+    if (!root.OmegaReportV2 || root.OmegaReportV2.__verdict) return;
+    var origRender = root.OmegaReportV2.render;
+    if (typeof origRender !== 'function') return;
+    root.OmegaReportV2.render = function () {
+      var r = origRender.apply(this, arguments);
+      try { swapVerdict(); } catch (e) {}
+      try { pruneOrphans(); } catch (e) {}
+      return r;
+    };
+    root.OmegaReportV2.__verdict = true;
+  }
+
+  function swapVerdict() {
+    var body = document.getElementById('report-body');
+    if (!body) return;
+    var sc = null;
+    try { sc = root.OmegaLoadScreen && root.OmegaLoadScreen.screen(); } catch (e) {}
+    if (!sc) return;
+    var rows = body.querySelectorAll('div');
+    for (var i = 0; i < rows.length; i++) {
+      var el = rows[i];
+      if (el.children.length !== 2) continue;
+      var label = (el.children[0].textContent || '').trim().toLowerCase();
+      if (label !== 'screen result') continue;
+      var tone = { ok: '#4ADE80', warn: '#F59E0B', bad: '#F87171' }[sc.tone] || 'var(--text)';
+      el.children[1].innerHTML = '<span style="font-weight:700">' + sc.label + '</span>'
+        + '<span style="color:' + tone + ';font-weight:800;margin-left:12px;'
+        + "font-family:'IBM Plex Mono',monospace\">" + sc.act + '</span>';
+      /* Next gate is the actionable half and was not on the page. */
+      var gate = document.createElement('div');
+      gate.style.cssText = 'display:flex;justify-content:space-between;gap:18px;'
+        + 'padding:12px 2px;border-bottom:1px solid var(--border);font-size:13.5px';
+      gate.innerHTML = '<span style="color:var(--text)">Next gate</span>'
+        + '<span style="color:var(--sub);text-align:right">' + sc.gate + '</span>';
+      if (el.nextSibling) el.parentNode.insertBefore(gate, el.nextSibling);
+      else el.parentNode.appendChild(gate);
+      break;
+    }
+  }
+
+  /* ── orphan sections ────────────────────────────────────────────────── */
+
+  /* A heading with fewer than two rows under it is noise. Runs after
+     render, on the DOM, so it applies to whatever the renderers emit
+     without either of them having to know about the rule. */
+  function pruneOrphans() {
+    var body = document.getElementById('report-body');
+    if (!body) return 0;
+    var kids = Array.prototype.slice.call(body.querySelectorAll(':scope > div > *'));
+    var pruned = 0, i, j;
+    for (i = 0; i < kids.length; i++) {
+      var el = kids[i];
+      var isHead = /uppercase/.test(el.getAttribute('style') || '')
+        && el.children.length === 0;
+      if (!isHead) continue;
+      var rows = 0;
+      for (j = i + 1; j < kids.length; j++) {
+        var nxt = kids[j];
+        if (/uppercase/.test(nxt.getAttribute('style') || '') && nxt.children.length === 0) break;
+        if (nxt.children.length === 2) rows++;
+      }
+      if (rows === 0) { el.style.display = 'none'; pruned++; }
+    }
+    return pruned;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      wrapCapture(); patchComputeBlock();
+      if (++n > 40) clearInterval(iv);
+    }, 500);
+    if (root.console) console.info(TAG + ' ready');
+  }
+
+  root.OmegaReportFix = {
+    hideChrome: hideChrome, restore: restore,
+    pruneOrphans: pruneOrphans, overlays: OVERLAYS
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
 
