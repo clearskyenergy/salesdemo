@@ -145742,12 +145742,43 @@ if (root.console && console.info) {
 
   /* ── keeping scale honest as the view moves ─────────────────────────── */
 
-  function recalibrate() {
+  /* Last view this was calibrated against, so an idle that reports no
+     actual movement does no work. */
+  var lastView = null;
+
+  function interacting() {
+    try {
+      return !!(S.drag || S.resizing || S.rotating || S.shapeDrag
+        || S.shapeResize || S.shapeRotate || S.asmPartDrag);
+    } catch (e) { return false; }
+  }
+
+  function recalibrate(force) {
     var m = map();
     if (!m || typeof m.getCenter !== 'function') return false;
     var c, z;
     try { c = m.getCenter(); z = m.getZoom(); } catch (e) { return false; }
     if (!c) return false;
+
+    /* NEVER REPROJECT MID-GESTURE.
+       _geoReprojectAll() moves every shape to the pixel position implied
+       by its stored geo anchor. A drag changes the pixels but not the
+       anchor, so reprojecting during one drags the shape straight back
+       under the cursor and the canvas feels frozen. */
+    if (!force && interacting()) return false;
+
+    /* And not at all unless the view actually moved. Making the map
+       interactive means idle fires constantly; without this the
+       reprojector runs on every one of them for no reason. */
+    var view = { lat: c.lat(), lng: c.lng(), zoom: z };
+    if (!force && lastView
+        && Math.abs(lastView.lat - view.lat) < 1e-9
+        && Math.abs(lastView.lng - view.lng) < 1e-9
+        && lastView.zoom === view.zoom) {
+      return false;
+    }
+    lastView = view;
+
     try {
       if (typeof _setScaleFromZoomLat === 'function') _setScaleFromZoomLat(z, c.lat());
       else if (typeof _gmapAutoScale === 'function') _gmapAutoScale();
@@ -145758,6 +145789,36 @@ if (root.console && console.info) {
     try { if (typeof _geoStampAll === 'function') _geoStampAll(); } catch (e) {}
     try { if (typeof root._geoReprojectAll === 'function') root._geoReprojectAll(); } catch (e) {}
     return true;
+  }
+
+  /* _geoStampAll only stamps a shape that has NO anchor, and the
+     mouseup handler re-stamps elements but not shapes. So a shape the
+     user moved keeps the anchor it had before the move and the next
+     pan puts it back. Clearing its stamps on mouseup lets the next
+     stamp re-anchor it where the user actually left it. */
+  function watchDrags() {
+    if (root.__omegaDragWatch) return;
+    root.__omegaDragWatch = true;
+    var moving = null;
+    document.addEventListener('mousedown', function () {
+      try { moving = S.shapeDrag || S.shapeResize || S.shapeRotate || null; } catch (e) {}
+    }, true);
+    document.addEventListener('mouseup', function () {
+      var id = null;
+      try { id = moving || S.shapeDrag || S.shapeResize || S.shapeRotate; } catch (e) {}
+      moving = null;
+      if (!id) return;
+      setTimeout(function () {
+        try {
+          (S.shapes || []).forEach(function (sh) {
+            if (!sh || sh.id !== id) return;
+            delete sh._geoPts; delete sh._geoLat; delete sh._geoLng;
+            delete sh._geoCx; delete sh._geoBoundary;
+          });
+          if (typeof _geoStampAll === 'function') _geoStampAll();
+        } catch (e) {}
+      }, 0);
+    }, true);
   }
 
   function hookIdle() {
@@ -145812,8 +145873,8 @@ if (root.console && console.info) {
     /* setCenter/setZoom are async; the projection is only trustworthy
        once the map has settled, so calibrate on idle rather than now. */
     hookIdle();
-    setTimeout(recalibrate, 350);
-    setTimeout(recalibrate, 1200);
+    setTimeout(function(){ recalibrate(true); }, 350);
+    setTimeout(function(){ recalibrate(true); }, 1200);
 
     if (typeof showBanner === 'function') {
       showBanner('cal', 'Live site \u2014 scale calibrated and tracking. '
@@ -145847,7 +145908,7 @@ if (root.console && console.info) {
     }
     try { if (typeof root.setMapInteractive === 'function') root.setMapInteractive(true); } catch (e) {}
     hookIdle();
-    var ok = recalibrate();
+    var ok = recalibrate(true);
     if (typeof showBanner === 'function') {
       showBanner('cal', ok
         ? 'Live map restored \u2014 pan and zoom are back, scale is tracking the view.'
@@ -145955,6 +146016,7 @@ if (root.console && console.info) {
   function boot() {
     wrapRun();
     wrapMosaic();
+    watchDrags();
     hookIdle();
     var n = 0, iv = setInterval(function () {
       wrapRun(); wrapMosaic(); injectToggle(); hookIdle();
@@ -147294,7 +147356,13 @@ if (root.console && console.info) {
   /* ── substation ─────────────────────────────────────────────────────── */
 
   /* Placed on the parcel edge nearest the real substation, so the tie
-     line leaves the site pointing at where the tap actually is. */
+     line leaves the site pointing at where the tap actually is.
+
+     A substation is a TWO-POINT shape in this build: pts holds the two
+     opposite corners of the fenced yard, and the renderer draws the
+     rectangle between them. An earlier version of this wrote a single
+     point with lf/wf like a container, which is the convention for
+     equipment blocks and simply does not draw here. */
   function placeSubstation() {
     var poly = boundary();
     if (!poly) {
@@ -147320,24 +147388,39 @@ if (root.console && console.info) {
       cx += (bb.x1 + bb.x2) / 2 > cx ? 10 * P : -10 * P;
       cy += (bb.y1 + bb.y2) / 2 > cy ? 10 * P : -10 * P;
     }
-    var name = 'Substation', mw = null;
+    var name = 'Utility Substation', mw = 10, kv = '';
     try {
       var LK = S.substationLookup;
-      if (LK) { name = LK.name || name; mw = LK.capMw; }
+      if (LK) {
+        name = LK.name || name;
+        if (LK.capMw != null) mw = LK.capMw;
+        if (LK.kv) kv = LK.kv + ' kV';
+      }
     } catch (e) {}
+    var w = 120 * P, h = 90 * P;
     var sh = push({
       id: (typeof uid === 'function' ? uid() : 'sub' + Date.now()),
-      kind: 'substation', pts: [{ x: cx, y: cy }],
-      style: (S.shapeStyle || ''), lf: 80, wf: 60,
-      model: name, capMw: mw,
+      kind: 'substation',
+      pts: [{ x: cx - w / 2, y: cy - h / 2 }, { x: cx + w / 2, y: cy + h / 2 }],
+      label: name, capMw: mw, voltage: kv, firm: true,
+      color: '#F59E0B', fill: '#F59E0B', fillOpacity: 0.12,
       scaled: !!(S.pxPerFt > 0), omegaCompute: true
     });
+    try { if (typeof updShapeCount === 'function') updShapeCount(); } catch (e) {}
     try { if (typeof pushHist === 'function') pushHist(); } catch (e) {}
     if (typeof showBanner === 'function') {
-      showBanner('cal', 'Substation pad placed on the ' + dir + ' edge'
-        + (mw != null ? ' \u2014 ' + mw + ' MW screening basis' : '') + '.');
+      showBanner('cal', 'Substation placed on the ' + dir + ' edge'
+        + (mw != null ? ' \u2014 ' + mw + ' MW basis' : '')
+        + '. Drag it, or use Draw \u203a Substation to set the yard by hand.');
     }
     return sh;
+  }
+
+  /* The hand-drawn path, for a yard whose real extents are known. */
+  function drawSubstation() {
+    if (typeof root.setSubstationMode === 'function') return root.setSubstationMode();
+    if (typeof rbMode === 'function') { rbMode('substation'); return true; }
+    return false;
   }
 
   /* ── wire into the existing dialog ──────────────────────────────────── */
@@ -147367,11 +147450,309 @@ if (root.console && console.info) {
   root.OmegaComputePlace = {
     build: build,
     placeSubstation: placeSubstation,
+    drawSubstation: drawSubstation,
     clear: clearPrevious,
     boundary: boundary,
     lastResult: function () { return root._omegaComputePlaced || null; },
     legacy: function () { return legacyPlace ? legacyPlace.apply(this, arguments) : null; },
     config: CFG
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 60 — WHAT FITS HERE
+ *  ---------------------------------------------------------------------
+ *  Compute Build answers "I need 40 MW, does this site take it?".
+ *  A land play asks the question the other way round: here is a parcel,
+ *  what will it hold? Same packer, opposite direction.
+ *
+ *  maxFit() packs pods until the ground runs out and reports the MW.
+ *  Then it fills what is left with PV and sizes storage against the
+ *  result, so one run answers all four:
+ *
+ *      how many modular units      pods placed x 1 MW
+ *      how many solar panels       tables placed, kW-DC
+ *      how big a battery           ride-through on the sited load
+ *      where the tie-ins are       substation pad and gas marker
+ *
+ *  ORDER: COMPUTE FIRST, THEN SOLAR
+ *  On an energised land play the load is what the site is worth. Pods
+ *  are inflexible — they need road access, clearance and a security
+ *  envelope — while PV bends around whatever is left and still produces.
+ *  Filling with solar first would strand megawatts of load capacity to
+ *  win a few hundred kW of generation. Reverse it with
+ *  OmegaMaxFit.run({ solarFirst: true }) if a particular site argues for
+ *  the other order.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[MaxFit]';
+
+  function P() { try { return (S.pxPerFt > 0) ? S.pxPerFt : 6; } catch (e) { return 6; } }
+  function CP() { return root.OmegaComputePlace; }
+  function n0(v) { return Math.round(v).toLocaleString(); }
+  function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+
+  function boundary() {
+    try { return CP() ? CP().boundary() : null; } catch (e) { return null; }
+  }
+
+  /* ── capacity ───────────────────────────────────────────────────────── */
+
+  /* Runs the sizer at a load big enough that the parcel, not the number,
+     is the binding constraint, then reads back how many actually landed.
+     Sizing to a wild figure and letting geometry cut it down is simpler
+     and more honest than trying to predict the count analytically. */
+  function run(opts) {
+    opts = opts || {};
+    var poly = boundary();
+    if (!poly) {
+      if (typeof showBanner === 'function') {
+        showBanner('cal', 'Trace the parcel boundary first \u2014 there is nothing to fill.');
+      }
+      return null;
+    }
+    if (!root.OmegaCompute || !CP()) return null;
+
+    var probe = +opts.probeMw || 200;
+    var pue = +opts.pue || 1.3;
+    var ride = +opts.rideMin || 10;
+    var cap = +opts.maxProbeMw || 3200;
+
+    /* THE PROBE MUST NOT BE THE ANSWER.
+       Sizing to a big number and reading back what landed only works if
+       the ground ran out first. When every pod requested is placed, the
+       parcel was never the constraint and the reported figure is just
+       the probe — so it doubles and runs again until geometry bites or
+       the ceiling is hit. Reporting a probe value as a site capacity
+       would be inventing a number, which is the one thing this tool
+       cannot do. */
+    var sized = null, placed = null, saturated = true, guard = 0;
+    while (saturated && probe <= cap && guard++ < 6) {
+      try {
+        sized = root.OmegaCompute.size({
+          itMw: probe, pue: pue, rideMin: ride,
+          redundancy: opts.redundancy || 'n1',
+          island: opts.island || 'parallel'
+        });
+      } catch (e) { if (root.console) console.warn(TAG + ' size', e && e.message); break; }
+      if (!sized) break;
+      try { placed = CP().build(); } catch (e) { if (root.console) console.warn(TAG, e); break; }
+      if (!placed) break;
+      saturated = placed.pods >= placed.podsWanted;
+      if (saturated) probe *= 2;
+    }
+    if (!sized || !placed) return null;
+    if (saturated && root.console) {
+      console.warn(TAG + ' parcel still not full at ' + cap + ' MW \u2014 reporting the '
+        + 'probe ceiling, not a site limit. Raise maxProbeMw if this is a real parcel.');
+    }
+
+    /* What the ground actually took. */
+    var itMw = placed.pods;                   /* pods are 1 MW each */
+    var facMw = itMw * pue;
+
+    /* Re-size honestly at the load that fits, so gap, gas and storage
+       describe the real build rather than the 400 MW probe. */
+    var real = null;
+    try {
+      real = root.OmegaCompute.size({
+        itMw: itMw, pue: pue, rideMin: ride,
+        redundancy: opts.redundancy || 'n1',
+        island: opts.island || 'parallel'
+      });
+    } catch (e) {}
+
+    var solar = opts.solar === false ? null : fillSolar();
+
+    var out = {
+      pods: placed.pods, itMw: itMw, facilityMw: facMw,
+      sofcPlaced: placed.fc,
+      solar: solar,
+      sizing: real,
+      probeMw: probe,
+      probeWasBinding: saturated
+    };
+    root._omegaMaxFit = out;
+    report(out);
+    try { if (root.OmegaComputeHUD) root.OmegaComputeHUD.refresh(); } catch (e) {}
+    return out;
+  }
+
+  /* ── solar into what is left ────────────────────────────────────────── */
+
+  /* The compute pack has already claimed its ground and left its blocks
+     on the canvas. computeGroundLayout() rejects a table whose corner
+     falls in an exclusion, so the placed equipment is handed to it as
+     exclusions and PV flows around the buildings by the same rule that
+     keeps it out of a wetland. */
+  function fillSolar(opts) {
+    opts = opts || {};
+    var poly = boundary();
+    if (!poly || typeof computeGroundLayout !== 'function') return null;
+
+    var excl = [];
+    try { excl = (root._alExclusions || []).slice(); } catch (e) {}
+
+    try {
+      (S.shapes || []).forEach(function (sh) {
+        if (!sh || !sh.omegaCompute) return;
+        var pts = sh.pts || [];
+        if (sh.kind === 'substation' && pts.length >= 2) {
+          excl.push([
+            { x: pts[0].x, y: pts[0].y }, { x: pts[1].x, y: pts[0].y },
+            { x: pts[1].x, y: pts[1].y }, { x: pts[0].x, y: pts[1].y }
+          ]);
+          return;
+        }
+        if (!pts.length) return;
+        var w = (+sh.lf || 20) * P(), h = (+sh.wf || 10) * P();
+        var x = pts[0].x, y = pts[0].y;
+        excl.push([{ x: x, y: y }, { x: x + w, y: y },
+                   { x: x + w, y: y + h }, { x: x, y: y + h }]);
+      });
+    } catch (e) {}
+
+    var layout = null;
+    try {
+      layout = computeGroundLayout({
+        boundary: poly, exclusions: excl,
+        presetKey: opts.presetKey || 'fixed_ground',
+        gcr: +opts.gcr || 0.40,
+        setbackFt: +opts.setbackFt || 25
+      });
+    } catch (e) { if (root.console) console.warn(TAG + ' solar', e && e.message); }
+    if (!layout || !layout.tableCount) return null;
+
+    try { applyGroundLayout(poly, layout, excl); } catch (e) { return null; }
+    return { tables: layout.tableCount, kwDc: layout.kw, kwAc: layout.kwAc, gcr: layout.gcr };
+  }
+
+  function report(o) {
+    var bits = [o.pods + ' pods \u2014 ' + o.itMw + ' MW IT'];
+    if (o.solar) bits.push(n0(o.solar.kwDc) + ' kW-DC solar in ' + n0(o.solar.tables) + ' tables');
+    if (o.sizing && o.sizing.bessKwh) {
+      bits.push(n0(o.sizing.bessKwh) + ' kWh ride-through');
+    }
+    if (o.sizing && o.sizing.genNeedKw > 0) {
+      bits.push(n1(o.sizing.genNeedKw / 1000) + ' MW gap to close on site');
+    }
+    var msg = 'This parcel holds ' + bits.join(', ') + '.';
+    if (typeof showBanner === 'function') showBanner('cal', msg);
+    if (root.console) console.info(TAG + ' ' + msg);
+  }
+
+  /* ── gas tie-in ─────────────────────────────────────────────────────── */
+
+  /* A marker on the boundary edge facing the recorded main. It is a
+     bearing, not a survey: the distance came from OmegaGas.setMain(),
+     which is typed in, so the marker says where the service would come
+     from rather than where a pipe is. */
+  function gasTieIn() {
+    var poly = boundary();
+    if (!poly) {
+      if (typeof showBanner === 'function') showBanner('cal', 'Trace the parcel boundary first.');
+      return null;
+    }
+    var g = null;
+    try { g = root.OmegaGas && root.OmegaGas.main(); } catch (e) {}
+    var dir = (g && g.bearing) ? g.bearing : 'S';
+    var xs = poly.map(function (p) { return p.x; }), ys = poly.map(function (p) { return p.y; });
+    var x1 = Math.min.apply(null, xs), x2 = Math.max.apply(null, xs);
+    var y1 = Math.min.apply(null, ys), y2 = Math.max.apply(null, ys);
+    var cx = (x1 + x2) / 2, cy = (y1 + y2) / 2;
+    if (dir.indexOf('N') > -1) cy = y1 + 30 * P();
+    if (dir.indexOf('S') > -1) cy = y2 - 30 * P();
+    if (dir.indexOf('E') > -1) cx = x2 - 30 * P();
+    if (dir.indexOf('W') > -1) cx = x1 + 30 * P();
+
+    var dem = null;
+    try { dem = root.OmegaGas && root.OmegaGas.demand(); } catch (e) {}
+    var label = 'GAS TIE-IN'
+      + (dem ? ' \u00b7 ' + n1(dem.mmbtuHr) + ' MMBtu/hr' : '')
+      + (g ? ' \u00b7 ' + n1(g.miles) + ' mi ' + dir : ' \u00b7 main not recorded');
+
+    var sh = {
+      id: (typeof uid === 'function' ? uid() : 'gas' + Date.now()),
+      kind: 'callout', pts: [{ x: cx, y: cy }, { x: cx + 90 * P(), y: cy - 40 * P() }],
+      text: label, color: '#F59E0B',
+      scaled: !!(S.pxPerFt > 0), omegaCompute: true, omegaGasTie: true
+    };
+    try {
+      S.shapes.push(sh);
+      if (typeof renderShape === 'function') renderShape(sh);
+      if (typeof updShapeCount === 'function') updShapeCount();
+      if (typeof pushHist === 'function') pushHist();
+    } catch (e) { return null; }
+    if (typeof showBanner === 'function') {
+      showBanner('cal', g
+        ? 'Gas tie-in marked on the ' + dir + ' edge \u2014 ' + n1(g.miles)
+          + ' mi to the main, entered not surveyed.'
+        : 'Gas tie-in marked. Record the main with OmegaGas.setMain(miles, "S") '
+          + 'so the distance prints on the screen.');
+    }
+    return sh;
+  }
+
+  /* ── buttons ────────────────────────────────────────────────────────── */
+
+  function btn(id, icon, colour, label, title, fn, after) {
+    if (document.getElementById(id)) return false;
+    var host = document.getElementById(after);
+    if (!host || !host.parentNode) return false;
+    var b = document.createElement('button');
+    b.className = 'rbtn'; b.id = id; b.title = title; b.onclick = fn;
+    b.innerHTML = '<span class="rb-ico" style="color:' + colour + '">' + icon + '</span>'
+      + '<span class="rb-lbl">' + label + '</span>';
+    host.parentNode.insertBefore(b, host.nextSibling);
+    return true;
+  }
+
+  function inject() {
+    var made = false;
+    made = btn('rb-place-sub', '\u26EC', '#F59E0B', 'Place<br>Substation',
+      'Place Substation \u2014 drops a yard on the parcel edge facing the tap. '
+      + 'Shift-click to draw the fence line by hand instead.',
+      function (e) {
+        if (e && e.shiftKey && CP() && CP().drawSubstation) return CP().drawSubstation();
+        return CP() && CP().placeSubstation();
+      }, 'rb-trace-exclusion') || made;
+
+    made = btn('rb-gas-tie', '\u2668', '#F59E0B', 'Gas<br>Tie-In',
+      'Gas Tie-In \u2014 marks the edge facing the recorded transmission main, '
+      + 'with the demand this build would draw.', gasTieIn, 'rb-sub-envelope') || made;
+
+    made = btn('rb-max-fit', '\u229E', '#A78BFA', 'What<br>Fits',
+      'What Fits \u2014 packs the parcel with as many compute pods as it will hold, '
+      + 'fills the remainder with PV and sizes storage against the result.',
+      function () { return run(); }, 'rb-place-sub') || made;
+
+    if (made) {
+      try {
+        if (root.OmegaMode && root.OmegaMode.keep) {
+          root.OmegaMode.keep(/rb-(place-sub|gas-tie|max-fit)/);
+        }
+      } catch (e) {}
+    }
+    return made;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      inject();
+      if (++n > 40) clearInterval(iv);
+    }, 600);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaMaxFit.run() / .gasTieIn()');
+  }
+
+  root.OmegaMaxFit = {
+    run: run, fillSolar: fillSolar, gasTieIn: gasTieIn,
+    last: function () { return root._omegaMaxFit || null; }
   };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
@@ -147739,6 +148120,201 @@ if (root.console && console.info) {
 
 <script>
 /* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 62 — WHAT IS ACTUALLY ON THE CANVAS
+ *  ---------------------------------------------------------------------
+ *  Draw a compute container by hand from Draw > Data Ctr and it does not
+ *  count toward anything. The sizer reports what the load NEEDS and the
+ *  placer reports what IT placed, and neither one looks at the canvas.
+ *  So two containers drawn by hand are, as far as every readout is
+ *  concerned, not there.
+ *
+ *  Both are kind:'derdc' carrying kw. There is no difference between a
+ *  container the engine placed and one drawn by hand except a flag the
+ *  engine sets on its own. Sited capacity is a property of the drawing,
+ *  not of who drew it.
+ *
+ *  THREE NUMBERS THAT ARE NOT THE SAME NUMBER
+ *      needed   what the load requires        (the sizer)
+ *      placed   what the auto-pack managed    (the placer)
+ *      sited    what is on the canvas now     (this)
+ *  They diverge constantly and each divergence means something. Sited
+ *  below needed is a shortfall. Sited above placed means somebody added
+ *  containers by hand and the sizing behind them is now stale.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Sited]';
+
+  function shapes() {
+    try { return (typeof S !== 'undefined' && S.shapes) ? S.shapes : []; } catch (e) { return []; }
+  }
+
+  /* Every derdc on the canvas, whoever put it there. */
+  function compute() {
+    var n = 0, kw = 0, drawn = 0, auto = 0;
+    shapes().forEach(function (s) {
+      if (!s || s.kind !== 'derdc') return;
+      var q = +(s.qty || 1);
+      n += q;
+      kw += (+(s.kw || 0)) * q;
+      if (s.omegaCompute) auto += q; else drawn += q;
+    });
+    return { units: n, kw: kw, mw: kw / 1000, drawn: drawn, auto: auto };
+  }
+
+  function generation() {
+    var kw = 0, n = 0;
+    shapes().forEach(function (s) {
+      if (!s || s.kind !== 'deralt') return;
+      var q = +(s.qty || 1);
+      n += q; kw += (+(s.kw || 0)) * q;
+    });
+    return { units: n, kw: kw, mw: kw / 1000 };
+  }
+
+  function solar() {
+    var kw = 0, n = 0;
+    shapes().forEach(function (s) {
+      if (!s || (s.kind !== 'dersolar' && s.kind !== 'solar')) return;
+      n++; kw += +(s.kw || 0);
+    });
+    return { arrays: n, kwDc: kw };
+  }
+
+  function storage() {
+    var kw = 0, kwh = 0;
+    try {
+      (S.bessList || []).forEach(function (b) {
+        var q = +(b.qty || 1);
+        kw += (+(b.kw || 0)) * q; kwh += (+(b.kwh || 0)) * q;
+      });
+    } catch (e) {}
+    shapes().forEach(function (s) {
+      if (!s || s.kind !== 'bespad') return;
+      kw += +(s.kw || 0); kwh += +(s.kwh || 0);
+    });
+    return { kw: kw, kwh: kwh };
+  }
+
+  function all() {
+    var c = compute(), g = generation(), sol = solar(), st = storage();
+    var needed = null;
+    try { needed = root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute(); } catch (e) {}
+    var placed = root._omegaComputePlaced || null;
+
+    var out = {
+      compute: c, generation: g, solar: sol, storage: st,
+      needed: needed ? { mw: needed.itKw / 1000, facilityMw: needed.facKw / 1000,
+                         sofcMw: (needed.fcKw || 0) / 1000 } : null,
+      placed: placed ? { pods: placed.pods, sofc: placed.fc } : null,
+      notes: []
+    };
+
+    /* The divergences, said plainly. */
+    if (needed && c.units > 0) {
+      var need = needed.itKw / 1000;
+      if (c.mw + 0.01 < need) {
+        out.notes.push('Sited ' + c.mw.toFixed(1) + ' MW of ' + need.toFixed(1)
+          + ' MW required \u2014 ' + (need - c.mw).toFixed(1) + ' MW short on the canvas.');
+      } else if (c.mw > need + 0.01) {
+        out.notes.push('Sited ' + c.mw.toFixed(1) + ' MW against a ' + need.toFixed(1)
+          + ' MW sizing \u2014 re-run Compute Build so the gap, gas and storage match what is drawn.');
+      }
+    }
+    if (c.drawn > 0 && c.auto > 0) {
+      out.notes.push(c.drawn + ' container' + (c.drawn === 1 ? '' : 's') + ' drawn by hand '
+        + 'alongside ' + c.auto + ' auto-placed. Both count.');
+    } else if (c.drawn > 0) {
+      out.notes.push(c.drawn + ' container' + (c.drawn === 1 ? '' : 's')
+        + ' drawn by hand \u2014 ' + c.mw.toFixed(1) + ' MW IT sited.');
+    }
+    if (g.kw > 0 && needed && needed.genNeedKw > 0 && g.kw < needed.genNeedKw) {
+      out.notes.push('On-site generation sited ' + g.mw.toFixed(1) + ' MW against a '
+        + (needed.genNeedKw / 1000).toFixed(1) + ' MW gap.');
+    }
+    return out;
+  }
+
+  function report() {
+    var a = all();
+    var bits = [];
+    if (a.compute.units) bits.push(a.compute.units + ' compute \u00b7 ' + a.compute.mw.toFixed(1) + ' MW');
+    if (a.generation.units) bits.push(a.generation.units + ' gen \u00b7 ' + a.generation.mw.toFixed(1) + ' MW');
+    if (a.solar.kwDc) bits.push(Math.round(a.solar.kwDc).toLocaleString() + ' kW-DC solar');
+    if (a.storage.kwh) bits.push(Math.round(a.storage.kwh).toLocaleString() + ' kWh storage');
+    var msg = bits.length ? 'On the canvas: ' + bits.join(', ') + '.' : 'Nothing sited yet.';
+    if (a.notes.length) msg += ' ' + a.notes[0];
+    if (typeof showBanner === 'function') showBanner('cal', msg);
+    if (root.console) {
+      console.info(TAG + ' ' + msg);
+      if (console.table) console.table([a.compute, a.generation, a.solar, a.storage]);
+    }
+    return a;
+  }
+
+  /* The rail's ON-SITE block should show what is drawn, not only what
+     the sizer wanted. Appended rather than rewritten so the HUD stays
+     the owner of its own layout. */
+  function augmentRail() {
+    var box = document.getElementById('omega-rail');
+    if (!box) return;
+    var a = all();
+    var old = document.getElementById('omega-sited');
+    if (!a.compute.units && !a.generation.units && !a.solar.kwDc) {
+      if (old) old.remove();
+      return;
+    }
+    if (!old) {
+      old = document.createElement('div');
+      old.id = 'omega-sited';
+      box.appendChild(old);
+    }
+    var row = function (l, v, c) {
+      return '<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:11px">'
+        + '<span style="color:var(--sub)">' + l + '</span>'
+        + '<span style="color:' + (c || 'var(--text)') + ';'
+        + 'font-family:\'IBM Plex Mono\',monospace">' + v + '</span></div>';
+    };
+    var h = '<div style="font-size:9px;letter-spacing:1.3px;text-transform:uppercase;'
+      + 'color:#8B7BD8;margin:12px 0 5px;padding-top:9px;'
+      + 'border-top:1px solid var(--border)">Sited on canvas</div>';
+    if (a.compute.units) {
+      h += row('Compute units', a.compute.units + ' \u00b7 ' + a.compute.mw.toFixed(1) + ' MW');
+    }
+    if (a.generation.units) {
+      h += row('Generation', a.generation.units + ' \u00b7 ' + a.generation.mw.toFixed(1) + ' MW');
+    }
+    if (a.solar.kwDc) h += row('Solar', Math.round(a.solar.kwDc).toLocaleString() + ' kW-DC');
+    if (a.storage.kwh) h += row('Storage', Math.round(a.storage.kwh).toLocaleString() + ' kWh');
+    if (a.notes.length) {
+      h += '<div style="margin-top:8px;padding:6px 8px;background:rgba(245,158,11,.10);'
+        + 'border:1px solid rgba(245,158,11,.28);border-radius:6px;font-size:10px;'
+        + 'color:#F59E0B;line-height:1.5">' + a.notes[0] + '</div>';
+    }
+    old.innerHTML = h;
+  }
+
+  function boot() {
+    /* Repaint after the HUD does, and after any shape change. */
+    var n = 0, iv = setInterval(function () {
+      try { augmentRail(); } catch (e) {}
+      if (++n > 600) clearInterval(iv);      /* ~5 min, then idle */
+    }, 500);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaSited.report()');
+  }
+
+  root.OmegaSited = {
+    all: all, report: report, compute: compute, generation: generation,
+    solar: solar, storage: storage, refresh: augmentRail
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
  *  OMEGA PATCH 56 — LOAD SITING SCREEN
  *  ---------------------------------------------------------------------
  *  The compute-side report: CAPACITY, FUEL, NETWORK, SCREEN RESULT.
@@ -148009,6 +148585,166 @@ if (root.console && console.info) {
   root.OmegaLoadScreen = { open: open, html: html, screen: function () {
     var r = compute(); return r ? screen(r) : null;
   } };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 61 — SUBSTATION LABEL
+ *  ---------------------------------------------------------------------
+ *  The label chip on a substation draws as an empty black bar.
+ *
+ *  The renderer sizes the chip from the shape and the type from a
+ *  clamp:
+ *
+ *      var fs = Math.max(9, Math.min(15, w * 0.055));
+ *
+ *  The rectangle therefore grows with the yard while the text stops at
+ *  15 SVG units. A 120 ft substation at any working scale is several
+ *  hundred units across, so the chip fills the shape and the two lines
+ *  inside it render a couple of pixels tall. The text is present in the
+ *  DOM the whole time, which is why nothing looks broken — it is just
+ *  too small to see.
+ *
+ *  This redraws the chip after the native render, with type sized from
+ *  the shape and no ceiling. Everything else the renderer produced —
+ *  the yard, the transformer coils, the selection handles — is left
+ *  alone; only the chip and its two <text> nodes are replaced.
+ *
+ *  Fixing it downstream rather than in place keeps it reversible, and
+ *  the native renderer lives inside an IIFE that this cannot reach
+ *  without rewriting the block it sits in.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[SubLabel]';
+
+  var NS = 'http://www.w3.org/2000/svg';
+  function mk(t) { return document.createElementNS(NS, t); }
+
+  function shapeOf(id) {
+    try {
+      var l = S.shapes || [];
+      for (var i = 0; i < l.length; i++) if (l[i].id === id) return l[i];
+    } catch (e) {}
+    return null;
+  }
+
+  function relabel(sh) {
+    if (!sh || sh.kind !== 'substation' || !sh.pts || sh.pts.length < 2) return false;
+    var svg = document.getElementById('csvg');
+    if (!svg) return false;
+    var g = svg.querySelector('[data-shid="' + sh.id + '"]');
+    if (!g) return false;
+
+    var a = sh.pts[0], b = sh.pts[1];
+    var x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+    var w = Math.abs(b.x - a.x), h = Math.abs(b.y - a.y);
+    if (!(w > 0 && h > 0)) return false;
+    var cx = x + w / 2;
+
+    /* Remove what the native pass drew for the chip: the last rect and
+       every text node in the group. The yard rect is the first one, so
+       it survives. */
+    var texts = g.querySelectorAll('text');
+    for (var i = 0; i < texts.length; i++) texts[i].parentNode.removeChild(texts[i]);
+    var rects = g.querySelectorAll('rect');
+    if (rects.length > 1) {
+      var last = rects[rects.length - 1];
+      /* Only if it looks like the chip: dark fill, sitting low. */
+      var f = last.getAttribute('fill') || '';
+      if (f.indexOf('rgba(10') === 0 || f.indexOf('rgb(10') === 0) {
+        last.parentNode.removeChild(last);
+      }
+    }
+
+    var cap = isFinite(+sh.capMw) ? +sh.capMw : 0;
+    var line1 = sh.label || 'Utility Substation';
+    var line2 = cap.toLocaleString() + ' MW firm' + (sh.voltage ? ' \u00b7 ' + sh.voltage : '');
+
+    /* Type sized from the shape with no ceiling, so it stays readable
+       whatever the drawing scale. The floor keeps it from vanishing on
+       a tiny yard; the width cap keeps a long label inside the fence. */
+    var fs = Math.max(10, w * 0.075);
+    var longest = Math.max(line1.length, line2.length);
+    var maxByWidth = (w * 0.92) / (longest * 0.56);
+    fs = Math.min(fs, maxByWidth);
+    fs = Math.max(8, fs);
+
+    var chipW = Math.min(longest * fs * 0.56 + fs, w * 0.96);
+    var chipH = fs * 2.5 + fs * 0.6;
+    var chx = cx - chipW / 2, chy = y + h - chipH - Math.max(4, h * 0.05);
+
+    var chip = mk('rect');
+    chip.setAttribute('x', chx); chip.setAttribute('y', chy);
+    chip.setAttribute('width', chipW); chip.setAttribute('height', chipH);
+    chip.setAttribute('rx', Math.max(3, fs * 0.35));
+    chip.setAttribute('fill', 'rgba(10,12,22,0.88)');
+    chip.setAttribute('stroke', sh.color || '#F59E0B');
+    chip.setAttribute('stroke-width', Math.max(1, fs * 0.08));
+    chip.setAttribute('data-omega-chip', '1');
+    g.appendChild(chip);
+
+    function text(ty, s, size, fill, weight) {
+      var t = mk('text');
+      t.setAttribute('x', cx); t.setAttribute('y', ty);
+      t.setAttribute('font-size', size);
+      t.setAttribute('fill', fill);
+      t.setAttribute('text-anchor', 'middle');
+      t.setAttribute('font-family', "Arial,'Helvetica',sans-serif");
+      t.setAttribute('font-weight', weight);
+      t.setAttribute('data-omega-chip', '1');
+      t.textContent = s;
+      g.appendChild(t);
+      return t;
+    }
+    text(chy + fs * 1.05, line1, fs, '#F5C871', '700');
+    text(chy + fs * 2.2, line2, fs * 0.9, '#E2EEF9', '600');
+    return true;
+  }
+
+  function relabelAll() {
+    var n = 0;
+    try {
+      (S.shapes || []).forEach(function (sh) {
+        if (sh && sh.kind === 'substation' && relabel(sh)) n++;
+      });
+    } catch (e) {}
+    return n;
+  }
+
+  /* renderShape is already wrapped by a later block for substation and
+     EV kinds, so this wraps whatever is current and runs after it. */
+  function install() {
+    if (typeof root.renderShape !== 'function' || root.renderShape.__sublabel) return false;
+    var orig = root.renderShape;
+    root.renderShape = function (sh) {
+      var r = orig.apply(this, arguments);
+      if (sh && sh.kind === 'substation') {
+        /* After the native pass, not during: it appends its own chip
+           and would land on top of this one. */
+        setTimeout(function () { try { relabel(sh); } catch (e) {} }, 0);
+      }
+      return r;
+    };
+    root.renderShape.__sublabel = true;
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      if (install()) { relabelAll(); clearInterval(iv); }
+      if (++n > 40) clearInterval(iv);
+    }, 400);
+    /* A restored project renders its shapes before this loads. */
+    setTimeout(relabelAll, 2000);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaSubLabel.refresh()');
+  }
+
+  root.OmegaSubLabel = { refresh: relabelAll, one: relabel };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
