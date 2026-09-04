@@ -145702,11 +145702,46 @@ if (root.console && console.info) {
     return true;
   }
 
+  /* Even in frozen mode the mosaic should be an IMAGE, not a state
+     change. applyMosaic() sets _userLockedMap, calls setMapInteractive
+     (false) and leaves _committedPlot set, and that last one is what
+     makes _liveMapState() return null and switches off geo-anchoring
+     for the whole session.
+
+     The mosaic is still wanted — it is the 3D ground texture and the
+     print backdrop. What is not wanted is it taking the live map with
+     it. So the lock is undone immediately after the mosaic is applied:
+     the image stays, interactivity and anchoring come back, and the
+     scale is re-derived from the live projection rather than the still. */
+  function wrapMosaic() {
+    if (typeof root.applyMosaic !== 'function' || root.applyMosaic.__live) return;
+    var orig = root.applyMosaic;
+    root.applyMosaic = function (m) {
+      var ok = orig.apply(this, arguments);
+      if (!ok) return ok;
+      try {
+        root._committedPlot = null;
+        root._userLockedMap = false;
+        root._mapLocked = false;
+        if (typeof root.setMapInteractive === 'function') root.setMapInteractive(true);
+      } catch (e) {}
+      hookIdle();
+      setTimeout(recalibrate, 250);
+      if (typeof showBanner === 'function') {
+        showBanner('cal', 'Backdrop captured \u2014 map stays live. '
+          + 'Pan and zoom still work and drawn objects stay anchored to the ground.');
+      }
+      return ok;
+    };
+    root.applyMosaic.__live = true;
+  }
+
   function boot() {
     wrapRun();
+    wrapMosaic();
     hookIdle();
     var n = 0, iv = setInterval(function () {
-      wrapRun(); injectToggle(); hookIdle();
+      wrapRun(); wrapMosaic(); injectToggle(); hookIdle();
       if (++n > 30) clearInterval(iv);
     }, 500);
     if (root.console) {
@@ -146264,14 +146299,45 @@ if (root.console && console.info) {
     }
   }
 
+  /* OmegaCompute.recalc() reads the dialog's own inputs, so it returns
+     zeros the moment the dialog closes and the report could never show
+     a compute ladder. size() is the pure function underneath it, so the
+     last real result is cached as it goes past.
+
+     In memory only: the project save payload carries elements,
+     conduits, shapes, trench, bessList, docTabs and brand, and adding a
+     key to S would not survive a reload. Reopening Compute Build
+     repopulates it. */
+  function wrapCompute() {
+    if (!root.OmegaCompute || typeof root.OmegaCompute.size !== 'function') return;
+    if (root.OmegaCompute.size.__facts) return;
+    var orig = root.OmegaCompute.size;
+    root.OmegaCompute.size = function () {
+      var r = orig.apply(this, arguments);
+      try { if (r && r.facKw > 0) root._omegaComputeLast = r; } catch (e) {}
+      return r;
+    };
+    root.OmegaCompute.size.__facts = true;
+  }
+
+  function compute() {
+    return root._omegaComputeLast || null;
+  }
+
   function boot() {
     wrapApply();
     wrapSizer();
+    wrapCompute();
+    var n = 0, iv = setInterval(function () {
+      wrapCompute();                 /* OmegaCompute loads in a later block */
+      if (++n > 20) clearInterval(iv);
+    }, 500);
     if (root.console) console.info(TAG + ' ready \u2014 OmegaLayoutFacts.get() / .headroom()');
   }
 
   root.OmegaLayoutFacts = {
     get: layoutFacts,
+    compute: compute,
     shape: layoutShape,
     headroom: headroom,
     substation: substation,
@@ -146547,6 +146613,51 @@ if (root.console && console.info) {
     return sectionHead('Cost') + body;
   }
 
+  /* A compute site is sized load-first, not area-first: the question is
+     not how much fits but whether the grid will carry it and what has
+     to be generated on site to close the gap. OmegaCompute.size()
+     already computes that whole ladder; it just never reached the
+     report. Rendered only when a compute build exists, so a solar
+     project is unaffected. */
+  function computeBlock() {
+    var r = null;
+    try {
+      if (root.OmegaLayoutFacts && typeof root.OmegaLayoutFacts.compute === 'function') {
+        r = root.OmegaLayoutFacts.compute();
+      }
+    } catch (e) { return ''; }
+    if (!r || !(r.facKw > 0)) return '';
+
+    var mw = function (kw) { return n1(kw / 1000) + ' MW'; };
+    var body = '';
+    body += row('Facility load \u2014 ' + n1(r.itKw / 1000) + ' MW IT at PUE '
+      + (r.pue || 1.3), mw(r.facKw));
+    if (r.utilKw != null) body += row('Utility screening ceiling', mw(r.utilKw));
+    if (r.genNeedKw != null) {
+      body += row('Gap to close on site',
+        '<span style="color:' + (r.genNeedKw > 0 ? '#F87171' : '#4ADE80') + '">'
+        + mw(r.genNeedKw) + '</span>');
+    }
+    if (r.fcBlocks > 0) {
+      body += row('SOFC \u2014 ' + r.fcBlocks + ' \u00d7 '
+        + n0(r.fcKw / r.fcBlocks) + ' kW', mw(r.fcKw));
+      body += row('Natural gas at full generation', n1(r.gasMmbtuHr) + ' MMBtu/hr');
+    }
+    if (r.bessKwh > 0) {
+      body += row('Ride-through on critical bus',
+        mw(r.bessKw) + ' / ' + n0(r.bessKwh) + ' kWh');
+    }
+    if (r.pods > 0) body += row('Compute pods', n0(r.pods));
+    if (r.verdict) {
+      body += '<div style="display:flex;justify-content:space-between;padding:16px 2px;'
+        + 'border-top:2px solid var(--border);margin-top:2px">'
+        + '<span style="font-size:14px;font-weight:700;color:var(--text)">Screen result</span>'
+        + '<span style="font-size:14px;font-weight:700;color:var(--text)">'
+        + esc(r.verdict) + '</span></div>';
+    }
+    return sectionHead('Load siting') + body;
+  }
+
   function render() {
     var body = document.getElementById('report-body');
     if (!body) return;
@@ -146558,6 +146669,7 @@ if (root.console && console.info) {
       + (F.address ? '<div style="font-size:13px;color:var(--sub);font-family:\'IBM Plex Mono\',monospace">'
         + esc(F.address) + '</div>' : '')
       + locationBlock(F)
+      + computeBlock()
       + designBlock(F)
       + costBlock(F)
       + '</div>';
@@ -146811,6 +146923,310 @@ if (root.console && console.info) {
     restoreLegacy: function () {
       if (legacy) { root._reportShareLink = legacy; return true; }
       return false;
+    }
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 52 — SHELF: ONE ADDRESS PER TOOL
+ *  ---------------------------------------------------------------------
+ *  Nothing is removed. 120 buttons go in, 120 come out. What changes is
+ *  where they live.
+ *
+ *  THE THREE FAULTS BEING FIXED
+ *
+ *  1. Establishing the ground is one job split across three tabs.
+ *     Site Setup / Trace Boundary / Add Exclusion sit in Build, while
+ *     Upload Image / Lock Map / Set Plot / GPS Place / Clear Plot /
+ *     Recenter sit in View, and Calibrate Scale / Clear Scale sit in
+ *     Modify. You cannot set up a site without already knowing all
+ *     three locations.
+ *
+ *  2. View is a junk drawer. 24 buttons, the largest tab in the ribbon,
+ *     holding backdrop tools, genuine view state and panel launchers
+ *     with nothing to distinguish them.
+ *
+ *  3. Four tools have two addresses. Calibrate Scale is in Modify and
+ *     View. Export for Validation and Validation Status are in Output
+ *     and in the hidden Validation stub. Permit Creator is in Output
+ *     twice.
+ *
+ *  HOW, AND WHY THIS WAY
+ *  The ribbon is 57 KB of hand-tuned markup with live onclick bindings,
+ *  gating hooks and Designer-mode keep-flags attached to the nodes
+ *  themselves. Re-authoring it would break RibbonGating and
+ *  OmegaMode.keep() and would be exactly the kind of change that eats a
+ *  working build. So this moves the existing DOM nodes with
+ *  appendChild. Every button keeps its id, its handler, its tooltip and
+ *  its gating. OmegaShelf.restore() puts them all back.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Shelf]';
+
+  /* label -> { to: page, panel: caption }  ------------------------------
+     Labels are matched on the button's own .rb-lbl text, normalised so
+     that "Calib- rate Scale" and "Calibrate Scale" are the same key. */
+  var MOVES = [
+    /* --- the ground, gathered into Build where Site Setup already is --- */
+    { label: 'upload image',    to: 'home', panel: 'Ground' },
+    { label: 'lock map',        to: 'home', panel: 'Ground' },
+    { label: 'set plot',        to: 'home', panel: 'Ground' },
+    { label: 'gps place',       to: 'home', panel: 'Ground' },
+    { label: 'clear plot',      to: 'home', panel: 'Ground' },
+    { label: 'recenter',        to: 'home', panel: 'Ground' },
+    { label: 'calibrate scale', to: 'home', panel: 'Ground', from: 'modify' },
+    { label: 'clear scale',     to: 'home', panel: 'Ground', from: 'modify' },
+
+    /* --- drafting verbs collapse into one tab ------------------------- */
+    { label: 'text note',       to: 'draw', panel: 'Annotate' },
+    { label: 'callout arrow',   to: 'draw', panel: 'Annotate' },
+    { label: 'dimension',       to: 'draw', panel: 'Annotate' },
+    { label: 'zone box',        to: 'draw', panel: 'Annotate' },
+    { label: 'building net-zero', to: 'draw', panel: 'Annotate' }
+  ];
+
+  /* Duplicates. The FIRST occurrence in document order is kept; every
+     later copy is hidden, not deleted, so restore() is exact and so a
+     stale onclick elsewhere in the file cannot hit a missing node. */
+  var DEDUPE = ['calibrate scale', 'permit creator', 'export for validation', 'validation status'];
+
+  /* Captions that describe a drawer rather than name a category. */
+  var RECAPTION = {
+    'site overlay': 'Backdrop',
+    'canvas': 'Display',
+    'assessment': '1 \u00b7 Screening',
+    'connectivity': '2 \u00b7 Grid & Network',
+    'operations': '3 \u00b7 Operations',
+    'markup': 'Annotate',
+    'edit': 'Edit',
+    'scale': 'Scale'
+  };
+
+  var undo = [];      /* {node, parent, next, prevDisplay} */
+  var made = [];      /* panels this patch created */
+  var applied = false;
+
+  /* ── helpers ────────────────────────────────────────────────────────── */
+
+  function norm(s) {
+    return String(s || '').replace(/<[^>]*>/g, ' ')
+      .replace(/\u00a0/g, ' ')
+      .replace(/-\s+/g, '')            /* "Calib- rate" -> "Calibrate" */
+      .replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function page(name) {
+    return document.querySelector('#ribbon .ribbon-page[data-page="' + name + '"]');
+  }
+
+  function buttons(scope) {
+    return Array.prototype.slice.call((scope || document).querySelectorAll('#ribbon .rbtn'));
+  }
+
+  function labelOf(btn) {
+    var l = btn.querySelector('.rb-lbl');
+    return norm(l ? l.innerHTML : btn.textContent);
+  }
+
+  function pageOf(btn) {
+    var p = btn.closest ? btn.closest('.ribbon-page') : null;
+    return p ? p.getAttribute('data-page') : null;
+  }
+
+  /* Find a panel by caption inside a page, or build one. A created panel
+     matches the existing structure exactly: .rpanel > .rpanel-body +
+     .rpanel-cap, because the CSS keys off that shape. */
+  function panelIn(pg, caption) {
+    var pageEl = page(pg);
+    if (!pageEl) return null;
+    var caps = pageEl.querySelectorAll('.rpanel-cap');
+    for (var i = 0; i < caps.length; i++) {
+      if (norm(caps[i].innerHTML) === norm(caption)) {
+        return caps[i].parentNode.querySelector('.rpanel-body');
+      }
+    }
+    var panel = document.createElement('div');
+    panel.className = 'rpanel';
+    panel.setAttribute('data-shelf', '1');
+    var body = document.createElement('div');
+    body.className = 'rpanel-body';
+    var cap = document.createElement('div');
+    cap.className = 'rpanel-cap';
+    cap.innerHTML = caption;
+    panel.appendChild(body);
+    panel.appendChild(cap);
+    pageEl.appendChild(panel);
+    made.push(panel);
+    return body;
+  }
+
+  function remember(node) {
+    undo.push({
+      node: node,
+      parent: node.parentNode,
+      next: node.nextSibling,
+      prevDisplay: node.style.display
+    });
+  }
+
+  /* ── the three operations ───────────────────────────────────────────── */
+
+  function dedupe() {
+    var seen = {}, n = 0;
+    buttons().forEach(function (b) {
+      var k = labelOf(b);
+      if (DEDUPE.indexOf(k) < 0) return;
+      if (seen[k]) {
+        remember(b);
+        b.style.display = 'none';
+        b.setAttribute('data-shelf-dupe', '1');
+        n++;
+      } else { seen[k] = true; }
+    });
+    return n;
+  }
+
+  function move() {
+    var n = 0;
+    MOVES.forEach(function (mv) {
+      buttons().forEach(function (b) {
+        if (labelOf(b) !== mv.label) return;
+        if (b.getAttribute('data-shelf-dupe')) return;   /* hidden copy */
+        if (mv.from && pageOf(b) !== mv.from) return;
+        if (pageOf(b) === mv.to) return;                 /* already home */
+        var target = panelIn(mv.to, mv.panel);
+        if (!target) return;
+        remember(b);
+        target.appendChild(b);
+        n++;
+      });
+    });
+    return n;
+  }
+
+  function recaption() {
+    var n = 0;
+    var caps = document.querySelectorAll('#ribbon .rpanel-cap');
+    for (var i = 0; i < caps.length; i++) {
+      var k = norm(caps[i].innerHTML);
+      if (RECAPTION[k] && norm(RECAPTION[k]) !== k) {
+        if (!caps[i].getAttribute('data-shelf-orig')) {
+          caps[i].setAttribute('data-shelf-orig', caps[i].innerHTML);
+        }
+        caps[i].innerHTML = RECAPTION[k];
+        n++;
+      }
+    }
+    return n;
+  }
+
+  /* A tab whose every panel is now empty is a door onto an empty
+     cupboard. Hide it rather than leave it to be opened once and
+     distrusted after. */
+  function hideEmptyTabs() {
+    var hidden = [];
+    var pages = document.querySelectorAll('#ribbon .ribbon-page');
+    for (var i = 0; i < pages.length; i++) {
+      var pg = pages[i], name = pg.getAttribute('data-page');
+      if (name === 'home' || name === 'validation') continue;
+      var live = 0;
+      var bs = pg.querySelectorAll('.rbtn');
+      for (var j = 0; j < bs.length; j++) {
+        if (bs[j].style.display !== 'none') live++;
+      }
+      if (live === 0) {
+        var tab = document.querySelector('#ribbon-tabs .rtab[data-page="' + name + '"]');
+        if (tab && tab.style.display !== 'none') {
+          remember(tab);
+          tab.style.display = 'none';
+          hidden.push(name);
+        }
+      }
+    }
+    return hidden;
+  }
+
+  /* ── apply / restore ────────────────────────────────────────────────── */
+
+  function apply() {
+    if (applied) return false;
+    if (!document.getElementById('ribbon')) return false;
+    var d = dedupe();
+    var m = move();
+    var c = recaption();
+    var h = hideEmptyTabs();
+    applied = true;
+    if (root.console) {
+      console.info(TAG + ' ' + m + ' tools rehoused, ' + d + ' duplicates hidden, '
+        + c + ' captions clarified'
+        + (h.length ? ', emptied tabs hidden: ' + h.join(', ') : '')
+        + '. OmegaShelf.restore() reverts.');
+    }
+    /* Designer mode filters by onclick, and the nodes just changed
+       parents, so re-assert the keep-flags. */
+    try { if (root.OmegaMode && root.OmegaMode.retag) root.OmegaMode.retag(); } catch (e) {}
+    return true;
+  }
+
+  function restore() {
+    if (!applied) return false;
+    for (var i = undo.length - 1; i >= 0; i--) {
+      var u = undo[i];
+      try {
+        u.node.style.display = u.prevDisplay || '';
+        u.node.removeAttribute('data-shelf-dupe');
+        if (u.parent) u.parent.insertBefore(u.node, u.next);
+      } catch (e) {}
+    }
+    made.forEach(function (p) { if (p.parentNode) p.parentNode.removeChild(p); });
+    var caps = document.querySelectorAll('#ribbon .rpanel-cap[data-shelf-orig]');
+    for (var j = 0; j < caps.length; j++) {
+      caps[j].innerHTML = caps[j].getAttribute('data-shelf-orig');
+      caps[j].removeAttribute('data-shelf-orig');
+    }
+    undo = []; made = []; applied = false;
+    try { if (root.OmegaMode && root.OmegaMode.retag) root.OmegaMode.retag(); } catch (e) {}
+    if (root.console) console.info(TAG + ' restored to the original layout.');
+    return true;
+  }
+
+  /* Other patches inject ribbon buttons on timers long after load, so
+     the shelf is re-asserted for a while rather than applied once. */
+  function boot() {
+    setTimeout(function () {
+      apply();
+      var n = 0, iv = setInterval(function () {
+        if (!applied) { apply(); return; }
+        move(); recaption();
+        if (++n > 20) clearInterval(iv);
+      }, 700);
+    }, 1200);
+  }
+
+  root.OmegaShelf = {
+    apply: apply,
+    restore: restore,
+    isApplied: function () { return applied; },
+    moves: MOVES,
+    /* Audit: every button, its label and where it now lives. */
+    audit: function () {
+      var rows = buttons().map(function (b) {
+        return {
+          label: labelOf(b),
+          tab: pageOf(b),
+          panel: norm((b.closest('.rpanel') || {}).querySelector
+            ? (b.closest('.rpanel').querySelector('.rpanel-cap') || {}).innerHTML : ''),
+          hidden: b.style.display === 'none'
+        };
+      });
+      if (root.console && console.table) console.table(rows);
+      return rows;
     }
   };
 
