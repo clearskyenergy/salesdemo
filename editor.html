@@ -148524,6 +148524,80 @@ if (root.console && console.info) {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
 })(typeof window !== 'undefined' ? window : globalThis);
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  PATCH 68 — CHANGING THE CEILING SHOULD CHANGE THE ANSWER
+ *  ---------------------------------------------------------------------
+ *  _subApply() writes the new firm MW onto the shape and then says so
+ *  in a comment:
+ *
+ *      if (typeof runResults === 'function') { /* leave recompute to
+ *                                                 the Run button *\/ }
+ *
+ *  Reasonable for the results rail, which is explicit about being stale
+ *  until you press Run. Wrong for the ladder, which is a live readout:
+ *  it sat there showing a gap computed against the old ceiling while
+ *  the panel that set the new one was still open. Two numbers on screen
+ *  disagreeing, with nothing saying which was current.
+ *
+ *  The sizer is cheap and pure, so re-running it on a ceiling change
+ *  costs nothing and removes the contradiction. The placement is NOT
+ *  re-run: moving hundreds of shapes because somebody typed a digit
+ *  would be its own kind of hostile. The rail updates, the drawing
+ *  waits to be asked.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[CeilingSync]';
+
+  function resize() {
+    var r = null;
+    try { r = root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute(); } catch (e) {}
+    if (!r || !(r.itKw > 0)) return false;
+    try {
+      root.OmegaCompute.size({
+        itMw: r.itKw / 1000, pue: r.pue, rideMin: r.rideMin,
+        redundancy: r.redundancy, island: r.island
+      });
+    } catch (e) { return false; }
+    try { if (root.OmegaComputeHUD) root.OmegaComputeHUD.refresh(); } catch (e) {}
+    try { if (root.OmegaBuildLabels) root.OmegaBuildLabels.draw(); } catch (e) {}
+    return true;
+  }
+
+  function install() {
+    if (typeof root._subApply !== 'function' || root._subApply.__sync) return false;
+    var orig = root._subApply;
+    root._subApply = function () {
+      var out = orig.apply(this, arguments);
+      setTimeout(function () {
+        if (!resize()) return;
+        var kw = 0;
+        try { kw = root.OmegaLayout ? root.OmegaLayout.ceilingKw() : 0; } catch (e) {}
+        if (typeof showBanner === 'function' && kw > 0) {
+          showBanner('cal', 'Ceiling now ' + (kw / 1000).toFixed(1)
+            + ' MW \u2014 gap and generation re-sized. The drawing is unchanged; '
+            + 'run Lay Out Site to rebuild against it.');
+        }
+      }, 0);
+      return out;
+    };
+    root._subApply.__sync = true;
+    if (root.console) console.info(TAG + ' substation edits now re-size the ladder');
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      if (install() || ++n > 40) clearInterval(iv);
+    }, 400);
+  }
+
+  root.OmegaCeilingSync = { resize: resize };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
 </script>
 
 <script>
@@ -148678,26 +148752,46 @@ if (root.console && console.info) {
     var fac = r.facKw, util = r.utilKw || 0, gen = r.fcKw || 0;
     var gap = Math.max(0, r.genNeedKw || 0);
     if (!(fac > 0)) return '';
-    var pct = function (kw) { return Math.max(0, Math.min(100, kw / fac * 100)); };
-    var covered = gen >= gap && gap > 0;
 
+    /* THREE SEGMENTS, NOT TWO.
+       The old bar drew the grid band and then one flex div carrying
+       either the gap or the generation, which meant the two states could
+       not be seen against each other and a surplus was invisible. A
+       build that generates 34.5 MW against a 34.0 MW gap has 0.5 MW of
+       headroom, and that is a real number: it is what absorbs a block
+       going down for service. Scale is against the facility load, so
+       every segment is a readable fraction of the same whole. */
+    var served = Math.min(util, fac);                 /* grid carries    */
+    var covered = Math.min(gen, gap);                 /* generation fills */
+    var shortfall = Math.max(0, gap - gen);           /* still uncovered  */
+    var surplus = Math.max(0, gen - gap);             /* headroom         */
+    var span = fac + surplus;                         /* bar runs past
+                                                         facility when
+                                                         generation
+                                                         overshoots      */
+    var w = function (kw) { return (kw / span * 100).toFixed(2) + '%'; };
+
+    var seg = function (kw, bg, label, colour) {
+      if (kw <= 0) return '';
+      return '<div style="width:' + w(kw) + ';background:' + bg + ';display:flex;'
+        + 'align-items:center;padding:0 8px;overflow:hidden;font-size:11.5px;'
+        + 'font-weight:700;color:' + (colour || '#fff') + ';line-height:1.25;'
+        + 'white-space:nowrap">' + (label || '') + '</div>';
+    };
+
+    var hatch = 'repeating-linear-gradient(45deg,#B91C1C,#B91C1C 6px,#7F1D1D 6px,#7F1D1D 12px)';
     var bar = '<div style="display:flex;height:42px;border-radius:5px;overflow:hidden;'
       + 'border:1px solid var(--border)">'
-      + '<div style="width:' + pct(util) + '%;background:#4ADE80"></div>';
-    if (covered) {
-      bar += '<div style="flex:1;background:#7C3AED;display:flex;align-items:center;'
-        + 'padding:0 12px;font-size:12px;font-weight:700;color:#fff;line-height:1.25">'
-        + n1(gen / 1000) + ' MW on site closes a ' + n1(gap / 1000) + ' MW gap</div>';
-    } else {
-      bar += '<div style="flex:1;display:flex;align-items:center;padding:0 12px;'
-        + 'font-size:12px;font-weight:700;color:#fff;'
-        + 'background:repeating-linear-gradient(45deg,#B91C1C,#B91C1C 6px,#7F1D1D 6px,#7F1D1D 12px)">'
-        + 'GAP ' + n1(gap / 1000) + ' MW</div>';
-    }
-    bar += '</div>';
+      + seg(served, '#4ADE80', '', '#0A1628')
+      + seg(covered, '#7C3AED',
+            covered > 0 ? n1(gen / 1000) + ' MW on site closes a ' + n1(gap / 1000) + ' MW gap' : '')
+      + seg(shortfall, hatch, 'GAP ' + n1(shortfall / 1000) + ' MW')
+      + seg(surplus, 'rgba(124,58,237,.32)', surplus / span > 0.06
+            ? '+' + n1(surplus / 1000) + ' MW' : '', '#C4B5FD')
+      + '</div>';
 
     var key = function (c, l, v) {
-      return '<span style="display:inline-flex;align-items:center;gap:5px;margin-right:16px">'
+      return '<span style="display:inline-flex;align-items:center;gap:5px;margin-right:14px">'
         + '<span style="width:9px;height:9px;border-radius:2px;background:' + c + '"></span>'
         + '<span style="color:var(--sub)">' + l + '</span>'
         + '<span style="font-family:\'IBM Plex Mono\',monospace">' + v + '</span></span>';
@@ -148711,12 +148805,14 @@ if (root.console && console.info) {
       + bar
       + '<div style="display:flex;justify-content:space-between;font-size:9px;'
       + 'color:var(--sub);font-family:\'IBM Plex Mono\',monospace;margin-top:5px">'
-      + '<span>0</span><span>' + n1(fac / 2000) + ' MW</span><span>'
-      + n1(fac / 1000) + ' MW</span></div>'
+      + '<span>0</span><span>' + n1(span / 2000) + ' MW</span><span>'
+      + n1(span / 1000) + ' MW</span></div>'
       + '<div style="margin-top:9px;font-size:10px">'
-      + key('#4ADE80', 'Grid', n1(util / 1000))
-      + key('#B91C1C', 'Gap', n1(gap / 1000))
+      + key('#4ADE80', 'Grid', n1(served / 1000))
+      + key(shortfall > 0 ? '#B91C1C' : '#7C3AED', shortfall > 0 ? 'Gap' : 'Covered',
+            n1((shortfall > 0 ? shortfall : covered) / 1000))
       + key('#7C3AED', 'On-site', n1(gen / 1000))
+      + (surplus > 0 ? key('rgba(124,58,237,.5)', 'Headroom', n1(surplus / 1000)) : '')
       + '</div>';
   }
 
