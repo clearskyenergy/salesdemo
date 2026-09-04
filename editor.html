@@ -148148,6 +148148,283 @@ if (root.console && console.info) {
 
 <script>
 /* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 64 — CEILING FROM THE DRAWING, LOCK, AND OPTIMISE
+ *  ---------------------------------------------------------------------
+ *  1. THE CEILING BUG
+ *  OmegaCompute.size() resolves the utility ceiling like this:
+ *
+ *      var L = S.substationLookup;
+ *      if (L && isFinite(+L.capMw)) util = +L.capMw * 1000;
+ *
+ *  S.substationLookup is only set by Find Substation. Place a
+ *  substation by hand, type 10 MW firm into its panel, and the sizer
+ *  still sees nothing — so the whole facility reads as a gap and the
+ *  build fills the parcel with generation. The results rail knew about
+ *  it the whole time, because _substationCapKw() already sums every
+ *  drawn substation and is used in eight other places. The sizer was
+ *  the one place that did not ask.
+ *
+ *  2. THE LOCK
+ *  Panning the canvas drags whatever is under the pointer. On a site
+ *  with a few hundred placed shapes that means you cannot move around
+ *  without moving the design. Placed equipment is output, not input:
+ *  it should be locked by default and unlocked deliberately.
+ *
+ *  3. OPTIMISE — AND WHAT IT IS NOT
+ *  This is a search, not a model. It re-runs the existing packer across
+ *  a grid of layout parameters and keeps the arrangement that sites the
+ *  most load: block width, aisle spacing, and the split between the
+ *  compute and generation bands. No language model is involved and
+ *  none would help — the objective is countable and the constraint is
+ *  geometry, so a solver beats a guess every time. Calling that AI
+ *  would be a marketing decision, and the number it produces has to
+ *  survive an engineer asking how it was reached.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Optimise]';
+
+  /* ── 1. ceiling from the drawing ────────────────────────────────────── */
+
+  function drawnCeilingKw() {
+    try {
+      if (typeof _substationCapKw === 'function') return _substationCapKw() || 0;
+    } catch (e) {}
+    var kw = 0;
+    try {
+      (S.shapes || []).forEach(function (s) {
+        if (s && s.kind === 'substation' && isFinite(+s.capMw)) kw += (+s.capMw) * 1000;
+      });
+    } catch (e) {}
+    return kw;
+  }
+
+  /* The lookup still wins when present — it carries a tier and a
+     provenance string the drawn one does not. The drawn yard fills the
+     gap rather than overriding a real lookup. */
+  function wrapSize() {
+    if (!root.OmegaCompute || typeof root.OmegaCompute.size !== 'function') return false;
+    if (root.OmegaCompute.size.__ceiling) return true;
+    var orig = root.OmegaCompute.size;
+    root.OmegaCompute.size = function (cfg) {
+      cfg = cfg || {};
+      var haveLookup = false;
+      try { haveLookup = !!(S.substationLookup && isFinite(+S.substationLookup.capMw)); }
+      catch (e) {}
+      if (!haveLookup && !(isFinite(+cfg.utilKw) && +cfg.utilKw > 0)) {
+        var kw = drawnCeilingKw();
+        if (kw > 0) {
+          cfg = Object.assign({}, cfg, { utilKw: kw, utilSrc: 'drawn substation' });
+        }
+      }
+      return orig.call(this, cfg);
+    };
+    root.OmegaCompute.size.__ceiling = true;
+    if (root.console) console.info(TAG + ' ceiling now reads drawn substations');
+    return true;
+  }
+
+  /* ── 2. lock ────────────────────────────────────────────────────────── */
+
+  var locked = true;   /* placed equipment starts locked */
+
+  function isPlaced(sh) {
+    return !!(sh && (sh.omegaCompute || sh.autoLayout));
+  }
+
+  /* Blocks the gesture at capture, before the editor's own handlers see
+     it, so a locked shape behaves as if it were part of the backdrop. */
+  function install() {
+    if (root.__omegaLockWired) return;
+    root.__omegaLockWired = true;
+    var guard = function (e) {
+      if (!locked) return;
+      var el = e.target && e.target.closest ? e.target.closest('[data-shid]') : null;
+      if (!el) return;
+      var id = el.getAttribute('data-shid');
+      var sh = null;
+      try { sh = (S.shapes || []).filter(function (s) { return s && s.id === id; })[0]; }
+      catch (e2) {}
+      if (!isPlaced(sh)) return;
+      e.stopPropagation();
+      e.preventDefault();
+    };
+    ['mousedown', 'touchstart', 'pointerdown'].forEach(function (t) {
+      document.addEventListener(t, guard, true);
+    });
+  }
+
+  function setLocked(on) {
+    locked = !!on;
+    badge();
+    if (typeof showBanner === 'function') {
+      showBanner('cal', locked
+        ? 'Layout locked \u2014 pan and zoom freely, placed equipment will not move. '
+          + 'Hand-drawn shapes are still editable.'
+        : 'Layout unlocked \u2014 placed equipment can be dragged again.');
+    }
+    return locked;
+  }
+
+  function badge() {
+    var b = document.getElementById('omega-lock');
+    if (!b) {
+      var sb = document.getElementById('statusbar');
+      if (!sb) return;
+      b = document.createElement('div');
+      b.id = 'omega-lock';
+      b.style.cssText = 'padding:0 10px;font-size:10px;cursor:pointer;'
+        + "font-family:'IBM Plex Mono',monospace;white-space:nowrap";
+      b.onclick = function () { setLocked(!locked); };
+      var right = document.getElementById('sb-right');
+      if (right && right.parentNode) right.parentNode.insertBefore(b, right);
+      else sb.appendChild(b);
+    }
+    b.textContent = locked ? '\u25A0 LAYOUT LOCKED' : '\u25A1 LAYOUT UNLOCKED';
+    b.style.color = locked ? '#4ADE80' : '#F59E0B';
+    b.title = locked
+      ? 'Placed equipment is locked so panning does not drag it. Click to unlock.'
+      : 'Placed equipment can be dragged. Click to lock.';
+  }
+
+  /* ── 3. optimise ────────────────────────────────────────────────────── */
+
+  /* Parameter grid. Small and explicit: every combination is a real
+     pack, so this is seconds of work, not milliseconds, and a wider
+     grid would not pay for itself. */
+  var GRID = {
+    blockCols: [4, 6, 8, 12],
+    aisleFt: [20, 24, 30],
+    clearanceFt: [10, 15, 20]
+  };
+
+  function optimise(opts) {
+    opts = opts || {};
+    var CP = root.OmegaComputePlace;
+    if (!CP || !CP.boundary || !CP.boundary()) {
+      if (typeof showBanner === 'function') showBanner('cal', 'Trace the parcel boundary first.');
+      return null;
+    }
+    var r = null;
+    try { r = root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute(); } catch (e) {}
+    if (!r || !(r.itKw > 0)) {
+      if (typeof showBanner === 'function') {
+        showBanner('cal', 'Set an IT load first \u2014 there is nothing to optimise against.');
+      }
+      return null;
+    }
+
+    var save = {
+      blockCols: CP.config.blockCols,
+      aisleFt: CP.config.aisleFt,
+      clearanceFt: CP.config.clearanceFt
+    };
+    var best = null, tried = 0;
+
+    for (var a = 0; a < GRID.blockCols.length; a++) {
+      for (var b = 0; b < GRID.aisleFt.length; b++) {
+        for (var c = 0; c < GRID.clearanceFt.length; c++) {
+          CP.config.blockCols = GRID.blockCols[a];
+          CP.config.aisleFt = GRID.aisleFt[b];
+          CP.config.clearanceFt = GRID.clearanceFt[c];
+          var res = null;
+          try { res = CP.build(); } catch (e) { continue; }
+          tried++;
+          if (!res || res.blocked) continue;
+          /* Objective: pods first, then fuel cells. Pods are the load;
+             a layout that sites more generation but less load has
+             optimised the wrong thing. */
+          var score = res.pods * 1000 + res.fc;
+          if (!best || score > best.score) {
+            best = { score: score, pods: res.pods, fc: res.fc,
+                     cfg: { blockCols: CP.config.blockCols,
+                            aisleFt: CP.config.aisleFt,
+                            clearanceFt: CP.config.clearanceFt } };
+          }
+        }
+      }
+    }
+
+    if (!best) {
+      CP.config.blockCols = save.blockCols;
+      CP.config.aisleFt = save.aisleFt;
+      CP.config.clearanceFt = save.clearanceFt;
+      try { CP.build(); } catch (e) {}
+      if (typeof showBanner === 'function') {
+        showBanner('cal', 'No arrangement placed anything \u2014 check the boundary and scale.');
+      }
+      return null;
+    }
+
+    /* Re-run the winner so the canvas shows it rather than the last
+       combination tried. */
+    CP.config.blockCols = best.cfg.blockCols;
+    CP.config.aisleFt = best.cfg.aisleFt;
+    CP.config.clearanceFt = best.cfg.clearanceFt;
+    try { CP.build(); } catch (e) {}
+    try { if (root.OmegaComputeHUD) root.OmegaComputeHUD.refresh(); } catch (e) {}
+
+    var baseline = null;
+    try { baseline = root._omegaOptBaseline; } catch (e) {}
+    var msg = 'Best of ' + tried + ' arrangements: ' + best.pods + ' pods, ' + best.fc
+      + ' SOFC \u2014 ' + best.cfg.blockCols + ' per row, ' + best.cfg.aisleFt
+      + ' ft roads, ' + best.cfg.clearanceFt + ' ft clearance.';
+    if (baseline != null && best.pods > baseline) {
+      msg += '  ' + (best.pods - baseline) + ' more pods than the default layout.';
+    }
+    if (typeof showBanner === 'function') showBanner('cal', msg);
+    if (root.console) console.info(TAG + ' ' + msg);
+    root._omegaOptBaseline = best.pods;
+    return best;
+  }
+
+  /* ── buttons ────────────────────────────────────────────────────────── */
+
+  function inject() {
+    if (document.getElementById('rb-optimise')) return true;
+    var host = document.getElementById('rb-what-fits') || document.getElementById('rb-max-fit');
+    if (!host || !host.parentNode) return false;
+    var b = document.createElement('button');
+    b.className = 'rbtn'; b.id = 'rb-optimise';
+    b.title = 'Optimise Layout \u2014 re-packs the parcel across 36 combinations of row '
+      + 'length, road width and clearance, and keeps the one that sites the most load. '
+      + 'A search over the real packer, not an estimate.';
+    b.onclick = function () { return optimise(); };
+    b.innerHTML = '<span class="rb-ico" style="color:#A78BFA">\u2699</span>'
+      + '<span class="rb-lbl">Optimise<br>Layout</span>';
+    host.parentNode.insertBefore(b, host.nextSibling);
+    try {
+      if (root.OmegaMode && root.OmegaMode.keep) root.OmegaMode.keep(/rb-optimise/);
+    } catch (e) {}
+    return true;
+  }
+
+  function boot() {
+    install();
+    var n = 0, iv = setInterval(function () {
+      wrapSize(); inject(); badge();
+      if (++n > 40) clearInterval(iv);
+    }, 500);
+    if (root.console) {
+      console.info(TAG + ' ready \u2014 OmegaLayout.lock(false) / OmegaLayout.optimise()');
+    }
+  }
+
+  root.OmegaLayout = {
+    lock: setLocked,
+    isLocked: function () { return locked; },
+    optimise: optimise,
+    grid: GRID,
+    ceilingKw: drawnCeilingKw
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
  *  OMEGA PATCH 54 — COMPUTE HUD: THE RAIL, THE LADDER, THE GAP
  *  ---------------------------------------------------------------------
  *  Patch 53 made the build land inside the parcel. This is the surface
