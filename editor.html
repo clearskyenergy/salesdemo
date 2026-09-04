@@ -145498,7 +145498,16 @@ if (root.console && console.info) {
   /* Sources in order of trustworthiness. A geocoded address is a fact
      about the site; a map centre is wherever the user last dragged to,
      which is close enough to seed from but should never overwrite a
-     geocode. */
+     geocode.
+
+     omegaGeo() is consulted before any hand-rolled fallback because it
+     already knows every path this file can hold a position on: both
+     _gmap bindings, _liveMapState(), window._savedMapState, and the
+     mosaic centre. An earlier version of this function reimplemented
+     three of those four and missed _savedMapState, which is precisely
+     the one that survives a reload — so a restored project reported
+     "no map centre yet" and Network Proximity refused to run on a site
+     whose latitude was sitting in the results panel the whole time. */
   function resolve() {
     var out = null;
 
@@ -145509,6 +145518,20 @@ if (root.console && console.info) {
 
     if (!out) {
       try {
+        if (typeof omegaGeo === 'function') {
+          var g = omegaGeo();
+          if (g && valid(g.lat, g.lng)) out = { lat: +g.lat, lng: +g.lng, src: 'map' };
+        }
+      } catch (e) {}
+    }
+    if (!out) {
+      try {
+        var sv = root._savedMapState;
+        if (sv && valid(sv.lat, sv.lng)) out = { lat: +sv.lat, lng: +sv.lng, src: 'project' };
+      } catch (e) {}
+    }
+    if (!out) {
+      try {
         var m = root._mosaic;
         if (m && valid(m.lat, m.lng)) out = { lat: +m.lat, lng: +m.lng, src: 'capture' };
       } catch (e) {}
@@ -145517,17 +145540,6 @@ if (root.console && console.info) {
       try {
         var c = root._lastCenter;
         if (c && valid(c.lat, c.lng)) out = { lat: +c.lat, lng: +c.lng, src: 'gps' };
-      } catch (e) {}
-    }
-    if (!out) {
-      try {
-        var g = (typeof _omegaMap === 'function') ? _omegaMap() : root._gmap;
-        if (g && g.getCenter) {
-          var cc = g.getCenter();
-          if (cc && valid(cc.lat(), cc.lng())) {
-            out = { lat: cc.lat(), lng: cc.lng(), src: 'map centre' };
-          }
-        }
       } catch (e) {}
     }
     return out;
@@ -145652,6 +145664,52 @@ if (root.console && console.info) {
     demand: demand,
     clear: function () { var S0 = S_(); if (S0) delete S0[GAS_KEY]; return true; }
   };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  PATCH 65 — TOOLS THAT NEED A LOCATION SHOULD ASK THE SAME QUESTION
+ *  ---------------------------------------------------------------------
+ *  _npxSiteLatLon() checks S.lat, then _gmap.getCenter(), and gives up.
+ *  Two of the five places a position can live in this file, and not the
+ *  two that survive a reload. That is why Network Proximity says "place
+ *  or lock the satellite view first" on a project whose coordinates are
+ *  on screen in the results panel.
+ *
+ *  Rather than patch each caller, this replaces the resolver with one
+ *  that goes through OmegaSiteLocation, which consults omegaGeo() and
+ *  therefore every path. The original stays as the last fallback so
+ *  nothing this does not know about is lost.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[NpxLocation]';
+
+  function install() {
+    if (typeof root._npxSiteLatLon !== 'function' || root._npxSiteLatLon.__loc) return false;
+    var orig = root._npxSiteLatLon;
+    root._npxSiteLatLon = function () {
+      try {
+        var l = root.OmegaSiteLocation && root.OmegaSiteLocation.get();
+        /* npx wants {lat, lon}; the rest of the file says lng. */
+        if (l && isFinite(+l.lat) && isFinite(+l.lng) && +l.lat !== 0) {
+          return { lat: +l.lat, lon: +l.lng };
+        }
+      } catch (e) {}
+      return orig.apply(this, arguments);
+    };
+    root._npxSiteLatLon.__loc = true;
+    if (root.console) console.info(TAG + ' Network Proximity now resolves through omegaGeo');
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      if (install() || ++n > 40) clearInterval(iv);
+    }, 400);
+  }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
@@ -147089,7 +147147,8 @@ if (root.console && console.info) {
        looks like, and it is also what makes the drawing legible. */
     aisleFt: 30,       /* road width between blocks        */
     blockCols: 6,      /* containers per row before a road */
-    blockRows: 4       /* rows before a cross road         */
+    blockRows: 4,      /* rows before a cross road         */
+    bessKwhPerContainer: 4000  /* 20 ft enclosure, ~4 MWh          */
   };
 
   function ppf() {
@@ -147346,24 +147405,47 @@ if (root.console && console.info) {
       });
     });
 
-    /* 3. Ride-through storage, one pad sized off the energy. */
+    /* 3. Ride-through storage, drawn as containers.
+          The previous version sized one slab as sqrt(kWh) * 1.4, which
+          had no basis in anything — it was chosen so the box looked
+          proportionate. Storage arrives in enclosures: a 20 ft unit
+          holds roughly 4 MWh, so the count follows from the energy the
+          same way pods follow from the load. A 7,974 kWh ride-through
+          is two containers, not a 125 ft rectangle claiming ground the
+          packer then cannot give to a pod. */
     var bessSlots = [];
     if (r.bessKwh > 0) {
-      var bw = Math.max(40, Math.min(200, Math.sqrt(r.bessKwh) * 1.4));
-      bessSlots = pack(1, bw, bw * 0.4, poly, excl, taken);
-      bessSlots.forEach(function (s) {
+      var perUnit = +CFG.bessKwhPerContainer || 4000;
+      var units = Math.max(1, Math.ceil(r.bessKwh / perUnit));
+      bessSlots = pack(units, 40, 8, poly, excl, taken);
+      bessSlots.forEach(function (s, i) {
         push({
-          id: (typeof uid === 'function' ? uid() : 'b' + Date.now()),
+          id: (typeof uid === 'function' ? uid() : 'b' + i + Date.now()),
           kind: 'bespad', pts: [{ x: s.x, y: s.y }],
-          style: (S.shapeStyle || ''), lf: bw, wf: bw * 0.4,
-          model: 'Ride-through BESS', kw: r.bessKw, kwh: r.bessKwh,
+          style: (S.shapeStyle || ''), lf: 40, wf: 8,
+          model: 'Ride-through BESS',
+          kw: Math.round(r.bessKw / units), kwh: Math.round(r.bessKwh / units),
           scaled: !!(S.pxPerFt > 0), omegaCompute: true
         });
       });
     }
 
+    /* Block extents, so labels can sit over the group they name rather
+       than being positioned by guesswork. */
+    var extent = function (slots) {
+      if (!slots.length) return null;
+      var x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+      slots.forEach(function (s) {
+        x1 = Math.min(x1, s.x); y1 = Math.min(y1, s.y);
+        x2 = Math.max(x2, s.x + s.dw); y2 = Math.max(y2, s.y + s.dh);
+      });
+      return { x1: x1, y1: y1, x2: x2, y2: y2 };
+    };
+
     var placed = {
       pods: podSlots.length, podsWanted: r.pods,
+      podBox: extent(podSlots), fcBox: extent(fcSlots), bessBox: extent(bessSlots),
+      sizing: r,
       fc: fcSlots.length, fcWanted: r.fcBlocks,
       bess: bessSlots.length,
       itKwPlaced: podSlots.length * (pSpec.kw || 1000),
@@ -148970,6 +149052,217 @@ if (root.console && console.info) {
     all: all, report: report, compute: compute, generation: generation,
     solar: solar, storage: storage, refresh: augmentRail
   };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 66 — LABELS AND TIE LINES
+ *  ---------------------------------------------------------------------
+ *  The build places the right equipment in the right place and says
+ *  nothing about it. A drawing that names nothing is a pattern; the
+ *  labels are what make it a site plan somebody can read without the
+ *  person who made it standing next to them:
+ *
+ *      40 x 1 MW MDC POD
+ *      115 x 300 kW SOFC - 34.5 MW (N+1)
+ *      BESS - 40 MW / 7,974 kWh
+ *      GAS TAP - 214 MMBtu/hr
+ *      MAZON TAP - 138 kV / 3.1 mi SE / 18 MW basis
+ *
+ *  DERIVED, NOT DRAWN
+ *  These are rendered into their own <g> inside #csvg rather than
+ *  pushed onto S.shapes. They restate figures that live elsewhere, so
+ *  saving them would create a second copy that goes stale the moment
+ *  the load changes — and a label that disagrees with the rail is worse
+ *  than no label. They regenerate from the build every time.
+ *
+ *  Being inside #csvg means they share the canvas coordinate space and
+ *  therefore pan, zoom and reproject with everything else, for free.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Labels]';
+  var NS = 'http://www.w3.org/2000/svg';
+  var GID = 'omega-build-labels';
+
+  function mk(t) { return document.createElementNS(NS, t); }
+  function n0(v) { return Math.round(v).toLocaleString(); }
+  function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+  function ppf() { try { return (S.pxPerFt > 0) ? S.pxPerFt : 6; } catch (e) { return 6; } }
+
+  function layer() {
+    var svg = document.getElementById('csvg');
+    if (!svg) return null;
+    var g = document.getElementById(GID);
+    if (g) { while (g.firstChild) g.removeChild(g.firstChild); return g; }
+    g = mk('g');
+    g.setAttribute('id', GID);
+    g.setAttribute('pointer-events', 'none');   /* never intercepts a drag */
+    svg.appendChild(g);
+    return g;
+  }
+
+  function text(g, x, y, s, size, fill, anchor, weight) {
+    var t = mk('text');
+    t.setAttribute('x', x); t.setAttribute('y', y);
+    t.setAttribute('font-size', size);
+    t.setAttribute('fill', fill);
+    t.setAttribute('text-anchor', anchor || 'middle');
+    t.setAttribute('font-family', "'IBM Plex Mono',Menlo,monospace");
+    t.setAttribute('font-weight', weight || '600');
+    t.textContent = s;
+    g.appendChild(t);
+    return t;
+  }
+
+  function line(g, x1, y1, x2, y2, colour, dash, width) {
+    var l = mk('line');
+    l.setAttribute('x1', x1); l.setAttribute('y1', y1);
+    l.setAttribute('x2', x2); l.setAttribute('y2', y2);
+    l.setAttribute('stroke', colour);
+    l.setAttribute('stroke-width', width || 2);
+    if (dash) l.setAttribute('stroke-dasharray', dash);
+    g.appendChild(l);
+    return l;
+  }
+
+  function substationBox() {
+    try {
+      var subs = (S.shapes || []).filter(function (s) {
+        return s && s.kind === 'substation' && s.pts && s.pts.length >= 2;
+      });
+      var sh = subs[subs.length - 1];
+      if (!sh) return null;
+      var a = sh.pts[0], b = sh.pts[1];
+      return {
+        cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2,
+        y2: Math.max(a.y, b.y), sh: sh
+      };
+    } catch (e) { return null; }
+  }
+
+  function draw() {
+    var placed = root._omegaComputePlaced;
+    var g = layer();
+    if (!g) return false;
+    if (!placed || placed.blocked) return false;
+
+    var r = placed.sizing || null;
+    try { if (!r) r = root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute(); } catch (e) {}
+    if (!r) return false;
+
+    var P = ppf();
+    /* Type scaled from the drawing, not a fixed size, for the same
+       reason the substation chip needed fixing: a constant in SVG units
+       is illegible the moment the scale changes. */
+    var fs = Math.max(9, 14 * P / 6);
+
+    /* Pod block. */
+    if (placed.podBox && placed.pods) {
+      var pb = placed.podBox;
+      text(g, (pb.x1 + pb.x2) / 2, pb.y1 - fs * 0.9,
+        placed.pods + ' \u00d7 1 MW MDC POD', fs, '#93C5FD', 'middle', '700');
+    }
+
+    /* Fuel cell block. */
+    if (placed.fcBox && placed.fc) {
+      var fb = placed.fcBox;
+      var each = r.fcBlocks ? Math.round(r.fcKw / r.fcBlocks) : 300;
+      text(g, (fb.x1 + fb.x2) / 2, fb.y1 - fs * 0.9,
+        placed.fc + ' \u00d7 ' + each + ' kW SOFC \u2014 '
+        + n1(placed.fc * each / 1000) + ' MW'
+        + (r.redundancy ? ' (' + String(r.redundancy).toUpperCase().replace('N', 'N+') + ')' : ''),
+        fs, '#C4B5FD', 'middle', '700');
+    }
+
+    /* Storage. */
+    if (placed.bessBox && r.bessKwh > 0) {
+      var bb = placed.bessBox;
+      text(g, (bb.x1 + bb.x2) / 2, bb.y2 + fs * 1.5,
+        'BESS \u00b7 ' + n1(r.bessKw / 1000) + ' MW / ' + n0(r.bessKwh) + ' kWh',
+        fs * 0.92, '#4ADE80', 'middle', '700');
+    }
+
+    /* Tie line to the substation, from the nearest block edge. The line
+       is what makes the drawing answer "and how does it connect". */
+    var sub = substationBox();
+    if (sub && placed.fcBox) {
+      var from = { x: placed.fcBox.x2, y: placed.fcBox.y2 };
+      line(g, from.x, from.y, sub.cx, sub.cy, '#F59E0B', '10 7', Math.max(1.5, P * 0.25));
+      var lbl = [];
+      try {
+        var L = S.substationLookup;
+        if (sub.sh.label) lbl.push(String(sub.sh.label).toUpperCase());
+        if (sub.sh.voltage) lbl.push(sub.sh.voltage);
+        if (L && L.miles != null) lbl.push(L.miles + ' mi ' + (L.dir || ''));
+        if (r.utilKw != null) lbl.push(n1(r.utilKw / 1000) + ' MW basis');
+      } catch (e) {}
+      if (lbl.length) {
+        text(g, sub.cx, sub.y2 + fs * 1.4, lbl.join('  \u00b7  '),
+          fs * 0.85, '#F59E0B', 'middle', '600');
+      }
+    }
+
+    /* Gas tap, with the demand this build would draw. */
+    if (r.gasMmbtuHr > 0) {
+      var gt = null;
+      try {
+        gt = (S.shapes || []).filter(function (s) { return s && s.omegaGasTie; }).pop();
+      } catch (e) {}
+      if (gt && gt.pts && gt.pts.length) {
+        var p0 = gt.pts[0];
+        if (placed.fcBox) {
+          line(g, placed.fcBox.x2, placed.fcBox.y2 + 10 * P, p0.x, p0.y,
+            '#F97316', null, Math.max(1.5, P * 0.25));
+        }
+        text(g, p0.x, p0.y - fs * 0.7,
+          'GAS TAP \u00b7 ' + n1(r.gasMmbtuHr) + ' MMBtu/hr',
+          fs * 0.85, '#F97316', 'middle', '600');
+      }
+    }
+    return true;
+  }
+
+  function clear() {
+    var g = document.getElementById(GID);
+    if (g && g.parentNode) g.parentNode.removeChild(g);
+    return true;
+  }
+
+  /* Redraw whenever the build changes, and after a reprojection, since
+     the labels are positioned from slot geometry that moves with it. */
+  function wrap() {
+    var CP = root.OmegaComputePlace;
+    if (CP && CP.build && !CP.build.__labels) {
+      var orig = CP.build;
+      CP.build = function () {
+        var res = orig.apply(this, arguments);
+        setTimeout(draw, 0);
+        return res;
+      };
+      CP.build.__labels = true;
+    }
+    if (CP && CP.clearAll && !CP.clearAll.__labels) {
+      var oc = CP.clearAll;
+      CP.clearAll = function () { clear(); return oc.apply(this, arguments); };
+      CP.clearAll.__labels = true;
+    }
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      wrap();
+      if (++n > 40) clearInterval(iv);
+    }, 500);
+    setTimeout(draw, 2500);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaBuildLabels.draw()');
+  }
+
+  root.OmegaBuildLabels = { draw: draw, clear: clear };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
