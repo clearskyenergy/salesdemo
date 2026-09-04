@@ -146315,6 +146315,416 @@ if (root.console && console.info) {
 
 <script>
 /* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 57 — WHY THE LAND IS UNBUILDABLE
+ *  ---------------------------------------------------------------------
+ *  Patch 46 gave a shape a role: boundary or exclusion. That is enough
+ *  to pack a layout correctly and not enough to underwrite one.
+ *
+ *  A reference engine distinguishes "Transmission Right-Of-Way" from
+ *  "Substation Core Enclosure", and that distinction is the whole
+ *  difference between a picture and an assessment. Both remove acreage.
+ *  Only one of them can be negotiated. A wetland needs a delineation, a
+ *  ROW needs the easement document, a substation envelope is a clearance
+ *  standard, a floodplain is a FEMA panel. Same geometry, four different
+ *  diligence items and four different people to call.
+ *
+ *  So an exclusion now carries a reason, the reason is printed wherever
+ *  the exclusion is counted, and the CSV carries it out to whoever is
+ *  checking the work.
+ *
+ *  SUBSTATION CLEARANCE
+ *  A placed substation should exclude its own envelope. Nobody sites a
+ *  compute pod against the fence of a switchyard, and forgetting it is
+ *  the kind of error that survives all the way to a site walk.
+ *
+ *  FEASIBILITY CSV
+ *  One row per finding, with units and provenance. It exists so the
+ *  numbers can be checked against a source rather than trusted because
+ *  they came out of a tool.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Siting]';
+
+  /* Reason, swatch, and the document that resolves it. The third column
+     is why this catalogue is worth having: it turns a coloured polygon
+     into a diligence item with an owner. */
+  var TYPES = [
+    { id: 'wetland',   label: 'Wetland / waters',        colour: '#3B82F6',
+      doc: 'Delineation report; USACE jurisdictional determination' },
+    { id: 'row',       label: 'Transmission right-of-way', colour: '#F59E0B',
+      doc: 'Recorded easement; utility encroachment standard' },
+    { id: 'substation',label: 'Substation envelope',      colour: '#EF4444',
+      doc: 'Utility clearance standard; fence-line survey' },
+    { id: 'easement',  label: 'Easement / access',        colour: '#A78BFA',
+      doc: 'Title commitment, Schedule B-II' },
+    { id: 'flood',     label: 'Floodplain',               colour: '#22D3EE',
+      doc: 'FEMA FIRM panel; elevation certificate' },
+    { id: 'setback',   label: 'Zoning setback',           colour: '#94A3B8',
+      doc: 'Zoning ordinance; AHJ confirmation' },
+    { id: 'other',     label: 'Other constraint',         colour: '#B08D57',
+      doc: 'Note the basis on the exclusion' }
+  ];
+
+  function typeOf(id) {
+    for (var i = 0; i < TYPES.length; i++) if (TYPES[i].id === id) return TYPES[i];
+    return TYPES[TYPES.length - 1];
+  }
+
+  function shapes() {
+    try { return (typeof S !== 'undefined' && S.shapes) ? S.shapes : []; } catch (e) { return []; }
+  }
+  function exclusions() {
+    return shapes().filter(function (s) { return s && s.omegaRole === 'exclusion'; });
+  }
+  function acres(sh) {
+    try {
+      var p = (typeof _alShapePts === 'function') ? _alShapePts(sh) : null;
+      if (!p) return null;
+      var a = _alPolyAcres(p);
+      return isFinite(a) && a > 0 ? a : null;
+    } catch (e) { return null; }
+  }
+
+  /* ── the picker ─────────────────────────────────────────────────────── */
+
+  function pick(cb) {
+    var old = document.getElementById('omega-extype');
+    if (old) old.remove();
+    var w = document.createElement('div');
+    w.id = 'omega-extype';
+    w.style.cssText = 'position:fixed;inset:0;z-index:9000;background:rgba(0,0,0,.55);'
+      + 'display:flex;align-items:center;justify-content:center';
+    var rows = TYPES.map(function (t) {
+      return '<button data-t="' + t.id + '" style="display:flex;align-items:center;gap:11px;'
+        + 'width:100%;text-align:left;background:rgba(255,255,255,.03);border:1px solid #3A3A3A;'
+        + 'border-radius:7px;padding:10px 12px;margin-bottom:7px;cursor:pointer;'
+        + 'font-family:inherit;color:#E0E0E0">'
+        + '<span style="width:11px;height:11px;border-radius:3px;flex:none;background:'
+        + t.colour + '"></span>'
+        + '<span><span style="font-size:12.5px;font-weight:600">' + t.label + '</span>'
+        + '<span style="display:block;font-size:10px;color:#9A9A9A;margin-top:2px">'
+        + t.doc + '</span></span></button>';
+    }).join('');
+    w.innerHTML = '<div style="background:#1E1E1E;border:1px solid #3A3A3A;border-radius:11px;'
+      + 'padding:18px;max-width:430px;width:100%;font-family:inherit">'
+      + '<div style="font-size:15px;font-weight:700;color:#E0E0E0;margin-bottom:3px">'
+      + 'What makes this area unbuildable?</div>'
+      + '<div style="font-size:11px;color:#9A9A9A;margin-bottom:14px">'
+      + 'Every exclusion removes acreage. The reason decides who has to sign off on it.</div>'
+      + rows
+      + '<button data-t="__cancel" style="width:100%;background:none;border:none;color:#9A9A9A;'
+      + 'padding:8px;cursor:pointer;font-family:inherit;font-size:11px">Cancel</button></div>';
+    w.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-t]') : null;
+      if (!b) { if (e.target === w) w.remove(); return; }
+      var id = b.getAttribute('data-t');
+      w.remove();
+      if (id !== '__cancel') cb(id);
+    });
+    document.body.appendChild(w);
+  }
+
+  /* ── typed tracing ──────────────────────────────────────────────────── */
+
+  var pendingType = null;
+
+  function traceTyped() {
+    pick(function (id) {
+      pendingType = id;
+      try { root.OmegaSiteRoles.traceExclusion(); } catch (e) {}
+    });
+    return true;
+  }
+
+  /* The role patch tags the shape; this colours it by reason and records
+     the reason on the shape, where it survives save and load with every
+     other shape field. */
+  function wrapRoles() {
+    if (!root.OmegaSiteRoles || root.OmegaSiteRoles.__typed) return;
+    var origTrace = root.OmegaSiteRoles.traceExclusion;
+    root.OmegaSiteRoles.traceExclusion = function () {
+      var r = origTrace.apply(this, arguments);
+      var seen = exclusions().length;
+      var n = 0, iv = setInterval(function () {
+        var list = exclusions();
+        if (list.length > seen) {
+          clearInterval(iv);
+          var sh = list[list.length - 1];
+          applyType(sh, pendingType || 'other');
+          pendingType = null;
+        }
+        if (++n > 400) clearInterval(iv);   /* ~40 s, then give up quietly */
+      }, 100);
+      return r;
+    };
+    root.OmegaSiteRoles.__typed = true;
+  }
+
+  function applyType(sh, id) {
+    if (!sh) return null;
+    var t = typeOf(id);
+    sh.exType = t.id;
+    sh.exLabel = t.label;
+    sh.exDoc = t.doc;
+    sh.color = t.colour;
+    sh.style = 'dashed';
+    try { if (typeof renderShape === 'function') renderShape(sh); } catch (e) {}
+    try { if (typeof pushHist === 'function') pushHist(); } catch (e) {}
+    var a = acres(sh);
+    if (typeof showBanner === 'function') {
+      showBanner('cal', t.label + ' recorded'
+        + (a ? ' \u2014 ' + a.toFixed(1) + ' acres removed' : '')
+        + '. Resolve with: ' + t.doc + '.');
+    }
+    return sh;
+  }
+
+  /* ── substation clearance envelope ──────────────────────────────────── */
+
+  /* A square envelope centred on the placed substation, tagged as an
+     exclusion so the packer honours it like any other. Default 75 ft
+     matches the reference engine; a real clearance comes from the
+     serving utility's standard and should be set from it. */
+  function substationEnvelope(bufferFt) {
+    var ft = +bufferFt || 75;
+    var sub = shapes().filter(function (s) { return s && s.kind === 'substation'; }).pop();
+    if (!sub || !sub.pts || !sub.pts.length) {
+      if (typeof showBanner === 'function') {
+        showBanner('cal', 'No substation on the canvas \u2014 place one first.');
+      }
+      return null;
+    }
+    var P = 6;
+    try { if (S.pxPerFt > 0) P = S.pxPerFt; } catch (e) {}
+    var c = sub.pts[0];
+    var half = ft * P;
+    var pts = [
+      { x: c.x - half, y: c.y - half }, { x: c.x + half, y: c.y - half },
+      { x: c.x + half, y: c.y + half }, { x: c.x - half, y: c.y + half }
+    ];
+    var sh = {
+      id: (typeof uid === 'function' ? uid() : 'env' + Date.now()),
+      kind: 'polyline', pts: pts, closed: true,
+      omegaRole: 'exclusion', scaled: true, omegaEnvelope: true
+    };
+    shapes().push(sh);
+    applyType(sh, 'substation');
+    if (typeof showBanner === 'function') {
+      showBanner('cal', 'Substation envelope added \u2014 ' + ft
+        + ' ft clearance. Confirm against the utility standard before relying on it.');
+    }
+    return sh;
+  }
+
+  /* ── feasibility CSV ────────────────────────────────────────────────── */
+
+  function csvCell(v) {
+    var s = String(v == null ? '' : v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+
+  /* One row per finding, each carrying its own basis. A number without a
+     basis cannot be checked, and a screening sheet that cannot be
+     checked is not a screening sheet. */
+  function csv() {
+    var rows = [['Section', 'Item', 'Value', 'Unit', 'Basis']];
+    var add = function (s, i, v, u, b) { rows.push([s, i, v, u, b]); };
+
+    try {
+      var loc = root.OmegaSiteLocation && root.OmegaSiteLocation.get();
+      var c = root._SITE_DATA || {};
+      add('Site', 'Project', (document.getElementById('pname') || {}).value || '', '', 'Entered');
+      add('Site', 'Address', (document.getElementById('addr-in') || {}).value || '', '', 'Entered');
+      if (loc) {
+        add('Site', 'Latitude', loc.lat.toFixed(6), 'deg', loc.src);
+        add('Site', 'Longitude', loc.lng.toFixed(6), 'deg', loc.src);
+      }
+      if (c.county) add('Site', 'County', c.county, '', 'Google geocoder');
+    } catch (e) {}
+
+    try {
+      var R = root.OmegaSiteRoles;
+      if (R) {
+        var g = R.grossAcres(), n = R.netAcres();
+        if (g != null) add('Land', 'Gross parcel', g.toFixed(2), 'ac', 'Traced boundary');
+        if (n != null) add('Land', 'Buildable after exclusions', n.toFixed(2), 'ac', 'Traced');
+      }
+      exclusions().forEach(function (sh, i) {
+        var a = acres(sh);
+        add('Land', 'Exclusion ' + (i + 1) + ' \u2014 ' + (sh.exLabel || 'unclassified'),
+          a != null ? a.toFixed(2) : '', 'ac', sh.exDoc || 'Traced, reason not recorded');
+      });
+    } catch (e) {}
+
+    try {
+      var sub = S.substationLookup;
+      if (sub) {
+        add('Grid', 'Substation', sub.name || '', '', sub.source || 'HIFLD extract');
+        if (sub.capMw != null) {
+          add('Grid', 'Screening capacity', sub.capMw, 'MW',
+            'Screening estimate \u2014 not an interconnection study');
+        }
+        if (sub.miles != null) add('Grid', 'Distance', sub.miles, 'mi', 'Great-circle');
+        if (sub.kv) add('Grid', 'Voltage class', sub.kv, 'kV', sub.source || 'HIFLD');
+      }
+    } catch (e) {}
+
+    try {
+      var r = root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute();
+      if (r) {
+        add('Load', 'IT load', (r.itKw / 1000).toFixed(1), 'MW', 'Entered');
+        add('Load', 'PUE', (+r.pue).toFixed(2), '', 'Entered');
+        add('Load', 'Facility load', (r.facKw / 1000).toFixed(1), 'MW', 'IT x PUE');
+        add('Load', 'Gap to close on site', ((r.genNeedKw || 0) / 1000).toFixed(1), 'MW',
+          'Facility less utility ceiling');
+        if (r.fcBlocks) {
+          add('Generation', 'SOFC blocks', r.fcBlocks, 'count', r.redundancy || 'N+1');
+          add('Generation', 'On-site generation', (r.fcKw / 1000).toFixed(1), 'MW', 'Block count x rating');
+          add('Fuel', 'Gas demand', r.gasMmbtuHr, 'MMBtu/hr', 'Heat rate at full generation');
+          add('Fuel', 'Approximate volume', r.gasScfh || '', 'scfh', '~1,020 Btu/scf');
+        }
+        if (r.bessKwh) {
+          add('Storage', 'Ride-through', r.bessKwh, 'kWh', r.rideMin + ' min on critical bus');
+        }
+      }
+      var gm = root.OmegaGas && root.OmegaGas.main();
+      if (gm) {
+        add('Fuel', 'Nearest transmission main', gm.miles, 'mi',
+          'Entered by hand, not surveyed');
+      }
+    } catch (e) {}
+
+    try {
+      var p = root._omegaComputePlaced;
+      if (p) {
+        add('Layout', 'Pods sited', p.pods + ' of ' + p.podsWanted, 'count', 'Parcel pack');
+        add('Layout', 'SOFC blocks sited', p.fc + ' of ' + p.fcWanted, 'count', 'Parcel pack');
+      }
+      var nw = root.OmegaComputeHUD && root.OmegaComputeHUD.network();
+      if (nw) {
+        add('Network', 'Nearest carrier hotel', nw.facility, '', 'PeeringDB');
+        add('Network', 'Route distance', nw.route, '', 'Great-circle x 1.45');
+        add('Network', 'Estimated RTT', nw.rtt, '', 'Propagation estimate, not measured');
+      }
+      var sc = root.OmegaLoadScreen && root.OmegaLoadScreen.screen();
+      if (sc) {
+        add('Screen', 'Result', sc.label, '', 'Derived');
+        add('Screen', 'Action', sc.act, '', 'Derived');
+        add('Screen', 'Next gate', sc.gate, '', 'Derived');
+      }
+    } catch (e) {}
+
+    return rows.map(function (r) { return r.map(csvCell).join(','); }).join('\r\n');
+  }
+
+  function exportCsv() {
+    var name = ((document.getElementById('pname') || {}).value || 'feasibility')
+      .replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'feasibility';
+    var blob = new Blob(['\ufeff' + csv()], { type: 'text/csv;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = name + '-feasibility.csv';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    if (typeof showBanner === 'function') {
+      showBanner('cal', 'Feasibility CSV saved \u2014 every row carries its basis.');
+    }
+    return true;
+  }
+
+  /* ── ribbon ─────────────────────────────────────────────────────────── */
+
+  function injectButtons() {
+    var made = false;
+    var home = document.querySelector('#ribbon .ribbon-page[data-page="home"]');
+    if (home && !document.getElementById('rb-sub-envelope')) {
+      var host = document.getElementById('rb-trace-exclusion');
+      if (host && host.parentNode) {
+        var b = document.createElement('button');
+        b.className = 'rbtn'; b.id = 'rb-sub-envelope';
+        b.title = 'Substation Envelope \u2014 exclude the clearance area around a placed '
+          + 'substation so nothing gets sited against the fence line.';
+        b.onclick = function () { substationEnvelope(75); };
+        b.innerHTML = '<span class="rb-ico" style="color:#EF4444">\u26A1</span>'
+          + '<span class="rb-lbl">Substation<br>Envelope</span>';
+        host.parentNode.insertBefore(b, host.nextSibling);
+        made = true;
+      }
+    }
+    var est = document.querySelector('#ribbon .ribbon-page[data-page="estimate"]');
+    if (est && !document.getElementById('rb-feas-csv')) {
+      var body = est.querySelector('.rpanel-body');
+      if (body) {
+        var c = document.createElement('button');
+        c.className = 'rbtn'; c.id = 'rb-feas-csv';
+        c.title = 'Feasibility CSV \u2014 every finding with its unit and its basis, '
+          + 'so the numbers can be checked against a source.';
+        c.onclick = exportCsv;
+        c.innerHTML = '<span class="rb-ico" style="color:#4ADE80">\u2913</span>'
+          + '<span class="rb-lbl">Feasibility<br>CSV</span>';
+        body.appendChild(c);
+        made = true;
+      }
+    }
+    if (made) {
+      try {
+        if (root.OmegaMode && root.OmegaMode.keep) {
+          root.OmegaMode.keep(/rb-(sub-envelope|feas-csv)/);
+        }
+      } catch (e) {}
+    }
+    return made;
+  }
+
+  /* Retype the Add Exclusion button so it asks for a reason first. */
+  function retypeButton() {
+    var b = document.getElementById('rb-trace-exclusion');
+    if (!b || b.__typed) return;
+    b.onclick = traceTyped;
+    b.title = 'Add Exclusion \u2014 wetland, right-of-way, easement, floodplain or setback. '
+      + 'The reason is recorded and printed with the acreage it removes.';
+    b.__typed = true;
+  }
+
+  function boot() {
+    wrapRoles();
+    var n = 0, iv = setInterval(function () {
+      injectButtons(); retypeButton(); wrapRoles();
+      if (++n > 30) clearInterval(iv);
+    }, 600);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaSiting.exportCsv() / .substationEnvelope(ft)');
+  }
+
+  root.OmegaSiting = {
+    types: TYPES,
+    traceTyped: traceTyped,
+    applyType: applyType,
+    substationEnvelope: substationEnvelope,
+    csv: csv,
+    exportCsv: exportCsv,
+    /* Reclassify an exclusion drawn before reasons existed. */
+    classify: function (index, typeId) {
+      var list = exclusions();
+      return applyType(list[index || 0], typeId || 'other');
+    },
+    audit: function () {
+      var rows = exclusions().map(function (sh, i) {
+        return { n: i, reason: sh.exLabel || 'unclassified',
+                 acres: acres(sh), resolvedBy: sh.exDoc || '' };
+      });
+      if (root.console && console.table) console.table(rows);
+      return rows;
+    }
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
  *  OMEGA PATCH 48 — LAYOUT PERSISTENCE + GRID CEILING IN THE SIZER
  *  ---------------------------------------------------------------------
  *  TWO PROBLEMS, ONE CAUSE.
@@ -146674,16 +147084,21 @@ if (root.console && console.info) {
     return true;
   }
 
-  /* Greedy row-major pack. Returns the slots it found, up to count. */
-  function pack(count, wFt, hFt, poly, excl, taken, startY) {
+  /* Greedy row-major pack, optionally confined to a horizontal band.
+     The band is what lets the pods and the fuel cells read as two
+     separate blocks side by side, the way the layout is actually built
+     on the ground, rather than one interleaved field. */
+  function pack(count, wFt, hFt, poly, excl, taken, startY, xMin, xMax) {
     var P = ppf();
     var w = wFt * P, h = hFt * P;
     var clear = CFG.clearanceFt * P, step = Math.max(4, CFG.stepFt * P);
     var bb = bbox(poly);
+    var x0 = (xMin != null) ? Math.max(bb.x1, xMin) : bb.x1;
+    var x1 = (xMax != null) ? Math.min(bb.x2, xMax) : bb.x2;
     var out = [];
     if (count < 1) return out;
     for (var y = (startY != null ? startY : bb.y1); y < bb.y2 - h; y += step) {
-      for (var x = bb.x1; x < bb.x2 - w; x += step) {
+      for (var x = x0; x < x1 - w; x += step) {
         if (out.length >= count) return out;
         if (fits(x, y, w, h, poly, excl, taken)) {
           var slot = { x: x, y: y, w: w + clear, h: h + clear, dw: w, dh: h };
@@ -146760,9 +147175,36 @@ if (root.console && console.info) {
     var fSpec = r.fcSpec || { label: 'SOFC Fuel Cell (NG)', kw: 300, lf: 9, wf: 6,
                               abbr: 'FC', fuel: 'natural gas' };
 
-    /* 1. Compute pods. Load-led build: the load lands first and
-          everything else is arranged to serve it. */
-    var podSlots = pack(r.pods, pSpec.lf, pSpec.wf, poly, excl, taken);
+    /* ZONING. The video builds two blocks side by side: compute on one
+       side, generation on the other, storage below. That is how it gets
+       built on the ground too — the pods are a security and cooling
+       envelope, the fuel cells are a fuel and exhaust envelope, and you
+       do not interleave them.
+
+       The split is by footprint, not by half: 40 pods at 40x10 need far
+       more ground than 115 SOFC at 9x6, so an even split would strand
+       pods while leaving the generation side empty. A floor of 25% each
+       stops one side collapsing when the other dominates. */
+    var podArea = r.pods * pSpec.lf * pSpec.wf;
+    var fcArea = r.fcBlocks * fSpec.lf * fSpec.wf;
+    var frac = (podArea + fcArea) > 0 ? podArea / (podArea + fcArea) : 0.5;
+    frac = Math.max(0.25, Math.min(0.75, frac));
+    var split = bb.x1 + (bb.x2 - bb.x1) * frac;
+    /* A gutter so the two blocks are visibly separate rather than merely
+       non-overlapping. Collision testing already guarantees they do not
+       touch; this is what makes them legible as two areas on a plan. */
+    var gutter = CFG.clearanceFt * 2 * P;
+
+    /* 1. Compute pods, left band. Load-led build: the load lands first
+          and everything else is arranged to serve it. */
+    var podSlots = pack(r.pods, pSpec.lf, pSpec.wf, poly, excl, taken, bb.y1, bb.x1, split - gutter / 2);
+    /* Anything that would not fit the band spills to the whole parcel
+       rather than being dropped: a placed pod in an awkward spot is
+       still information, a missing one is not. */
+    if (podSlots.length < r.pods) {
+      podSlots = podSlots.concat(
+        pack(r.pods - podSlots.length, pSpec.lf, pSpec.wf, poly, excl, taken));
+    }
     podSlots.forEach(function (s, i) {
       push({
         id: (typeof uid === 'function' ? uid() : 'p' + i + Date.now()),
@@ -146774,14 +147216,9 @@ if (root.console && console.info) {
       });
     });
 
-    /* 2. Fuel cells, starting below the pods so the two read as
-          separate blocks rather than one interleaved mass. */
-    var fcStartY = taken.length
-      ? Math.max.apply(null, taken.map(function (t) { return t.y + t.h; })) + 20 * P
-      : null;
-    var fcSlots = pack(r.fcBlocks, fSpec.lf, fSpec.wf, poly, excl, taken, fcStartY);
-    /* If the band below is full the remainder wraps anywhere it fits,
-       which beats refusing to place them. */
+    /* 2. Fuel cells, right band, starting level with the pods so the two
+          read as a pair rather than a stack. */
+    var fcSlots = pack(r.fcBlocks, fSpec.lf, fSpec.wf, poly, excl, taken, bb.y1, split + gutter / 2, bb.x2);
     if (fcSlots.length < r.fcBlocks) {
       var more = pack(r.fcBlocks - fcSlots.length, fSpec.lf, fSpec.wf, poly, excl, taken);
       fcSlots = fcSlots.concat(more);
@@ -146978,6 +147415,7 @@ if (root.console && console.info) {
 
   var DASH = '\u2014';
   var netCache = null;      /* {facility, metro, route, rtt} */
+  var hidden = false;       /* set by OmegaComputeHUD.hide() */
 
   function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
   function n0(v) { return Math.round(v).toLocaleString(); }
@@ -147065,11 +147503,16 @@ if (root.console && console.info) {
   function paintRail() {
     var lp = document.getElementById('lp');
     if (!lp) return;
-    var r = compute();
+    if (hidden) { var g = document.getElementById('omega-rail'); if (g) g.remove(); return; }
     var box = document.getElementById('omega-rail');
-    /* Only appears once there is something to say. An empty rail above
-       the controls is just lost height. */
-    if (!r && !substation()) { if (box) box.remove(); return; }
+    /* The rail renders from the start, em dashes and all.
+
+       It used to appear only once there was something to say, which
+       seemed tidy and was wrong: on a fresh project every row was
+       hidden, and a panel that is not there is indistinguishable from a
+       feature that was never built. The empty rail is also the clearest
+       statement of the workflow — four headings in the order the
+       questions get answered. */
     if (!box) {
       box = document.createElement('div');
       box.id = 'omega-rail';
@@ -147254,10 +147697,38 @@ if (root.console && console.info) {
     ladder: paintLadder,
     network: function () { return netCache; },
     hide: function () {
+      hidden = true;
       ['omega-rail', 'omega-ladder', 'sb-gap'].forEach(function (id) {
         var e = document.getElementById(id); if (e) e.remove();
       });
       return true;
+    },
+    show: function () { hidden = false; paintAll(); return true; },
+
+    /* Why is a surface not on screen? Each one has exactly one gate,
+       and guessing which gate closed is what wastes an afternoon. */
+    diagnose: function () {
+      var r = compute();
+      var out = [
+        { surface: 'Rail (LOAD/GRID/ON-SITE)', shown: !!document.getElementById('omega-rail'),
+          needs: 'left panel #lp present', ok: !!document.getElementById('lp') },
+        { surface: 'Ladder (load vs ceiling)', shown: !!document.getElementById('omega-ladder'),
+          needs: 'a compute result with facility load > 0',
+          ok: !!(r && r.facKw > 0) },
+        { surface: 'Status bar gap', shown: !!document.getElementById('sb-gap'),
+          needs: 'a gap > 0 to report', ok: !!(r && r.genNeedKw > 0) },
+        { surface: 'Load Screen button', shown: !!document.getElementById('rb-load-screen'),
+          needs: 'the Analyze ribbon tab in the DOM',
+          ok: !!document.querySelector('#ribbon .ribbon-page[data-page="analyze"]') },
+        { surface: 'Network rows', shown: !!netCache,
+          needs: 'Network Proximity to have been run once', ok: !!netCache }
+      ];
+      if (root.console && console.table) console.table(out);
+      if (!r && root.console) {
+        console.info(TAG + ' no compute result yet \u2014 open Compute Build and set an IT '
+          + 'load. Everything downstream of the sizer stays empty until then.');
+      }
+      return out;
     }
   };
 
@@ -148322,6 +148793,35 @@ if (root.console && console.info) {
     return n;
   }
 
+  /* A caption with nothing under it is worse than a tool in the wrong
+     place: you go looking, you find the label, and you conclude the
+     feature is gone. Moving the two scale tools into Ground emptied the
+     SCALE panel in Edit and left its caption standing, which is exactly
+     how Calibrate Scale came to look deleted.
+
+     Panels are checked before tabs, because a tab can be perfectly
+     healthy while one of its panels has been gutted. */
+  function hideEmptyPanels() {
+    var hidden = 0;
+    var panels = document.querySelectorAll('#ribbon .rpanel');
+    for (var i = 0; i < panels.length; i++) {
+      var pnl = panels[i];
+      if (pnl.getAttribute('data-shelf')) continue;      /* one we built */
+      var bs = pnl.querySelectorAll('.rbtn'), live = 0;
+      for (var j = 0; j < bs.length; j++) {
+        if (bs[j].style.display !== 'none') live++;
+      }
+      /* A panel that never held buttons holds something else — a
+         dropdown, a recents list — and is not ours to hide. */
+      if (bs.length > 0 && live === 0 && pnl.style.display !== 'none') {
+        remember(pnl);
+        pnl.style.display = 'none';
+        hidden++;
+      }
+    }
+    return hidden;
+  }
+
   /* A tab whose every panel is now empty is a door onto an empty
      cupboard. Hide it rather than leave it to be opened once and
      distrusted after. */
@@ -148356,11 +148856,12 @@ if (root.console && console.info) {
     var d = dedupe();
     var m = move();
     var c = recaption();
+    var e = hideEmptyPanels();
     var h = hideEmptyTabs();
     applied = true;
     if (root.console) {
       console.info(TAG + ' ' + m + ' tools rehoused, ' + d + ' duplicates hidden, '
-        + c + ' captions clarified'
+        + c + ' captions clarified, ' + e + ' emptied panels hidden'
         + (h.length ? ', emptied tabs hidden: ' + h.join(', ') : '')
         + '. OmegaShelf.restore() reverts.');
     }
@@ -148399,7 +148900,7 @@ if (root.console && console.info) {
       apply();
       var n = 0, iv = setInterval(function () {
         if (!applied) { apply(); return; }
-        move(); recaption();
+        move(); recaption(); hideEmptyPanels();
         if (++n > 20) clearInterval(iv);
       }, 700);
     }, 1200);
@@ -148428,6 +148929,340 @@ if (root.console && console.info) {
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 59 — COMPUTE MODE
+ *  ---------------------------------------------------------------------
+ *  A third mode beside Designer and Pro, curated for one job: siting a
+ *  large load on energised land. Four tabs, and an Analyze tab holding
+ *  exactly six tools in four groups:
+ *
+ *      Assessment    Site Setup, Find Substation
+ *      Build         Compute Build
+ *      Connectivity  Network Proximity
+ *      Output        Energy Balance, Interactive Report
+ *
+ *  WHY THIS IS NOT JUST A FILTER
+ *  Three of those six do not live in Analyze today. Site Setup and
+ *  Compute Build are in Build, Interactive Report is in Output. So the
+ *  mode has to gather them, not merely hide their neighbours. The nodes
+ *  are moved, not recreated, so every handler, tooltip and gating hook
+ *  travels with them and off() puts them all back.
+ *
+ *  Compute mode sits ON TOP of OmegaMode rather than inside it. That
+ *  module owns two modes and a localStorage key, and teaching it a
+ *  third from the outside would mean reaching into its private state.
+ *  Turning Compute mode on forces Pro underneath, because the tabs this
+ *  mode needs are the ones Designer hides.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[ComputeMode]';
+
+  var KEY = 'omega.ui.compute';
+  var TABS = ['home', 'analyze', 'estimate', 'output'];
+
+  /* label -> group caption, in the order the video lays them out. */
+  var TOOLS = [
+    { label: 'site setup',         group: 'Assessment' },
+    { label: 'find substation',    group: 'Assessment' },
+    { label: 'compute build',      group: 'Build' },
+    { label: 'network proximity',  group: 'Connectivity' },
+    { label: 'energy balance',     group: 'Output' },
+    { label: 'interactive report', group: 'Output' },
+    { label: 'load screen',        group: 'Output' }   /* patch 56 */
+  ];
+
+  var undo = [];      /* {node, parent, next, display} */
+  var made = [];
+  var on = false;
+
+  function norm(s) {
+    return String(s || '').replace(/<[^>]*>/g, ' ').replace(/\u00a0/g, ' ')
+      .replace(/-\s+/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+  function labelOf(b) {
+    var l = b.querySelector('.rb-lbl');
+    return norm(l ? l.innerHTML : b.textContent);
+  }
+  function page(n) {
+    return document.querySelector('#ribbon .ribbon-page[data-page="' + n + '"]');
+  }
+  function remember(node) {
+    undo.push({ node: node, parent: node.parentNode, next: node.nextSibling,
+                display: node.style.display });
+  }
+
+  function panelIn(pageName, caption) {
+    var pg = page(pageName);
+    if (!pg) return null;
+    var caps = pg.querySelectorAll('.rpanel-cap');
+    for (var i = 0; i < caps.length; i++) {
+      if (norm(caps[i].innerHTML) === norm(caption)
+          && caps[i].parentNode.getAttribute('data-compute')) {
+        return caps[i].parentNode.querySelector('.rpanel-body');
+      }
+    }
+    var panel = document.createElement('div');
+    panel.className = 'rpanel';
+    panel.setAttribute('data-compute', '1');
+    var body = document.createElement('div'); body.className = 'rpanel-body';
+    var cap = document.createElement('div'); cap.className = 'rpanel-cap'; cap.innerHTML = caption;
+    panel.appendChild(body); panel.appendChild(cap);
+    pg.appendChild(panel);
+    made.push(panel);
+    return body;
+  }
+
+  /* ── on ─────────────────────────────────────────────────────────────── */
+
+  function enable() {
+    if (on) return true;
+    if (!document.getElementById('ribbon')) return false;
+
+    /* Designer hides Analyze, which is where this mode lives. */
+    try { if (root.OmegaMode && root.OmegaMode.get() !== 'pro') root.OmegaMode.set('pro'); } catch (e) {}
+
+    var all = Array.prototype.slice.call(document.querySelectorAll('#ribbon .rbtn'));
+    var wanted = {};
+    TOOLS.forEach(function (t) { wanted[t.label] = t.group; });
+
+    /* Gather the six into Analyze under the four captions. */
+    TOOLS.forEach(function (t) {
+      for (var i = 0; i < all.length; i++) {
+        if (labelOf(all[i]) !== t.label) continue;
+        var body = panelIn('analyze', t.group);
+        if (!body) continue;
+        remember(all[i]);
+        all[i].style.display = '';
+        body.appendChild(all[i]);
+        break;                      /* first match only; dupes stay hidden */
+      }
+    });
+
+    /* Hide every other button on Analyze, and every panel that is not
+       one of ours. The originals are untouched on their own tabs. */
+    var an = page('analyze');
+    if (an) {
+      var pnls = an.querySelectorAll('.rpanel');
+      for (var p = 0; p < pnls.length; p++) {
+        if (pnls[p].getAttribute('data-compute')) continue;
+        if (pnls[p].style.display !== 'none') {
+          remember(pnls[p]); pnls[p].style.display = 'none';
+        }
+      }
+    }
+
+    /* Four tabs. */
+    var tabs = document.querySelectorAll('#ribbon-tabs .rtab');
+    for (var j = 0; j < tabs.length; j++) {
+      var pg = tabs[j].getAttribute('data-page');
+      var keep = TABS.indexOf(pg) > -1;
+      if (!keep && tabs[j].style.display !== 'none') {
+        remember(tabs[j]); tabs[j].style.display = 'none';
+      }
+    }
+
+    try { localStorage.setItem(KEY, '1'); } catch (e) {}
+    on = true;
+    badge();
+    try { if (typeof rbTab === 'function') rbTab('analyze'); } catch (e) {}
+    if (root.console) console.info(TAG + ' on \u2014 4 tabs, 6 tools. OmegaComputeMode.off() reverts.');
+    return true;
+  }
+
+  function disable() {
+    if (!on) return false;
+    for (var i = undo.length - 1; i >= 0; i--) {
+      var u = undo[i];
+      try {
+        u.node.style.display = u.display || '';
+        if (u.parent) u.parent.insertBefore(u.node, u.next);
+      } catch (e) {}
+    }
+    made.forEach(function (p) { if (p.parentNode) p.parentNode.removeChild(p); });
+    undo = []; made = []; on = false;
+    try { localStorage.removeItem(KEY); } catch (e) {}
+    badge();
+    if (root.console) console.info(TAG + ' off \u2014 full ribbon restored.');
+    return true;
+  }
+
+  /* ── the switch ─────────────────────────────────────────────────────── */
+
+  /* Sits next to the Designer/Pro switch so the three modes read as one
+     choice rather than two unrelated settings. */
+  function badge() {
+    var b = document.getElementById('omg-compute');
+    if (!b) {
+      var host = document.getElementById('omg-switch');
+      if (!host || !host.parentNode) return;
+      b = document.createElement('button');
+      b.id = 'omg-compute';
+      b.style.cssText = 'margin-left:6px;padding:3px 9px;border-radius:6px;cursor:pointer;'
+        + 'font-family:inherit;font-size:10px;font-weight:700;letter-spacing:.4px';
+      b.onclick = function () { on ? disable() : enable(); };
+      host.parentNode.insertBefore(b, host.nextSibling);
+    }
+    b.textContent = 'Compute';
+    b.title = on
+      ? 'Compute mode is on \u2014 four tabs, six tools. Click to restore the full ribbon.'
+      : 'Compute mode \u2014 curate the ribbon for siting a large load on energised land.';
+    b.style.background = on ? 'rgba(124,58,237,.22)' : 'rgba(255,255,255,.04)';
+    b.style.border = '1px solid ' + (on ? '#7C3AED' : '#3A3A3A');
+    b.style.color = on ? '#C4B5FD' : '#9A9A9A';
+  }
+
+  function boot() {
+    var want = false;
+    try { want = localStorage.getItem(KEY) === '1'; } catch (e) {}
+    var n = 0, iv = setInterval(function () {
+      badge();
+      /* Other patches inject their buttons on timers, so a mode restored
+         from storage waits for them before gathering. */
+      if (want && !on && document.getElementById('rb-load-screen')) { enable(); }
+      if (++n > 40) {
+        clearInterval(iv);
+        if (want && !on) enable();     /* go without the late arrivals */
+      }
+    }, 500);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaComputeMode.on()');
+  }
+
+  root.OmegaComputeMode = {
+    on: enable, off: disable, toggle: function () { return on ? disable() : enable(); },
+    isOn: function () { return on; }, tools: TOOLS, tabs: TABS
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 58 — OmegaCheck()
+ *  ---------------------------------------------------------------------
+ *  Twelve patches now add surfaces that each have their own precondition.
+ *  When one does not appear the question is always the same — did the
+ *  module load, or did it load and decide it had nothing to show — and
+ *  answering it by reading source is a waste of an afternoon.
+ *
+ *  OmegaCheck() prints two tables. The first says which modules are
+ *  present. The second says, for each thing you can look at, whether it
+ *  is on screen and what it is waiting for.
+ *
+ *  It deliberately reports "waiting" separately from "broken". Most of
+ *  what looks broken here is a surface correctly declining to invent
+ *  numbers it does not have, and that distinction is the whole point.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+
+  var MODULES = [
+    ['OmegaSiteContext',  'County and state from the geocoder'],
+    ['OmegaSiteLocation', 'S.lat / S.lng on the project record'],
+    ['OmegaLiveSite',     'Live map, calibration, unfreeze'],
+    ['OmegaSiteRoles',    'Boundary and exclusion tagging'],
+    ['OmegaSiting',       'Exclusion types, substation envelope, CSV'],
+    ['OmegaLayoutFacts',  'Persisted layout, cached compute result'],
+    ['OmegaComputePlace', 'Parcel-aware auto-placement'],
+    ['OmegaComputeHUD',   'Rail, ladder, status gap'],
+    ['OmegaLoadScreen',   'Load siting screen report'],
+    ['OmegaReportV2',     'Single-scroll site report'],
+    ['OmegaReportExport', 'Self-contained report file'],
+    ['OmegaShelf',        'Ribbon reorganisation']
+  ];
+
+  function has(n) { return !!root[n]; }
+
+  function modules() {
+    return MODULES.map(function (m) {
+      return { module: m[0], loaded: has(m[0]) ? 'yes' : 'NO', does: m[1] };
+    });
+  }
+
+  function state() {
+    var rows = [];
+    var add = function (what, ready, waiting) {
+      rows.push({ item: what, ready: ready ? 'yes' : 'no', waiting_on: ready ? '' : waiting });
+    };
+
+    var loc = null;
+    try { loc = root.OmegaSiteLocation && root.OmegaSiteLocation.get(); } catch (e) {}
+    add('Site location', !!loc, 'Enter a site address, or run Site Setup');
+
+    var bnd = null;
+    try { bnd = root.OmegaSiteRoles && root.OmegaSiteRoles.boundary(); } catch (e) {}
+    add('Traced parcel', !!bnd, 'Build \u203a Trace Boundary');
+
+    var nEx = 0;
+    try { nEx = (root.OmegaSiteRoles && root.OmegaSiteRoles.exclusions() || []).length; } catch (e) {}
+    add('Exclusions (' + nEx + ')', nEx > 0, 'Optional \u2014 Build \u203a Add Exclusion');
+
+    var sub = null;
+    try { sub = S.substationLookup; } catch (e) {}
+    add('Substation', !!sub, 'Analyze \u203a Find Substation, then Place on site');
+
+    var comp = null;
+    try { comp = root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute(); } catch (e) {}
+    add('Compute sizing', !!(comp && comp.facKw > 0),
+      'Build \u203a Compute Build \u2014 set an IT load. Nothing downstream fills until this runs');
+
+    var placed = root._omegaComputePlaced;
+    add('Pods placed on parcel', !!placed, 'Compute Build \u203a Place, after a boundary exists');
+
+    var net = null;
+    try { net = root.OmegaComputeHUD && root.OmegaComputeHUD.network(); } catch (e) {}
+    add('Network proximity', !!net, 'Analyze \u203a Network Proximity (needs a site location)');
+
+    var gas = null;
+    try { gas = root.OmegaGas && root.OmegaGas.main(); } catch (e) {}
+    add('Gas main distance', !!gas, 'OmegaGas.setMain(miles, "S") \u2014 no dataset wired, entered by hand');
+
+    add('Rail on screen', !!document.getElementById('omega-rail'), 'Left panel #lp missing');
+    add('Ladder on screen', !!document.getElementById('omega-ladder'), 'Needs compute sizing');
+    add('Load Screen button', !!document.getElementById('rb-load-screen'),
+      'Analyze tab not in the DOM, or hidden by Designer mode');
+    add('Trace Boundary button', !!document.getElementById('rb-trace-boundary'),
+      'Ribbon not ready');
+
+    return rows;
+  }
+
+  function check() {
+    var mods = modules(), st = state();
+    var missing = mods.filter(function (m) { return m.loaded === 'NO'; });
+    if (root.console) {
+      console.log('%cOMEGA CHECK', 'font-weight:700;font-size:13px');
+      if (console.table) { console.table(mods); console.table(st); }
+      if (missing.length) {
+        console.warn('Modules that did not load: '
+          + missing.map(function (m) { return m.module; }).join(', ')
+          + ' \u2014 that is a real fault, not a gate.');
+      } else {
+        console.info('All 12 modules loaded. Anything marked "no" above is waiting on an '
+          + 'input, not broken.');
+      }
+      var mode = '';
+      try { mode = root.OmegaMode ? root.OmegaMode.get() : '?'; } catch (e) {}
+      console.info('UI mode: ' + mode
+        + (mode === 'designer' ? '  \u2014 Analyze, Draw, Insert and Modify are hidden in '
+          + 'Designer. OmegaMode.set("pro") brings them back.' : ''));
+    }
+    return { modules: mods, state: st, missing: missing };
+  }
+
+  root.OmegaCheck = check;
+  root.OmegaCheck.modules = modules;
+  root.OmegaCheck.state = state;
+
+  if (root.console) {
+    console.info('[Check] ready \u2014 run OmegaCheck() to see what is loaded and what is waiting');
+  }
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
 </body>
