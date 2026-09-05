@@ -145374,12 +145374,15 @@ if (root.console && console.info) {
 
   /* ── zone plan ──────────────────────────────────────────────────────── */
 
-  /* Divides the build pad into four bands with real gutters between
-     them. Compute and generation are the two big consumers of ground,
-     so they take the split; storage takes a strip against the
-     generation side because that is where the interconnection is; solar
-     takes whatever is left OUTSIDE the pad, which is the awkward
-     boundary land nothing else can use. */
+  /* Divides the build pad into zones sized to what each actually needs,
+     with real gutters, and hands whatever is left to solar.
+
+     The earlier version split the full pad width three ways in
+     proportion. That filled the drawing but lied: at 500 MW the compute
+     and generation only occupy about 20 of 50 acres, and stretching
+     their zones across the rest implied ground was committed when it
+     was not. Zones are sized to need; the remainder is a real, separate
+     area and gets named as one. */
   function plan(pad, mix) {
     if (!pad) return null;
     var P = 6;
@@ -145387,33 +145390,44 @@ if (root.console && console.info) {
     var gut = CLEAR.zoneGutterFt * P;
     var w = pad.x2 - pad.x1, h = pad.y2 - pad.y1;
     if (!(w > 0 && h > 0)) return null;
+    if (h <= 0) return null;
 
-    var computeArea = Math.max(0, +mix.computeArea || 0);
-    var genArea = Math.max(0, +mix.genArea || 0);
-    var bessArea = Math.max(0, +mix.bessArea || 0);
-    var total = computeArea + genArea + bessArea;
-    if (total <= 0) return null;
-
-    /* Storage gets its own band at the far side, sized on need but
-       floored so it is never a sliver. */
-    var bessFrac = Math.min(0.25, Math.max(0.06, bessArea / total));
-    var rest = 1 - bessFrac;
-    var cFrac = rest * (computeArea / Math.max(1, computeArea + genArea));
-
-    var x = pad.x1;
-    var compute = { x1: x, y1: pad.y1, x2: x + w * cFrac - gut / 2, y2: pad.y2 };
-    x = compute.x2 + gut;
-    var gFrac = rest - cFrac;
-    var generation = { x1: x, y1: pad.y1, x2: x + w * gFrac - gut / 2, y2: pad.y2 };
-    x = generation.x2 + gut;
-    var storage = { x1: x, y1: pad.y1, x2: pad.x2, y2: pad.y2 };
-
-    return {
-      compute: compute, generation: generation, storage: storage,
-      gutterFt: CLEAR.zoneGutterFt,
-      note: 'Compute, generation and storage in separate zones with '
-        + CLEAR.zoneGutterFt + ' ft fire lanes. Storage sits on the interconnection side.'
+    /* Width each zone needs to hold its area at the pad's height, with
+       a margin so the packer is not fighting the boundary. */
+    var need = function (areaFt2) {
+      if (!(areaFt2 > 0)) return 0;
+      var areaPx = areaFt2 * P * P;
+      return Math.min(w, (areaPx / h) * 1.25);
     };
+
+    var cW = need(mix.computeArea);
+    var gW = need(mix.genArea);
+    var bW = need(mix.bessArea);
+    var used = cW + gW + bW + gut * 3;
+
+    /* If the three together exceed the pad, fall back to proportional
+       so nothing is dropped. */
+    if (used > w) {
+      var k = (w - gut * 3) / Math.max(1, cW + gW + bW);
+      cW *= k; gW *= k; bW *= k; used = w;
+    }
+
+    var x = pad.x1, z = {};
+    if (cW > 0) { z.compute = { x1: x, y1: pad.y1, x2: x + cW, y2: pad.y2 }; x += cW + gut; }
+    if (gW > 0) { z.generation = { x1: x, y1: pad.y1, x2: x + gW, y2: pad.y2 }; x += gW + gut; }
+    if (bW > 0) { z.storage = { x1: x, y1: pad.y1, x2: x + bW, y2: pad.y2 }; x += bW + gut; }
+
+    /* Everything left. On a compute-dense site this is most of the
+       parcel, and leaving it blank is what made the drawing look
+       unfinished. */
+    if (pad.x2 - x > 40 * P) {
+      z.solar = { x1: x, y1: pad.y1, x2: pad.x2, y2: pad.y2 };
+    }
+
+    z.gutterFt = CLEAR.zoneGutterFt;
+    z.note = 'Zones sized to need with ' + CLEAR.zoneGutterFt
+      + ' ft fire lanes. Remaining ground is available for solar.';
+    return z;
   }
 
   /* Per-zone clearance, so the packer uses the right one per equipment
@@ -147819,6 +147833,10 @@ if (root.console && console.info) {
     var placed = {
       pods: podSlots.length, podsWanted: r.pods,
       podBox: extent(podSlots), fcBox: extent(fcSlots), bessBox: extent(bessSlots),
+      /* The zone rectangles themselves, so they can be drawn as areas
+         rather than inferred from where equipment happens to sit. An
+         empty zone still has a boundary and should still show one. */
+      zones: zones, pad: pad,
       sizing: r,
       fc: fcSlots.length, fcWanted: r.fcBlocks,
       bess: bessSlots.length,
@@ -150450,6 +150468,106 @@ if (root.console && console.info) {
     } catch (e) { return null; }
   }
 
+  /* ── zones ──────────────────────────────────────────────────────────── */
+
+  /* The zones are drawn as areas rather than left implicit in where
+     equipment happens to sit. A site plan shows the compute yard, the
+     generation yard and the battery yard as places, with the fire lanes
+     between them visible, because that is what gets walked, fenced and
+     permitted. An empty zone still has a boundary and still gets one:
+     the ground is allocated whether or not it is occupied yet. */
+  var ZONE_STYLE = {
+    compute:    { stroke: '#3B82F6', fill: 'rgba(59,130,246,.07)',  name: 'COMPUTE' },
+    generation: { stroke: '#A78BFA', fill: 'rgba(167,139,250,.07)', name: 'GENERATION' },
+    storage:    { stroke: '#4ADE80', fill: 'rgba(74,222,128,.07)',  name: 'STORAGE' },
+    solar:      { stroke: '#FBBF24', fill: 'rgba(251,191,36,.06)',  name: 'SOLAR' }
+  };
+
+  /* What the leftover ground is worth, said plainly. On a compute-dense
+     site the honest answer is small, and rounding it up to look better
+     would be the kind of number nobody can act on. */
+  function solarForZone(z, r) {
+    var ac = acresOf(z);
+    if (ac == null || !(ac > 0)) return null;
+    var kwDc = (ac / 4.5) * 1000;           /* ~4.5 ac per MW-DC fixed tilt */
+    var cf = 0.20;
+    var mwhYr = (kwDc / 1000) * cf * 8760;
+    var facMwh = (r && r.facKw > 0) ? (r.facKw / 1000) * 0.9 * 8760 : 0;
+    return {
+      acres: ac, kwDc: kwDc, mwhYr: mwhYr,
+      offset: facMwh > 0 ? mwhYr / facMwh : null
+    };
+  }
+
+  function solarNote(z, r) {
+    var s = solarForZone(z, r);
+    if (!s) return 'available';
+    var pct = (s.offset != null)
+      ? ' \u00b7 ' + (s.offset * 100 < 1 ? '<1' : Math.round(s.offset * 100)) + '% of load energy'
+      : '';
+    return n1(s.kwDc / 1000) + ' MW-DC available' + pct;
+  }
+
+  function acresOf(z) {
+    var P = ppf();
+    if (!(P > 0)) return null;
+    var ft2 = ((z.x2 - z.x1) / P) * ((z.y2 - z.y1) / P);
+    return ft2 / 43560;
+  }
+
+  function drawZones(g, placed, r, fs) {
+    var zones = placed.zones;
+    if (!zones) return;
+    var counts = {
+      compute: placed.pods ? placed.pods + ' pods \u00b7 ' + placed.pods + ' MW IT' : 'unallocated',
+      generation: placed.fc
+        ? placed.fc + ' \u00d7 ' + (r.fcBlockKw >= 1000
+            ? (r.fcBlockKw / 1000) + ' MW' : (r.fcBlockKw || 300) + ' kW')
+          + ' \u00b7 ' + n1((r.fcKw || 0) / 1000) + ' MW'
+        : 'unallocated',
+      storage: (r.bessKwh > 0)
+        ? n0(r.bessKwh) + ' kWh \u00b7 ' + n1((r.bessKw || 0) / 1000) + ' MW'
+        : 'unallocated',
+      solar: solarNote(placed.zones && placed.zones.solar, r)
+    };
+
+    ['compute', 'generation', 'storage', 'solar'].forEach(function (k) {
+      var z = zones[k];
+      if (!z || !(z.x2 > z.x1 && z.y2 > z.y1)) return;
+      var st = ZONE_STYLE[k];
+
+      var rect = mk('rect');
+      rect.setAttribute('x', z.x1); rect.setAttribute('y', z.y1);
+      rect.setAttribute('width', z.x2 - z.x1);
+      rect.setAttribute('height', z.y2 - z.y1);
+      rect.setAttribute('fill', st.fill);
+      rect.setAttribute('stroke', st.stroke);
+      rect.setAttribute('stroke-width', Math.max(1, fs * 0.09));
+      rect.setAttribute('stroke-dasharray', (fs * 0.9) + ' ' + (fs * 0.6));
+      rect.setAttribute('rx', fs * 0.25);
+      g.appendChild(rect);
+
+      /* Zone name inside the top-left corner, area and contents under
+         it. Placed inside so a narrow zone does not throw its label
+         over its neighbour. */
+      var pad = fs * 0.6;
+      var ac = acresOf(z);
+      text(g, z.x1 + pad, z.y1 + fs * 1.25, st.name + ' ZONE',
+        fs * 0.95, st.stroke, 'start', '700');
+      text(g, z.x1 + pad, z.y1 + fs * 2.35,
+        (ac != null ? n1(ac) + ' ac \u00b7 ' : '') + counts[k],
+        fs * 0.72, 'rgba(226,238,249,.75)', 'start', '600');
+    });
+
+    /* The fire lane dimension, once, so the gap is a stated figure
+       rather than whitespace somebody has to measure. */
+    if (zones.compute && zones.generation && zones.gutterFt) {
+      var gx = (zones.compute.x2 + zones.generation.x1) / 2;
+      text(g, gx, zones.compute.y2 + fs * 1.1,
+        zones.gutterFt + ' ft fire lane', fs * 0.68, '#94A3B8', 'middle', '600');
+    }
+  }
+
   function draw() {
     var placed = root._omegaComputePlaced;
     var g = layer();
@@ -150465,6 +150583,12 @@ if (root.console && console.info) {
        reason the substation chip needed fixing: a constant in SVG units
        is illegible the moment the scale changes. */
     var fs = Math.max(9, 14 * P / 6);
+
+    /* Zones first, so the equipment labels sit on top of the areas
+       rather than under them. */
+    try { drawZones(g, placed, r, fs); } catch (e) {
+      if (root.console) console.warn(TAG + ' zones', e && e.message);
+    }
 
     /* Pod block. */
     if (placed.podBox && placed.pods) {
