@@ -156589,5 +156589,454 @@ if (root.console && console.info) {
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 83 — SCROLL THROUGH THE DRAWING, AND FENCE EVERYTHING
+ *  ---------------------------------------------------------------------
+ *  TWO THINGS, ONE ROOT EACH.
+ *
+ *  1. THE MAP WOULD NOT ZOOM OVER THE ARRAY.
+ *  Shapes are drawn with pointer-events:visiblePainted so they can be
+ *  clicked and dragged. That also means a wheel event over a painted
+ *  shape lands on the SVG and never reaches the map div underneath, so
+ *  the zoom worked over bare ground and died over the solar field —
+ *  exactly the part of the drawing anybody would be trying to zoom
+ *  into. The canvas wheel handler bows out in map mode on the
+ *  assumption the map will get the event, and over a shape it does not.
+ *
+ *  The fix keeps the shapes clickable and forwards the wheel: if the
+ *  map div is not already in the event's path, the event is replayed on
+ *  whatever sits under the pointer with the overlay momentarily
+ *  transparent. Clicks and drags are untouched.
+ *
+ *  2. FENCES AND A CONTROL POINT, ALWAYS — NOT ONLY AFTER DESIGN SITE.
+ *  Patch 77 fences the compounds it lays out itself. Anything placed by
+ *  hand, by Auto Layout, or by any of the guided builds got nothing:
+ *  no fence line, no control yard, no tie. A battery yard with no fence
+ *  is not a permit drawing, and the 3D view had no fence to build
+ *  because there was no fence object on the plan.
+ *
+ *  So this reads what is ALREADY on the canvas, groups it by what it is
+ *  — storage, compute, generation, solar, the tie-in yard — clusters
+ *  each group by proximity so two battery blocks 900 ft apart get two
+ *  compounds rather than one fence around a field, draws a dashed
+ *  security fence at a stand-off, puts a master controller in the
+ *  middle if there is not one, and trenches a duct bank from every
+ *  compound back to it.
+ *
+ *  The fences carry the same omegaCampus tag patch 79 reads, so they
+ *  build as real chain-link with a gate in the 3D visualiser rather
+ *  than as anonymous rectangles.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[FenceTie]';
+
+  var CFG = {
+    standoffFt: 12,        /* fence stand-off from the equipment       */
+    clusterFt: 150,        /* farther apart than this is a separate compound */
+    gutterFt: 30,          /* fire lane, and the corridor the ties run on */
+    ctrlLf: 40, ctrlWf: 30,
+    ctrlLabel: 'MASTER CONTROLLER'
+  };
+
+  function S_() { return root.S; }
+  function P() { try { return +S_().pxPerFt > 0 ? +S_().pxPerFt : 0; } catch (e) { return 0; } }
+  function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+
+  /* ── 1. wheel passthrough ───────────────────────────────────────────── */
+
+  function wheelFix() {
+    var cw = document.getElementById('cw');
+    if (!cw || cw.__omegaWheel) return false;
+    cw.__omegaWheel = true;
+    cw.addEventListener('wheel', function (e) {
+      var md = document.getElementById('_gmapDiv');
+      if (!md) return;                                  /* upload mode: leave it */
+      /* Already heading for the map? Nothing to do. */
+      var path = (e.composedPath && e.composedPath()) || [];
+      for (var i = 0; i < path.length; i++) if (path[i] === md) return;
+      /* Panels and inputs scroll themselves. */
+      if (e.target.closest && (e.target.closest('#lp') || e.target.closest('.rr')
+        || e.target.closest('[data-omega-scroll]'))) return;
+
+      var host = document.getElementById('csvg');
+      var prev = host ? host.style.pointerEvents : null;
+      if (host) host.style.pointerEvents = 'none';
+      var under = document.elementFromPoint(e.clientX, e.clientY);
+      if (host) host.style.pointerEvents = prev || '';
+      if (!under || !md.contains(under)) under = md;
+
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        under.dispatchEvent(new WheelEvent('wheel', {
+          deltaX: e.deltaX, deltaY: e.deltaY, deltaZ: e.deltaZ, deltaMode: e.deltaMode,
+          clientX: e.clientX, clientY: e.clientY, ctrlKey: e.ctrlKey, shiftKey: e.shiftKey,
+          bubbles: true, cancelable: true, view: root
+        }));
+      } catch (err) { /* older engines: the wheel simply does nothing, as before */ }
+    }, { passive: false, capture: true });
+    return true;
+  }
+
+  /* ── 2. what is on the canvas, and what it is ───────────────────────── */
+
+  var GROUPS = [
+    { key: 'storage',    label: 'ENERGY STORAGE',
+      is: function (sh) { return sh.kind === 'bespad' || sh.kind === 'assembly'
+        || (sh.kind === 'eq' && sh.eqId === 'bess'); } },
+    { key: 'compute',    label: 'COMPUTE CAMPUS',
+      is: function (sh) { return sh.kind === 'derdc'; } },
+    { key: 'generation', label: 'ON-SITE GENERATION',
+      is: function (sh) { return sh.kind === 'deralt' || sh.kind === 'derwind'; } },
+    { key: 'solar',      label: 'SOLAR FIELD',
+      is: function (sh) { return sh.kind === 'dersolar'; } },
+    { key: 'yard',       label: 'INTERCONNECTION YARD',
+      is: function (sh) { return !!sh.omegaYard || sh.kind === 'utility'; } }
+  ];
+
+  function boxOf(sh) {
+    var p = P(); if (!(p > 0)) return null;
+    if (sh.pts && sh.pts.length >= 2 && sh.kind !== 'derdc' && sh.kind !== 'deralt'
+        && sh.kind !== 'bespad' && !(sh.lf > 0 && sh.wf > 0)) {
+      var xs = sh.pts.map(function (q) { return q.x; }), ys = sh.pts.map(function (q) { return q.y; });
+      return { x1: Math.min.apply(null, xs), y1: Math.min.apply(null, ys),
+               x2: Math.max.apply(null, xs), y2: Math.max.apply(null, ys) };
+    }
+    if (sh.lf > 0 && sh.wf > 0) {
+      if (sh.cx != null) return { x1: sh.cx - sh.lf * p / 2, y1: sh.cy - sh.wf * p / 2,
+                                  x2: sh.cx + sh.lf * p / 2, y2: sh.cy + sh.wf * p / 2 };
+      if (sh.pts && sh.pts[0]) return { x1: sh.pts[0].x, y1: sh.pts[0].y,
+                                        x2: sh.pts[0].x + sh.lf * p, y2: sh.pts[0].y + sh.wf * p };
+    }
+    if (sh.boundary && sh.boundary.length >= 3) {
+      var bx = sh.boundary.map(function (q) { return q.x; }), by = sh.boundary.map(function (q) { return q.y; });
+      return { x1: Math.min.apply(null, bx), y1: Math.min.apply(null, by),
+               x2: Math.max.apply(null, bx), y2: Math.max.apply(null, by) };
+    }
+    if (sh.pts && sh.pts[0] && sh.wPx > 0 && sh.hPx > 0) {
+      return { x1: sh.pts[0].x, y1: sh.pts[0].y, x2: sh.pts[0].x + sh.wPx, y2: sh.pts[0].y + sh.hPx };
+    }
+    return null;
+  }
+
+  /* Two blocks of batteries at opposite ends of a parcel are two
+     compounds. Single-linkage on inflated boxes says so without anybody
+     having to draw the line. */
+  function cluster(boxes, gapPx) {
+    var groups = boxes.map(function (b) { return [b]; });
+    var merged = true;
+    var hull = function (g) {
+      var x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+      g.forEach(function (b) {
+        x1 = Math.min(x1, b.x1); y1 = Math.min(y1, b.y1);
+        x2 = Math.max(x2, b.x2); y2 = Math.max(y2, b.y2);
+      });
+      return { x1: x1, y1: y1, x2: x2, y2: y2 };
+    };
+    var near = function (a, b) {
+      return !(a.x2 + gapPx < b.x1 || b.x2 + gapPx < a.x1
+            || a.y2 + gapPx < b.y1 || b.y2 + gapPx < a.y1);
+    };
+    while (merged && groups.length > 1) {
+      merged = false;
+      outer:
+      for (var i = 0; i < groups.length; i++) {
+        for (var j = i + 1; j < groups.length; j++) {
+          if (near(hull(groups[i]), hull(groups[j]))) {
+            groups[i] = groups[i].concat(groups[j]);
+            groups.splice(j, 1); merged = true; break outer;
+          }
+        }
+      }
+    }
+    return groups.map(hull);
+  }
+
+  function compounds() {
+    var p = P(); if (!(p > 0)) return [];
+    var out = [], shapes = [];
+    try { shapes = S_().shapes || []; } catch (e) { return []; }
+    GROUPS.forEach(function (G) {
+      var boxes = [];
+      shapes.forEach(function (sh) {
+        if (!sh || sh.omegaCampus || sh.omegaFence) return;   /* fences are not equipment */
+        if (!G.is(sh)) return;
+        var b = boxOf(sh); if (b) boxes.push(b);
+      });
+      if (!boxes.length) return;
+      cluster(boxes, CFG.clusterFt * p).forEach(function (h, i) {
+        out.push({ key: G.key, label: G.label + (i ? ' ' + (i + 1) : ''),
+                   r: { x1: h.x1 - CFG.standoffFt * p, y1: h.y1 - CFG.standoffFt * p,
+                        x2: h.x2 + CFG.standoffFt * p, y2: h.y2 + CFG.standoffFt * p },
+                   n: boxes.length });
+      });
+    });
+    return out;
+  }
+
+  /* ── drawing ────────────────────────────────────────────────────────── */
+
+  function nid(p) { return (typeof root.uid === 'function') ? root.uid() : p + Date.now() + Math.random(); }
+  function push(sh) {
+    S_().shapes.push(sh);
+    try { if (typeof root._geoRestampOne === 'function') root._geoRestampOne(sh); } catch (e) {}
+    try { if (typeof root.renderShape === 'function') root.renderShape(sh); } catch (e) {}
+    return sh;
+  }
+
+  function clearOurs() {
+    var n = 0, keep = [];
+    (S_().shapes || []).forEach(function (sh) {
+      if (sh && sh.omegaFence) {
+        n++;
+        try {
+          var el = document.querySelector('#csvg [data-shid="' + sh.id + '"]');
+          if (el && el.parentNode) el.parentNode.removeChild(el);
+        } catch (e) {}
+      } else keep.push(sh);
+    });
+    S_().shapes = keep;
+    var ck = [];
+    (S_().conduits || []).forEach(function (c) {
+      if (c && c.omegaFence) {
+        try {
+          var e2 = document.querySelector('[data-cid="' + c.id + '"]');
+          if (e2 && e2.parentNode) e2.parentNode.removeChild(e2);
+        } catch (e) {}
+      } else ck.push(c);
+    });
+    S_().conduits = ck;
+    return n;
+  }
+
+  function conduit(pts, label) {
+    var p = P() || 6, px = 0;
+    for (var i = 1; i < pts.length; i++) px += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+    var c = { id: nid('mv'), condType: 'MV-UG', route: 'trench',
+      pts: pts.map(function (q) { return { x: q.x, y: q.y }; }),
+      pxLen: px, ftLen: +(px / p).toFixed(1), label: label || '',
+      labelDx: 40, labelDy: -20, omegaFence: true, omegaCampus: 'feeder' };
+    try { S_().conduits.push(c); } catch (e) { return null; }
+    try { if (typeof root._geoRestampOne === 'function') root._geoRestampOne(c); } catch (e) {}
+    try { if (typeof root.renderConduit === 'function') root.renderConduit(c); } catch (e) {}
+    return c;
+  }
+
+  /* Orthogonal, and around the compounds rather than through them. */
+  function hits(a, b, r) {
+    var x1 = Math.min(a.x, b.x), x2 = Math.max(a.x, b.x);
+    var y1 = Math.min(a.y, b.y), y2 = Math.max(a.y, b.y);
+    return x1 < r.x2 - 0.5 && x2 > r.x1 + 0.5 && y1 < r.y2 - 0.5 && y2 > r.y1 + 0.5;
+  }
+  function clear(pts, obs) {
+    for (var i = 1; i < pts.length; i++)
+      for (var o = 0; o < obs.length; o++) if (hits(pts[i - 1], pts[i], obs[o])) return false;
+    return true;
+  }
+  function edgePoint(r, t) {
+    var cx = (r.x1 + r.x2) / 2, cy = (r.y1 + r.y2) / 2;
+    if (Math.abs(t.x - cx) > Math.abs(t.y - cy)) {
+      return { x: t.x > cx ? r.x2 : r.x1, y: Math.max(r.y1 + 4, Math.min(r.y2 - 4, t.y)) };
+    }
+    return { x: Math.max(r.x1 + 4, Math.min(r.x2 - 4, t.x)), y: t.y > cy ? r.y2 : r.y1 };
+  }
+  /* Enter the control yard on its centre line so the last leg is square
+     to the pad instead of angling into the middle of it. */
+  function ctrlPort(f, from) {
+    var cx = (f.x1 + f.x2) / 2, cy = (f.y1 + f.y2) / 2;
+    if (Math.abs(from.x - cx) > Math.abs(from.y - cy)) {
+      return { x: from.x > cx ? f.x2 : f.x1, y: cy };
+    }
+    return { x: cx, y: from.y > cy ? f.y2 : f.y1 };
+  }
+
+  function route(from, to, obs, corr) {
+    var cands = [[from, { x: from.x, y: to.y }, to], [from, { x: to.x, y: from.y }, to]];
+    corr.xs.forEach(function (x) { cands.push([from, { x: x, y: from.y }, { x: x, y: to.y }, to]); });
+    corr.ys.forEach(function (y) { cands.push([from, { x: from.x, y: y }, { x: to.x, y: y }, to]); });
+    var best = null;
+    cands.forEach(function (c) {
+      if (!clear(c, obs)) return;
+      var L = 0;
+      for (var i = 1; i < c.length; i++) L += Math.abs(c[i].x - c[i - 1].x) + Math.abs(c[i].y - c[i - 1].y);
+      L += (c.length - 2) * 40;
+      if (!best || L < best.L) best = { L: L, pts: c };
+    });
+    return best ? best.pts : [from, { x: from.x, y: to.y }, to];
+  }
+
+  function run(opts) {
+    opts = opts || {};
+    var p = P();
+    if (!(p > 0)) {
+      if (typeof root.showBanner === 'function') {
+        root.showBanner('cal', 'Calibrate the drawing scale first \u2014 a fence has to be a real distance.');
+      }
+      return null;
+    }
+    clearOurs();
+    var comps = compounds();
+    if (!comps.length) {
+      if (typeof root.showBanner === 'function') {
+        root.showBanner('cal', 'Nothing to fence yet \u2014 place storage, compute, generation or solar first.');
+      }
+      return null;
+    }
+
+    /* Master controller: the one that already exists, or a new one in the
+       middle of everything, nudged clear of any compound it lands on. */
+    var ctrlShape = null;
+    try {
+      ctrlShape = (S_().shapes || []).filter(function (x) { return x && x.omegaController; }).pop() || null;
+    } catch (e) {}
+    var cw = CFG.ctrlLf * p, ch = CFG.ctrlWf * p, ctrl;
+    if (ctrlShape && ctrlShape.pts && ctrlShape.pts[0]) {
+      ctrl = { x1: ctrlShape.pts[0].x, y1: ctrlShape.pts[0].y,
+               x2: ctrlShape.pts[0].x + (ctrlShape.lf || CFG.ctrlLf) * p,
+               y2: ctrlShape.pts[0].y + (ctrlShape.wf || CFG.ctrlWf) * p };
+    } else {
+      var sx = 0, sy = 0;
+      comps.forEach(function (c) { sx += (c.r.x1 + c.r.x2) / 2; sy += (c.r.y1 + c.r.y2) / 2; });
+      var mx = sx / comps.length, my = sy / comps.length;
+      ctrl = { x1: mx - cw / 2, y1: my - ch / 2, x2: mx + cw / 2, y2: my + ch / 2 };
+      /* Walk it out of anything it landed inside. */
+      for (var tries = 0; tries < 40; tries++) {
+        var clash = null;
+        for (var i = 0; i < comps.length; i++) {
+          var r = comps[i].r;
+          if (!(ctrl.x2 + CFG.gutterFt * p < r.x1 || r.x2 + CFG.gutterFt * p < ctrl.x1
+             || ctrl.y2 + CFG.gutterFt * p < r.y1 || r.y2 + CFG.gutterFt * p < ctrl.y1)) { clash = r; break; }
+        }
+        if (!clash) break;
+        var dy = ((ctrl.y1 + ctrl.y2) / 2 < (clash.y1 + clash.y2) / 2) ? -1 : 1;
+        var step = 20 * p * dy;
+        ctrl = { x1: ctrl.x1, y1: ctrl.y1 + step, x2: ctrl.x2, y2: ctrl.y2 + step };
+      }
+      ctrlShape = push({ id: nid('mc'), kind: 'bespad', pts: [{ x: ctrl.x1, y: ctrl.y1 }],
+        style: (S_().shapeStyle || ''), lf: CFG.ctrlLf, wf: CFG.ctrlWf, model: CFG.ctrlLabel,
+        scaled: true, omegaFence: true, omegaCampus: 'controller', omegaController: true });
+    }
+    var target = { x: (ctrl.x1 + ctrl.x2) / 2, y: (ctrl.y1 + ctrl.y2) / 2 };
+    var ctrlFence = { x1: ctrl.x1 - CFG.standoffFt * p, y1: ctrl.y1 - CFG.standoffFt * p,
+                      x2: ctrl.x2 + CFG.standoffFt * p, y2: ctrl.y2 + CFG.standoffFt * p };
+
+    /* Dashed security fence per compound, plus one round the control
+       yard. Dashed on the plan because a fence is a line of posts, not
+       a wall; solid rectangles read as buildings. */
+    var fence = function (r, label, sub, tag) {
+      return push({ id: nid('f'), kind: 'rect', style: 'dashed',
+        pts: [{ x: r.x1, y: r.y1 }, { x: r.x2, y: r.y2 }],
+        color: (typeof root.SHAPE_STROKE !== 'undefined' ? root.SHAPE_STROKE : '#E0E0E0'),
+        omegaFence: true, omegaCampus: tag, campusLabel: label, campusSub: sub || null });
+    };
+    comps.forEach(function (c) {
+      var acres = ((c.r.x2 - c.r.x1) / p) * ((c.r.y2 - c.r.y1) / p) / 43560;
+      fence(c.r, c.label, n1(acres) + ' ac fenced \u00b7 ' + CFG.standoffFt + ' ft stand-off', c.key);
+    });
+    fence(ctrlFence, null, null, 'control');
+
+    /* Ties. Corridors are the fire lanes between compounds, so the runs
+       land on a grid instead of wandering. */
+    var corr = { xs: [target.x], ys: [target.y] }, obs = comps.map(function (c) { return c.r; });
+    obs.concat([ctrlFence]).forEach(function (r) {
+      corr.xs.push(r.x1 - CFG.gutterFt * p / 2, r.x2 + CFG.gutterFt * p / 2);
+      corr.ys.push(r.y1 - CFG.gutterFt * p / 2, r.y2 + CFG.gutterFt * p / 2);
+    });
+    var runs = 0;
+    comps.forEach(function (c) {
+      var others = obs.filter(function (r) { return r !== c.r; });
+      var from = edgePoint(c.r, target);
+      var to = ctrlPort(ctrlFence, from);
+      conduit(route(from, to, others, corr).concat([target]),
+              'MV feeder \u2014 ' + c.label.toLowerCase());
+      runs++;
+    });
+    /* And the utility service in, if a substation is drawn. */
+    try {
+      var sb = (S_().shapes || []).filter(function (x) { return x && x.kind === 'substation'; }).pop();
+      if (sb && sb.pts && sb.pts.length > 1) {
+        var sr = { x1: Math.min(sb.pts[0].x, sb.pts[1].x), y1: Math.min(sb.pts[0].y, sb.pts[1].y),
+                   x2: Math.max(sb.pts[0].x, sb.pts[1].x), y2: Math.max(sb.pts[0].y, sb.pts[1].y) };
+        var f2 = edgePoint(sr, target), t2 = ctrlPort(ctrlFence, f2);
+        conduit(route(f2, t2, obs, corr).concat([target]),
+                'SERVICE FROM ' + String(sb.label || 'SUBSTATION').toUpperCase());
+        runs++;
+      }
+    } catch (e) {}
+
+    try { if (typeof root.updShapeCount === 'function') root.updShapeCount(); } catch (e) {}
+    try { if (typeof root.updCondStat === 'function') root.updCondStat(); } catch (e) {}
+    try { if (typeof root.renderLegend === 'function') root.renderLegend(); } catch (e) {}
+    try { if (typeof root.pushHist === 'function') root.pushHist(); } catch (e) {}
+
+    var msg = comps.length + ' compound' + (comps.length === 1 ? '' : 's') + ' fenced, '
+      + runs + ' duct bank' + (runs === 1 ? '' : 's') + ' to the master controller.';
+    if (typeof root.showBanner === 'function') root.showBanner('cal', msg);
+    if (root.console) console.info(TAG + ' ' + msg);
+    return { compounds: comps, runs: runs, ctrl: ctrl };
+  }
+
+  /* ── run it without being asked ─────────────────────────────────────── */
+
+  /* Design Site fences its own compounds. Everything else — Auto Layout,
+     the guided builds, hand placement — never had a fence, so this
+     follows those and draws one. Debounced, because a build places
+     hundreds of shapes and each one would otherwise trigger a pass. */
+  var pending = null;
+  function later() {
+    clearTimeout(pending);
+    pending = setTimeout(function () { try { run({ auto: true }); } catch (e) {} }, 700);
+  }
+  function hook() {
+    var done = 0;
+    var after = function (obj, key) {
+      if (!obj || typeof obj[key] !== 'function' || obj[key].__fence) return;
+      var orig = obj[key];
+      obj[key] = function () { var r = orig.apply(this, arguments); later(); return r; };
+      obj[key].__fence = true; done++;
+    };
+    after(root, 'applyGroundLayout');
+    after(root.OmegaSiteBuild, 'build');
+    return done;
+  }
+
+  /* ── ribbon ─────────────────────────────────────────────────────────── */
+
+  function inject() {
+    var host = document.getElementById('rb-design-site') || document.getElementById('rb-buildable');
+    if (!host || !host.parentNode) return false;
+    if (document.getElementById('rb-fence-tie')) return true;
+    var b = document.createElement('button');
+    b.className = 'rbtn'; b.id = 'rb-fence-tie';
+    b.title = 'Fence & Tie \u2014 draws a security fence around every block of equipment on '
+      + 'the drawing, places a master controller, and trenches a duct bank from each '
+      + 'compound back to it. Runs on whatever is already there.';
+    b.onclick = function () { run(); };
+    b.innerHTML = '<span class="rb-ico" style="color:#4ADE80">\u25a7</span>'
+      + '<span class="rb-lbl">Fence<br>&amp; Tie</span>';
+    host.parentNode.insertBefore(b, host.nextSibling);
+    try { if (root.OmegaMode && root.OmegaMode.keep) root.OmegaMode.keep(/rb-fence-tie/); } catch (e) {}
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      wheelFix(); hook();
+      if (inject() || ++n > 60) clearInterval(iv);
+    }, 400);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaFenceTie.run()');
+  }
+
+  root.OmegaFenceTie = { run: run, compounds: compounds, clear: clearOurs,
+                         wheelFix: wheelFix, config: CFG };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaFenceTie;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
 </body>
 </html>
