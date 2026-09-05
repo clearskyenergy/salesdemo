@@ -155436,5 +155436,445 @@ if (root.console && console.info) {
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 80 — BUILDABLE AREA
+ *  ---------------------------------------------------------------------
+ *  The app reports megawatts. It has never reported LAND, and land is
+ *  the thing the whole design is spending. A parcel is not its deed
+ *  acreage: subtract the wetland, the easement and the perimeter
+ *  setback and what is left is the only ground anything can be built
+ *  on. That number decides whether a site is worth a lease payment,
+ *  and until now the only way to get it here was to read megawatts and
+ *  work backwards.
+ *
+ *  So: gross, excluded, setback, net buildable, and then what the
+ *  design actually consumed — compound by compound — with the rest
+ *  reported as ground still open. Plus the grid connection length,
+ *  because a site with 60 buildable acres and four miles to the
+ *  substation is not the same site as one with 60 acres and half a
+ *  mile, and nothing in the app said so.
+ *
+ *  HOW IT IS MEASURED, AND WHY IT SAYS SO
+ *  Areas are counted on a raster rather than by polygon boolean
+ *  algebra. Exclusions overlap each other, they hang over the parcel
+ *  edge, and compounds sit inside the setback ring — every one of
+ *  those is a special case in a boolean implementation and a
+ *  non-event when you are counting cells. The cost is a quantisation
+ *  error, so the panel prints the cell size and the resulting
+ *  tolerance instead of implying a precision it does not have.
+ *
+ *  NOTHING IS FILLED IN. No boundary means no gross acreage, and the
+ *  panel says which input is missing rather than reporting a plausible
+ *  number derived from something else.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Buildable]';
+  var GRID = 420;                    /* cells across the long side */
+
+  function S_() { return root.S; }
+  function ppf() {
+    try { return +S_().pxPerFt > 0 ? +S_().pxPerFt : 0; } catch (e) { return 0; }
+  }
+  function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+  function n2(v) { return (Math.round(v * 100) / 100).toFixed(2); }
+  function n0(v) { return Math.round(v).toLocaleString(); }
+
+  function pip(x, y, p) {
+    var n = p.length, ins = false, j = n - 1;
+    for (var i = 0; i < n; j = i++) {
+      var xi = p[i].x, yi = p[i].y, xj = p[j].x, yj = p[j].y;
+      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) ins = !ins;
+    }
+    return ins;
+  }
+
+  function boundary() {
+    try {
+      if (root.OmegaComputePlace && root.OmegaComputePlace.boundary()) return root.OmegaComputePlace.boundary();
+    } catch (e) {}
+    try {
+      if (typeof root._alFindBoundary === 'function') {
+        var b = root._alFindBoundary();
+        if (b && b.length >= 3) return b;
+      }
+    } catch (e) {}
+    return null;
+  }
+  function exclusions() {
+    try { return (root._alExclusions || []).filter(function (z) { return z && z.length >= 3; }); }
+    catch (e) { return []; }
+  }
+  function setbackFt() {
+    try { return (root.OmegaEngine && root.OmegaEngine.DEFAULTS.setbackFt) || 25; } catch (e) { return 25; }
+  }
+
+  /* Compounds the design drew, each with its own fence rectangle. */
+  function compounds() {
+    var out = [];
+    try {
+      (S_().shapes || []).forEach(function (sh) {
+        if (!sh || !sh.omegaCampus || !sh.pts || sh.pts.length < 2) return;
+        if (sh.omegaCampus === 'perimeter' || sh.omegaCampus === 'feeder'
+         || sh.omegaCampus === 'trunk' || sh.omegaCampus === 'service') return;
+        out.push({
+          label: sh.campusLabel || (sh.omegaCampus.toUpperCase()),
+          sub: sh.campusSub || '',
+          r: { x1: Math.min(sh.pts[0].x, sh.pts[1].x), y1: Math.min(sh.pts[0].y, sh.pts[1].y),
+               x2: Math.max(sh.pts[0].x, sh.pts[1].x), y2: Math.max(sh.pts[0].y, sh.pts[1].y) }
+        });
+      });
+    } catch (e) {}
+    return out;
+  }
+
+  /* Ground arrays, with their real table geometry where the layout
+     recorded it. Table area over PV area is the ground coverage ratio
+     the drawing actually achieved — not the one that was asked for. */
+  function arrays() {
+    var out = [];
+    try {
+      (S_().shapes || []).forEach(function (sh) {
+        if (!sh || sh.kind !== 'dersolar') return;
+        var poly = null;
+        if (sh.boundary && sh.boundary.length >= 3) poly = sh.boundary;
+        out.push({ sh: sh, poly: poly,
+          tables: +sh.tableCount || 0,
+          tableSqft: (+sh.tableCount || 0) * (+sh.tableWft || 0) * (+sh.tableHft || 0),
+          kw: +sh.kw || 0 });
+      });
+    } catch (e) {}
+    return out;
+  }
+
+  /* ── the count ──────────────────────────────────────────────────────── */
+
+  function measure() {
+    var P = ppf(), poly = boundary();
+    var out = { ok: false, missing: [], P: P };
+    if (!poly) out.missing.push('a traced parcel boundary');
+    if (!(P > 0)) out.missing.push('a drawing scale');
+    if (out.missing.length) return out;
+
+    var x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+    poly.forEach(function (q) {
+      if (q.x < x1) x1 = q.x; if (q.x > x2) x2 = q.x;
+      if (q.y < y1) y1 = q.y; if (q.y > y2) y2 = q.y;
+    });
+    var w = x2 - x1, h = y2 - y1;
+    var cs = Math.max(w, h) / GRID;
+    var nx = Math.max(1, Math.ceil(w / cs)), ny = Math.max(1, Math.ceil(h / cs));
+    var cellSqft = (cs / P) * (cs / P);
+    var ex = exclusions(), comps = compounds(), arrs = arrays();
+    var sbCells = (setbackFt() * P) / cs;
+
+    /* Pass one: inside the parcel, and inside an exclusion. */
+    var inside = new Uint8Array(nx * ny), excl = new Uint8Array(nx * ny);
+    var i, j, k;
+    for (j = 0; j < ny; j++) {
+      var cy = y1 + (j + 0.5) * cs;
+      for (i = 0; i < nx; i++) {
+        var cx = x1 + (i + 0.5) * cs;
+        if (!pip(cx, cy, poly)) continue;
+        inside[j * nx + i] = 1;
+        for (k = 0; k < ex.length; k++) {
+          if (pip(cx, cy, ex[k])) { excl[j * nx + i] = 1; break; }
+        }
+      }
+    }
+
+    /* Pass two: distance from the parcel edge, by two-pass chamfer, so
+       the setback ring is measured rather than assumed to be a uniform
+       strip off a rectangle. */
+    var dist = new Float32Array(nx * ny), BIG = 1e6;
+    for (k = 0; k < dist.length; k++) dist[k] = inside[k] ? BIG : 0;
+    for (j = 0; j < ny; j++) for (i = 0; i < nx; i++) {
+      k = j * nx + i; if (!inside[k]) continue;
+      /* Anything off the edge of the raster is OUTSIDE. The raster is
+         the parcel's own bounding box, so a rectangular parcel has no
+         outside cell anywhere in it — without this the whole distance
+         field stays at infinity and the setback ring measures zero. */
+      var d = dist[k];
+      d = Math.min(d, (i > 0 ? dist[k - 1] : 0) + 1);
+      d = Math.min(d, (j > 0 ? dist[k - nx] : 0) + 1);
+      d = Math.min(d, (i > 0 && j > 0 ? dist[k - nx - 1] : 0) + 1.41421);
+      d = Math.min(d, (i < nx - 1 && j > 0 ? dist[k - nx + 1] : 0) + 1.41421);
+      dist[k] = d;
+    }
+    for (j = ny - 1; j >= 0; j--) for (i = nx - 1; i >= 0; i--) {
+      k = j * nx + i; if (!inside[k]) continue;
+      var d2 = dist[k];
+      d2 = Math.min(d2, (i < nx - 1 ? dist[k + 1] : 0) + 1);
+      d2 = Math.min(d2, (j < ny - 1 ? dist[k + nx] : 0) + 1);
+      d2 = Math.min(d2, (i < nx - 1 && j < ny - 1 ? dist[k + nx + 1] : 0) + 1.41421);
+      d2 = Math.min(d2, (i > 0 && j < ny - 1 ? dist[k + nx - 1] : 0) + 1.41421);
+      dist[k] = d2;
+    }
+
+    /* Pass three: classify. Order matters — an exclusion inside the
+       setback ring is counted once, as exclusion, because taking it
+       out twice is how a buildable figure ends up smaller than the
+       ground it describes. */
+    var cGross = 0, cExcl = 0, cSetback = 0, cBuild = 0, cComp = 0, cPv = 0;
+    comps.forEach(function (c) { c.cells = 0; });
+    arrs.forEach(function (a) { a.cells = 0; });
+    for (j = 0; j < ny; j++) {
+      var yy = y1 + (j + 0.5) * cs;
+      for (i = 0; i < nx; i++) {
+        k = j * nx + i;
+        if (!inside[k]) continue;
+        cGross++;
+        if (excl[k]) { cExcl++; continue; }
+        /* Half a cell: the parcel edge sits between the last outside
+           centre and the first inside one, so measuring from centres
+           alone loses half a cell of ring all the way round. */
+        if (dist[k] - 0.5 < sbCells) { cSetback++; continue; }
+        cBuild++;
+        var xx = x1 + (i + 0.5) * cs, hit = false;
+        for (var c2 = 0; c2 < comps.length; c2++) {
+          var r = comps[c2].r;
+          if (xx >= r.x1 && xx <= r.x2 && yy >= r.y1 && yy <= r.y2) {
+            comps[c2].cells++; cComp++; hit = true; break;
+          }
+        }
+        if (hit) continue;
+        for (var a2 = 0; a2 < arrs.length; a2++) {
+          var A = arrs[a2];
+          if (A.poly ? pip(xx, yy, A.poly) : false) { A.cells++; cPv++; break; }
+        }
+      }
+    }
+
+    var ac = function (cells) { return cells * cellSqft / 43560; };
+    out.ok = true;
+    out.cellFt = cs / P;
+    out.grossAc = ac(cGross);
+    out.exclAc = ac(cExcl);
+    out.exclZones = ex.length;
+    out.setbackAc = ac(cSetback);
+    out.setbackFt = setbackFt();
+    out.buildableAc = ac(cBuild);
+    out.compoundAc = ac(cComp);
+    out.pvAc = ac(cPv);
+    out.openAc = ac(cBuild - cComp - cPv);
+    out.compounds = comps.map(function (c) {
+      return { label: c.label, sub: c.sub, ac: ac(c.cells) };
+    }).sort(function (a, b) { return b.ac - a.ac; });
+
+    var tblSqft = 0, tables = 0, pvKw = 0;
+    arrs.forEach(function (A) { tblSqft += A.tableSqft; tables += A.tables; pvKw += A.kw; });
+    out.tableAc = tblSqft / 43560;
+    out.tables = tables;
+    out.pvKw = pvKw;
+    out.gcr = out.pvAc > 0 ? out.tableAc / out.pvAc : 0;
+
+    /* Load carried on the ground, from the last design if there is one. */
+    try {
+      var pl = root._omegaPlan;
+      if (pl && pl.sizing) { out.itMw = pl.sizing.itMw; out.facMw = pl.sizing.facKw / 1000; }
+    } catch (e) {}
+
+    /* Grid connection: the routes that exist, plus the straight-line
+       run to the substation, which are different numbers and should
+       not be presented as one. */
+    var routeFt = 0, runs = 0;
+    try {
+      (S_().conduits || []).forEach(function (c) {
+        if (!c || !c.omegaCampus) return;
+        runs++; routeFt += (+c.ftLen || 0);
+      });
+    } catch (e) {}
+    out.routeFt = routeFt; out.runs = runs;
+    try {
+      var sub = (S_().shapes || []).filter(function (x) { return x && x.kind === 'substation'; }).pop();
+      var ctl = (S_().shapes || []).filter(function (x) { return x && x.omegaController; }).pop();
+      if (sub && sub.pts && sub.pts.length > 1) {
+        var sx = (sub.pts[0].x + sub.pts[1].x) / 2, sy = (sub.pts[0].y + sub.pts[1].y) / 2;
+        var ax, ay;
+        if (ctl && ctl.pts) { ax = ctl.pts[0].x; ay = ctl.pts[0].y; }
+        else { ax = (x1 + x2) / 2; ay = (y1 + y2) / 2; }
+        out.subFt = Math.hypot(sx - ax, sy - ay) / P;
+        out.subLabel = sub.label || 'substation';
+        out.subMw = isFinite(+sub.capMw) ? +sub.capMw : null;
+        out.subKv = sub.voltage || '';
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  /* ── panel ──────────────────────────────────────────────────────────── */
+
+  function rows(m) {
+    var R = [];
+    var pct = function (v, of) { return of > 0 ? ' \u00b7 ' + Math.round(v / of * 100) + '% of gross' : ''; };
+    R.push(['LAND', null, null]);
+    R.push(['Gross parcel', n1(m.grossAc) + ' ac', 'inside the traced boundary']);
+    R.push(['Exclusions', '\u2212 ' + n1(m.exclAc) + ' ac',
+            m.exclZones ? m.exclZones + (m.exclZones === 1 ? ' zone' : ' zones') + ', overlaps counted once'
+                        : 'none tagged \u2014 add them before trusting the net']);
+    R.push(['Perimeter setback', '\u2212 ' + n1(m.setbackAc) + ' ac',
+            m.setbackFt + ' ft off every boundary, measured not assumed']);
+    R.push(['Net buildable', n1(m.buildableAc) + ' ac', 'what anything can stand on' + pct(m.buildableAc, m.grossAc)]);
+
+    R.push(['LAYOUT', null, null]);
+    if (m.compounds.length) {
+      m.compounds.forEach(function (c) {
+        R.push([c.label, n1(c.ac) + ' ac', c.sub || 'fenced compound']);
+      });
+    } else {
+      R.push(['Fenced compounds', '\u2014', 'nothing drawn yet \u2014 run Design Site']);
+    }
+    if (m.pvAc > 0) {
+      R.push(['PV area', n1(m.pvAc) + ' ac',
+              (m.pvKw ? n0(m.pvKw) + ' kW-DC \u00b7 ' : '') + n0(m.tables) + ' tables']);
+      R.push(['Table area', n1(m.tableAc) + ' ac',
+              'GCR ' + n2(m.gcr) + ' \u2014 module footprint over PV ground']);
+    }
+    R.push(['Open ground', n1(m.openAc) + ' ac',
+            'buildable and unspent' + (m.buildableAc > 0
+              ? ' \u00b7 ' + Math.round(m.openAc / m.buildableAc * 100) + '% of buildable' : '')]);
+    if (m.itMw) {
+      R.push(['Load density', n2(m.itMw / Math.max(0.01, m.buildableAc)) + ' MW/ac',
+              m.itMw + ' MW IT over the buildable area']);
+    }
+
+    R.push(['GRID', null, null]);
+    if (m.runs) R.push(['MV route on site', n0(m.routeFt) + ' ft',
+                        m.runs + ' run' + (m.runs === 1 ? '' : 's') + ' \u00b7 trenched, from the drawn geometry']);
+    if (m.subFt != null) {
+      R.push(['To the substation', n0(m.subFt) + ' ft (' + n2(m.subFt / 5280) + ' mi)',
+              'straight line from the control yard \u2014 not a route']);
+      R.push([m.subLabel, (m.subMw != null ? m.subMw.toLocaleString() + ' MW firm' : 'capacity not set')
+              + (m.subKv ? ' \u00b7 ' + m.subKv : ''), 'as entered on the drawn substation']);
+    } else {
+      R.push(['To the substation', '\u2014', 'no substation drawn']);
+    }
+    return R;
+  }
+
+  function open() {
+    var m = measure();
+    var old = document.getElementById('omega-buildable');
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+
+    var w = document.createElement('div');
+    w.id = 'omega-buildable';
+    w.style.cssText = 'position:fixed;inset:0;z-index:9200;background:rgba(0,0,0,.6);'
+      + 'display:flex;align-items:center;justify-content:center;padding:20px';
+
+    var body = '';
+    if (!m.ok) {
+      body = '<div style="font-size:12.5px;color:#F59E0B;line-height:1.6">'
+        + 'Cannot measure the site yet. Missing: ' + m.missing.join(' and ') + '.'
+        + '<div style="color:#9A9A9A;margin-top:8px;font-size:11.5px">'
+        + 'Nothing is estimated from what is here instead \u2014 an acreage derived from '
+        + 'the wrong input is worse than no acreage.</div></div>';
+    } else {
+      rows(m).forEach(function (r) {
+        if (r[1] == null) {
+          body += '<div style="font-size:10px;letter-spacing:1.2px;text-transform:uppercase;'
+            + 'color:#8B7BD8;margin:16px 0 6px">' + r[0] + '</div>';
+          return;
+        }
+        body += '<div style="display:flex;justify-content:space-between;align-items:baseline;'
+          + 'gap:14px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05)">'
+          + '<div style="flex:1"><div style="font-size:12.5px;color:#E0E0E0">' + r[0] + '</div>'
+          + '<div style="font-size:10px;color:#9A9A9A;margin-top:1px">' + r[2] + '</div></div>'
+          + '<div style="font-size:13px;font-weight:700;color:#4ADE80;white-space:nowrap">'
+          + r[1] + '</div></div>';
+      });
+      body += '<div style="font-size:10px;color:#9A9A9A;margin-top:14px;line-height:1.6">'
+        + 'Areas counted on a ' + n1(m.cellFt) + ' ft raster, so each figure carries about '
+        + 'that much edge tolerance. Setbacks and exclusions come out once, never twice. '
+        + 'This is a planning measurement of the drawing, not a survey.</div>';
+    }
+
+    w.innerHTML = '<div style="background:#1E1E1E;border:1px solid #3A3A3A;border-radius:12px;'
+      + 'padding:22px;max-width:560px;width:100%;max-height:88vh;overflow:auto;font-family:inherit">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center">'
+      + '<div style="font-size:17px;font-weight:700;color:#E0E0E0">Buildable area</div>'
+      + '<button data-a="x" style="background:none;border:none;color:#9A9A9A;font-size:20px;'
+      + 'cursor:pointer;line-height:1">\u00d7</button></div>'
+      + '<div style="font-size:11px;color:#9A9A9A;margin:4px 0 6px;line-height:1.5">'
+      + 'What the parcel gives you, what comes out of it, and what the design has spent.</div>'
+      + body
+      + '<div style="display:flex;gap:8px;margin-top:18px">'
+      + '<button data-a="copy" style="flex:1;padding:10px;background:rgba(255,255,255,.05);'
+      + 'border:1px solid #3A3A3A;color:#E0E0E0;border-radius:8px;cursor:pointer;'
+      + 'font-family:inherit;font-size:12px">Copy as text</button>'
+      + '<button data-a="x" style="padding:10px 18px;background:#2FB54A;color:#0A1628;border:none;'
+      + 'border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;font-size:12px">'
+      + 'Close</button></div></div>';
+
+    w.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-a]') : null;
+      if (!b) { if (e.target === w) w.remove(); return; }
+      if (b.getAttribute('data-a') === 'copy') {
+        try { navigator.clipboard.writeText(asText(m)); b.textContent = 'Copied'; } catch (er) {}
+        return;
+      }
+      w.remove();
+    });
+    document.body.appendChild(w);
+    return m;
+  }
+
+  function asText(m) {
+    if (!m.ok) return 'Buildable area: cannot measure \u2014 missing ' + m.missing.join(' and ') + '.';
+    var out = ['BUILDABLE AREA'];
+    rows(m).forEach(function (r) {
+      if (r[1] == null) { out.push(''); out.push(r[0]); return; }
+      out.push('  ' + r[0] + ': ' + r[1] + '  (' + r[2] + ')');
+    });
+    out.push('');
+    out.push('Areas counted on a ' + n1(m.cellFt) + ' ft raster. Planning measurement, not a survey.');
+    return out.join('\n');
+  }
+
+  function report() {
+    var m = measure();
+    if (!m.ok) {
+      if (root.console) console.warn(TAG + ' missing ' + m.missing.join(' and '));
+      return m;
+    }
+    if (root.console && console.table) {
+      console.table(rows(m).filter(function (r) { return r[1] != null; })
+        .map(function (r) { return { item: r[0], value: r[1], basis: r[2] }; }));
+    }
+    return m;
+  }
+
+  /* ── ribbon ─────────────────────────────────────────────────────────── */
+
+  function inject() {
+    var host = document.getElementById('rb-trace-exclusion');
+    if (!host || !host.parentNode) return false;
+    if (document.getElementById('rb-buildable')) return true;
+    var b = document.createElement('button');
+    b.className = 'rbtn'; b.id = 'rb-buildable';
+    b.title = 'Buildable Area \u2014 gross parcel less exclusions and setback, what the design '
+      + 'has spent of it, and the grid connection length. Measured from the drawing.';
+    b.onclick = open;
+    b.innerHTML = '<span class="rb-ico" style="color:#4ADE80">\u25f0</span>'
+      + '<span class="rb-lbl">Buildable<br>Area</span>';
+    host.parentNode.insertBefore(b, host.nextSibling);
+    try { if (root.OmegaMode && root.OmegaMode.keep) root.OmegaMode.keep(/rb-buildable/); } catch (e) {}
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () { if (inject() || ++n > 40) clearInterval(iv); }, 500);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaBuildable.report()');
+  }
+
+  root.OmegaBuildable = { open: open, report: report, measure: measure, text: function () { return asText(measure()); } };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaBuildable;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
 </body>
 </html>
