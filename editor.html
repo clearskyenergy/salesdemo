@@ -6440,6 +6440,25 @@ const S={
   terrain:null            /* {samples,stats,grade,cut,fill,spacingFt,...} */
 };
 
+/* ── S IS NOT ON WINDOW, AND EVERY LATER MODULE ASSUMED IT WAS ─────────
+   Patch 107. The site state is declared `const S` at the top level of a
+   classic script. That makes it a LEXICAL binding, not a property of
+   window — the file says so itself where importSite() reads it. Any code
+   in a separate <script> block therefore sees window.S as undefined and
+   silently finds no shapes.
+
+   That is one root cause behind a long run of "it is not showing":
+   the legend census, the buildable-area measurement, the fence pass, the
+   compute cost count and the report overview all read window.S, all got
+   undefined, and all failed the way a project with an empty canvas
+   fails — quietly and with nothing to say.
+
+   One line fixes the class. It is the SAME object, not a copy, so there
+   is no second source of truth to drift: window.S and S are two names
+   for one state. */
+try { window.S = S; } catch (e) {}
+
+
 const BG={scale:1,tx:0,ty:0,rot:0,panning:false,lx:0,ly:0};
 
 function uid(){return Math.random().toString(36).substr(2,9)}
