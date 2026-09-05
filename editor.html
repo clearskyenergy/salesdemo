@@ -155876,5 +155876,221 @@ if (root.console && console.info) {
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 81 — WHY THE SAVE FAILS
+ *  ---------------------------------------------------------------------
+ *  The console says it exactly: Firestore rejects the whole document
+ *  because it contains nested arrays. It will not store an array whose
+ *  elements are themselves arrays, anywhere, at any depth.
+ *
+ *  A solar array carries its exclusion zones as rings of points — a
+ *  list of lists — in three places:
+ *
+ *      sh.exclusions   the pixel rings
+ *      sh._ftExcl      the same rings in feet, the scale-independent
+ *                      truth the layout is rebuilt from
+ *      sh._geoExcl     the same rings in lat/lng, the ground anchor
+ *
+ *  Patch 3 already normalises sh.exclusions to [{pts:[...]}] before
+ *  every save, and that part works. It is the other two nobody
+ *  normalises — and worse, _derFtSync REBUILDS sh.exclusions as raw
+ *  nested arrays from _ftExcl on every render. So the sequence is:
+ *  normalise, render, nested again, save, rejected. Two solar arrays
+ *  with one exclusion each is four nested arrays, which is the number
+ *  in the log.
+ *
+ *  WHERE TO FIX IT
+ *  Not in the live model. Half a dozen consumers — the rotator, the
+ *  mover, the reprojector, the auto-layout, the takeoff — read those
+ *  rings as raw arrays, and changing their shape to satisfy a database
+ *  would break drawing code to fix a storage problem.
+ *
+ *  So the fix sits at the write boundary. Every array-of-arrays is
+ *  encoded on the way to Firestore as {__a:[...]} and decoded on the
+ *  way back, and the in-memory model never changes. Sentinels
+ *  (serverTimestamp) and Timestamps pass through untouched, because a
+ *  deep copy that flattens them into plain objects is its own bug.
+ *
+ *  This is a storage codec, not a repair. Nothing is dropped and
+ *  nothing is reshaped: what is loaded is what was saved.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[SaveCodec]';
+  var KEY = '__a';
+
+  /* Only PLAIN objects and arrays are rebuilt. Anything with its own
+     prototype — a FieldValue sentinel, a Timestamp, a GeoPoint, a
+     DocumentReference — is passed through by reference, because
+     copying one destroys it. */
+  function plain(v) {
+    return v !== null && typeof v === 'object'
+      && Object.getPrototypeOf(v) === Object.prototype;
+  }
+
+  function encode(v) {
+    if (Array.isArray(v)) {
+      return v.map(function (x) {
+        return Array.isArray(x) ? { __a: encode(x) } : encode(x);
+      });
+    }
+    if (plain(v)) {
+      var o = {};
+      for (var k in v) if (Object.prototype.hasOwnProperty.call(v, k)) o[k] = encode(v[k]);
+      return o;
+    }
+    return v;
+  }
+
+  function decode(v) {
+    if (Array.isArray(v)) return v.map(decode);
+    if (plain(v)) {
+      var ks = Object.keys(v);
+      if (ks.length === 1 && ks[0] === KEY && Array.isArray(v[KEY])) return decode(v[KEY]);
+      var o = {};
+      for (var k in v) if (Object.prototype.hasOwnProperty.call(v, k)) o[k] = decode(v[k]);
+      return o;
+    }
+    return v;
+  }
+
+  /* Count what would have been rejected, so the fix can be seen to be
+     doing something rather than taken on trust. */
+  function countNested(v, n) {
+    n = n || { n: 0 };
+    if (Array.isArray(v)) {
+      v.forEach(function (x) { if (Array.isArray(x)) n.n++; countNested(x, n); });
+    } else if (plain(v)) {
+      for (var k in v) if (Object.prototype.hasOwnProperty.call(v, k)) countNested(v[k], n);
+    }
+    return n.n;
+  }
+
+  /* ── the boundary ───────────────────────────────────────────────────── */
+
+  function wrapDoc(ref) {
+    return new Proxy(ref, {
+      get: function (t, p) {
+        if (p === 'update' || p === 'set') {
+          return function (data, opts) {
+            var hits = countNested(data);
+            if (hits && root.console) {
+              console.info(TAG + ' encoded ' + hits + ' nested array(s) for Firestore');
+            }
+            return opts === undefined ? t[p](encode(data)) : t[p](encode(data), opts);
+          };
+        }
+        if (p === 'get') {
+          return function () {
+            var args = arguments;
+            return t.get.apply(t, args).then(function (snap) { return wrapSnap(snap); });
+          };
+        }
+        var v = t[p];
+        return (typeof v === 'function') ? v.bind(t) : v;
+      }
+    });
+  }
+
+  function wrapSnap(snap) {
+    return new Proxy(snap, {
+      get: function (t, p) {
+        if (p === 'data') {
+          return function () {
+            var d = t.data.apply(t, arguments);
+            return d ? decode(d) : d;
+          };
+        }
+        var v = t[p];
+        return (typeof v === 'function') ? v.bind(t) : v;
+      }
+    });
+  }
+
+  function wrapCol(col) {
+    return new Proxy(col, {
+      get: function (t, p) {
+        if (p === 'add') {
+          return function (data) {
+            var hits = countNested(data);
+            if (hits && root.console) {
+              console.info(TAG + ' encoded ' + hits + ' nested array(s) for Firestore');
+            }
+            return t.add(encode(data));
+          };
+        }
+        if (p === 'doc') return function (id) { return wrapDoc(id === undefined ? t.doc() : t.doc(id)); };
+        var v = t[p];
+        return (typeof v === 'function') ? v.bind(t) : v;
+      }
+    });
+  }
+
+  function install() {
+    var db = root._db;
+    if (!db || typeof db.collection !== 'function') return false;
+    if (db.collection.__codec) return true;
+    var orig = db.collection.bind(db);
+    var wrapped = function (name) {
+      var col = orig(name);
+      return name === 'projects' ? wrapCol(col) : col;
+    };
+    wrapped.__codec = true;
+    try { db.collection = wrapped; } catch (e) { return false; }
+
+    /* The save doctor reads the LIVE model, which still holds nested
+       arrays by design, so its FATAL verdict would now be wrong. Say so
+       rather than leaving two sources disagreeing in the same console. */
+    try {
+      if (root.OmegaSave && typeof root.OmegaSave.check === 'function' && !root.OmegaSave.check.__codec) {
+        var oc = root.OmegaSave.check;
+        var nc = function () {
+          var r = oc.apply(this, arguments);
+          if (r && r.nestedArrays > 0 && root.console) {
+            console.info(TAG + ' those nested arrays are encoded at the write boundary and '
+              + 'decoded on load \u2014 they are not what is failing this save.');
+          }
+          return r;
+        };
+        nc.__codec = true;
+        root.OmegaSave.check = nc;
+      }
+    } catch (e) {}
+
+    if (root.console) {
+      console.info(TAG + ' installed \u2014 nested arrays are encoded on write, decoded on read');
+    }
+    return true;
+  }
+
+  /* A round trip on the real project, without writing anything. */
+  function selfTest() {
+    var s = root.S || {};
+    var payload = { elements: s.elements || [], conduits: s.conduits || [], shapes: s.shapes || [] };
+    var before = countNested(payload);
+    var enc = encode(payload);
+    var after = countNested(enc);
+    var back = decode(enc);
+    var same = JSON.stringify(back) === JSON.stringify(payload);
+    var out = { nestedBefore: before, nestedAfterEncode: after, roundTripIdentical: same,
+                installed: !!(root._db && root._db.collection && root._db.collection.__codec) };
+    if (root.console) console.table ? console.table(out) : console.log(out);
+    return out;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () { if (install() || ++n > 60) clearInterval(iv); }, 500);
+  }
+
+  root.OmegaSaveCodec = { install: install, encode: encode, decode: decode,
+                          countNested: countNested, selfTest: selfTest };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaSaveCodec;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
 </body>
 </html>
