@@ -145294,6 +145294,16 @@ if (root.console && console.info) {
     /* equipment */
     pod:  { kw: 1000, lf: 40, wf: 10, label: 'MDC pod', clearFt: 15 },
     bess: { kwhPerUnit: 4000, lf: 40, wf: 8, clearFt: 10, label: 'BESS container' },
+    /* interconnection yard: the point where everything ties together.
+       Planning footprints, pad plus working clearance. */
+    yard: {
+      xfmr:   { mvaEach: 30, lf: 25, wf: 20, clearFt: 15, label: 'Main transformer', kind: 'xfmr' },
+      swgr:   { mwPerLineup: 20, lf: 40, wf: 12, clearFt: 10, label: 'MV switchgear', kind: 'mainswgr' },
+      pcs:    { kwEach: 4000, lf: 20, wf: 8, clearFt: 8, label: 'BESS PCS skid', kind: 'inverter' },
+      pvinv:  { kwAcEach: 2500, lf: 20, wf: 8, clearFt: 8, label: 'PV central inverter', kind: 'inverter' },
+      ems:    { lf: 30, wf: 12, clearFt: 10, label: 'EMS / control house', kind: 'panel' },
+      meter:  { lf: 8, wf: 6, clearFt: 8, label: 'Utility metering', kind: 'meter' }
+    },
     genClasses: [
       { id: 'sofc',      label: 'SOFC fuel cell',         kw: 300,   lf: 9,   wf: 6,  clearFt: 20, heatRate: 7000 },
       { id: 'gen_ng',    label: 'Natural-gas genset',     kw: 750,   lf: 14,  wf: 5,  clearFt: 20, heatRate: 9500 },
@@ -145443,9 +145453,20 @@ if (root.console && console.info) {
       bess = { kw: critKw, kwh: rideKwh, basis: cfg.rideMin + ' min ride-through on critical bus' };
       bess.units = Math.max(1, Math.ceil(rideKwh / cfg.bess.kwhPerUnit));
     }
+    /* Interconnection yard equipment, counted from the electrical
+       system rather than from the land. */
+    var Y = cfg.yard;
+    var yard = [];
+    var mva = Math.max(util, served) / 1000 / 0.95;
+    yard.push(Object.assign({ n: Math.max(1, Math.ceil(mva / Y.xfmr.mvaEach)) }, Y.xfmr));
+    yard.push(Object.assign({ n: Math.max(1, Math.ceil(facKw / 1000 / Y.swgr.mwPerLineup)) }, Y.swgr));
+    if (bess) yard.push(Object.assign({ n: Math.max(1, Math.ceil(bess.kw / Y.pcs.kwEach)) }, Y.pcs));
+    yard.push(Object.assign({ n: 1 }, Y.ems));
+    yard.push(Object.assign({ n: 1 }, Y.meter));
+
     return {
       itMw: itMw, itKw: itKw, facKw: facKw, critKw: critKw, utilKw: util,
-      gapKw: gap, servedKw: served, gen: gen, bess: bess,
+      gapKw: gap, servedKw: served, gen: gen, bess: bess, yard: yard,
       gridLimited: input.generation === false && facKw > util,
       pods: Math.ceil(itKw / cfg.pod.kw)
     };
@@ -145512,14 +145533,29 @@ if (root.console && console.info) {
       slots.bess = bk.slots;
       if (bk.slots.length) { z.storage = { x1: bk.x1, y1: band.y1, x2: bk.x2, y2: band.y2 }; x = bk.x2 + gut; }
     }
+    /* Interconnection yard: one band, every piece of tie-in equipment
+       packed into it in sequence. Sits between storage and solar so it
+       is adjacent to the generation and storage it collects from, and
+       the solar inverters land next to the array they serve. */
+    slots.yard = [];
+    var yx = x, yardX1 = x, yardX2 = x;
+    s.yard.forEach(function (eq) {
+      var yk = packBand(eq.n, eq.lf, eq.wf, eq.clearFt, yx, band, poly, excl, P, cfg);
+      yk.slots.forEach(function (sl) { sl.kind = eq.kind; sl.label = eq.label; });
+      slots.yard = slots.yard.concat(yk.slots);
+      if (yk.slots.length) { yx = yk.x2; yardX2 = yk.x2; }
+    });
+    if (slots.yard.length) { z.yard = { x1: yardX1, y1: band.y1, x2: yardX2, y2: band.y2 }; x = yardX2 + gut; }
+
     if (band.x2 - x > 40 * P) z.solar = { x1: x, y1: band.y1, x2: band.x2, y2: band.y2 };
 
-    var shapes = slots.pods.length + slots.gen.length + slots.bess.length;
+    var shapes = slots.pods.length + slots.gen.length + slots.bess.length + slots.yard.length;
     var parcelAc = area(poly) / (P * P) / 43560;
     var why = null;
     if (slots.pods.length < s.pods) why = 'land (compute)';
     else if (s.gen && slots.gen.length < s.gen.units) why = 'land (generation)';
     else if (s.bess && slots.bess.length < s.bess.units) why = 'land (storage)';
+    else if (slots.yard.length < s.yard.reduce(function (a, e) { return a + e.n; }, 0)) why = 'land (interconnection)';
     else if (s.gridLimited) why = 'utility ceiling (generation off)';
     else if (shapes > cfg.shapeBudget) why = 'drawing budget';
     else if (itMw / parcelAc > cfg.densityCapMwPerAcre) why = 'density cap';
@@ -145562,8 +145598,10 @@ if (root.console && console.info) {
       shiftKwh = surplus * 4;   /* four hours of surplus into evening */
     }
 
+    var pvInv = worth ? Math.max(1, Math.ceil((kwDc / cfg.solarDcAc) / cfg.yard.pvinv.kwAcEach)) : 0;
+
     return {
-      built: worth, polygon: clipped, acres: ac,
+      built: worth, polygon: clipped, acres: ac, pvInverters: pvInv,
       kwDc: worth ? kwDc : 0, kwAc: worth ? kwDc / cfg.solarDcAc : 0,
       mwhYr: worth ? mwhYr : 0, offsetPct: worth ? offset * 100 : 0,
       displacesPerMwh: displaced, displaces: displacedSrc,
@@ -150510,7 +150548,7 @@ if (root.console && console.info) {
 
     var layout = null;
     try {
-      layout = computeGroundLayout(clipped, excl);
+      layout = computeGroundLayout({ boundary: clipped, exclusions: excl });
     } catch (e) {
       if (root.console) console.warn(TAG, e && e.message);
     }
@@ -150747,15 +150785,40 @@ if (root.console && console.info) {
         kw: Math.round(s.bess.kw / s.bess.units), kwh: Math.round(s.bess.kwh / s.bess.units),
         scaled: scaled(), omegaCompute: true });
     });
+    /* Interconnection yard: transformers, switchgear, PCS, EMS, meter,
+       and PV inverters if there is an array. Drawn with the app's own
+       kinds so the one-line and the 3D view pick them up. */
+    var yardSlots = plan.slots.yard || [];
+    yardSlots.forEach(function (sl, i) {
+      push({ id: id('y', i), kind: sl.kind || 'panel', pts: [{ x: sl.x, y: sl.y }],
+        style: (S.shapeStyle || ''), lf: sl.w / scale(), wf: sl.h / scale(),
+        model: sl.label, label: sl.label, scaled: scaled(), omegaCompute: true, omegaYard: true });
+    });
+
     /* Solar through the app's own ground-layout engine, so row geometry
-       and kW are its numbers, not a second model's. */
+       and kW are its numbers, not a second model's.
+
+       computeGroundLayout takes an OPTIONS OBJECT — {boundary,
+       exclusions} — not positional arguments. Calling it with the
+       polygon first made opts.boundary undefined, it returned null, and
+       no zone-restricted array ever drew; the whole-parcel hatch the
+       user saw was the older fillSolar() path, which reads the full
+       boundary. That is exactly the overlap they reported. */
     if (plan.solar.built && plan.solar.polygon) {
       try {
-        var lay = computeGroundLayout(plan.solar.polygon, exclusions());
+        var lay = computeGroundLayout({ boundary: plan.solar.polygon, exclusions: exclusions() });
         if (lay) {
           var sh = applyGroundLayout(plan.solar.polygon, lay, exclusions());
           if (sh) { sh.omegaCompute = true; sh.omegaSolarZone = true; }
           plan.solar.drawnKw = lay.kw;
+          /* PV inverters beside the array. */
+          var inv = plan.cfg.yard.pvinv, n = plan.solar.pvInverters || 0;
+          var zx = plan.zones.solar.x1, zy = plan.zones.solar.y1;
+          for (var k = 0; k < n; k++) {
+            push({ id: id('pv', k), kind: inv.kind, pts: [{ x: zx, y: zy + k * (inv.wf + inv.clearFt) * scale() }],
+              style: (S.shapeStyle || ''), lf: inv.lf, wf: inv.wf, model: inv.label, label: inv.label,
+              scaled: scaled(), omegaCompute: true, omegaYard: true });
+          }
         }
       } catch (e) { if (root.console) console.warn(TAG + ' solar', e && e.message); }
     }
@@ -151556,6 +151619,7 @@ if (root.console && console.info) {
     compute:    { stroke: '#3B82F6', fill: 'rgba(59,130,246,.07)',  name: 'COMPUTE' },
     generation: { stroke: '#A78BFA', fill: 'rgba(167,139,250,.07)', name: 'GENERATION' },
     storage:    { stroke: '#4ADE80', fill: 'rgba(74,222,128,.07)',  name: 'STORAGE' },
+    yard:       { stroke: '#F97316', fill: 'rgba(249,115,22,.07)',  name: 'INTERCONNECTION' },
     solar:      { stroke: '#FBBF24', fill: 'rgba(251,191,36,.06)',  name: 'SOLAR' }
   };
 
@@ -151573,6 +151637,17 @@ if (root.console && console.info) {
       acres: ac, kwDc: kwDc, mwhYr: mwhYr,
       offset: facMwh > 0 ? mwhYr / facMwh : null
     };
+  }
+
+  function yardNote(r) {
+    try {
+      var plan = root._omegaPlan;
+      if (plan && plan.sizing && plan.sizing.yard) {
+        return plan.sizing.yard.map(function (e) { return e.n + '\u00d7 ' + e.label.split(' ')[0]; })
+          .join(' \u00b7 ');
+      }
+    } catch (e) {}
+    return 'switchgear \u00b7 transformers \u00b7 EMS';
   }
 
   function solarNote(z, r) {
@@ -151604,10 +151679,11 @@ if (root.console && console.info) {
       storage: (r.bessKwh > 0)
         ? n0(r.bessKwh) + ' kWh \u00b7 ' + n1((r.bessKw || 0) / 1000) + ' MW'
         : 'unallocated',
-      solar: solarNote(placed.zones && placed.zones.solar, r)
+      solar: solarNote(placed.zones && placed.zones.solar, r),
+      yard: yardNote(r)
     };
 
-    ['compute', 'generation', 'storage', 'solar'].forEach(function (k) {
+    ['compute', 'generation', 'storage', 'yard', 'solar'].forEach(function (k) {
       var z = zones[k];
       if (!z || !(z.x2 > z.x1 && z.y2 > z.y1)) return;
       var st = ZONE_STYLE[k];
