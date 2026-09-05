@@ -150355,8 +150355,17 @@ if (root.console && console.info) {
       var mw = g('od-ws') ? parseFloat(g('od-ws').value) : NaN;
       if (isFinite(mw) && mw > 0) setWillServe(mw, g('od-ref') ? g('od-ref').value : null);
       var it = g('od-it') ? parseFloat(g('od-it').value) || 40 : 40;
+      /* Prime mover choice, captured before the dialog is gone. */
+      try {
+        var gc = g('od-genclass');
+        if (gc && root.OmegaSolarZone) root.OmegaSolarZone.setClass(gc.value || null);
+      } catch (e) {}
       w.remove();
-      setTimeout(function () { run({ mode: mode, itMw: it }); }, 40);
+      /* Through the public entry, so anything that has taken over run()
+         — the engine adapter — is what actually runs. Calling the local
+         closure here bypassed every hook and ran the old chain, which
+         is how the engine could pass every test and still never draw. */
+      setTimeout(function () { root.OmegaDesign.run({ mode: mode, itMw: it }); }, 40);
     });
     document.body.appendChild(w);
     return true;
@@ -150512,6 +150521,9 @@ if (root.console && console.info) {
 
   function fillZone(opts) {
     opts = opts || {};
+    /* The engine draws solar as part of the plan. A second pass here
+       would overlay a second array on the first. */
+    if (root._omegaPlan) return root._omegaPlan.solar || null;
     var placed = root._omegaComputePlaced;
     var zone = placed && placed.zones && placed.zones.solar;
     if (!zone) {
@@ -150677,19 +150689,9 @@ if (root.console && console.info) {
       setTimeout(augmentDialog, 20);
       return r;
     };
-    /* Read the picker back when the dialog runs. */
-    var runOrig = root.OmegaDesign.run;
-    root.OmegaDesign.run = function (opts) {
-      try {
-        var s = document.getElementById('od-genclass');
-        if (s) setClass(s.value || null);
-      } catch (e) {}
-      var out = runOrig.apply(this, arguments);
-      try {
-        if (root.OmegaDesign.der && root.OmegaDesign.der.solar) setTimeout(fillZone, 60);
-      } catch (e) {}
-      return out;
-    };
+    /* The picker is read by the engine adapter at run time. This module
+       no longer wraps run() or draws solar itself: two placers that did
+       not know about each other is what produced overlapping arrays. */
     root.OmegaDesign.__aug = true;
     return true;
   }
@@ -150766,7 +150768,7 @@ if (root.console && console.info) {
   function scaled() { return !!(scale() > 0); }
 
   function draw(plan) {
-    try { root.OmegaComputePlace.clearAll(); } catch (e) {}
+    clearAll();
     var s = plan.sizing, cfg = plan.cfg;
     plan.slots.pods.forEach(function (sl, i) {
       push({ id: id('p', i), kind: 'derdc', dcId: 'dc_leviathan', pts: [{ x: sl.x, y: sl.y }],
@@ -150876,8 +150878,14 @@ if (root.console && console.info) {
     if (!(P > 0)) return fail('Calibrate the drawing scale first.');
 
     var der = (root.OmegaDesign && root.OmegaDesign.der) || { generation: true, storage: true, solar: false };
+    /* Prime mover picker, read from the dialog if it is open, else the
+       remembered choice. */
     var genClass = null;
-    try { genClass = root.OmegaSolarZone ? root.OmegaSolarZone.chosen() : null; } catch (e) {}
+    try {
+      var sel = document.getElementById('od-genclass');
+      if (sel && root.OmegaSolarZone) root.OmegaSolarZone.setClass(sel.value || null);
+      genClass = root.OmegaSolarZone ? root.OmegaSolarZone.chosen() : null;
+    } catch (e) {}
 
     var input = {
       polygon: poly, exclusions: exclusions(), pxPerFt: P,
@@ -150929,18 +150937,77 @@ if (root.console && console.info) {
     return null;
   }
 
-  /* Design Site now routes here. */
+  /* ONE PLACER.
+     Five modules could put equipment on the canvas: the old compute
+     packer, What Fits, Lay Out Site, the capacity solver and the solar
+     zone filler. Each was correct alone and any two together produced
+     the overlaps the user saw, because none knew the others existed.
+     They all now route here. Their public names are kept so console
+     use and old buttons still work; they just cannot draw independently
+     any more. */
+  function takeOver() {
+    var done = 0;
+    var route = function (obj, key, fn) {
+      if (!obj || typeof obj[key] !== 'function' || obj[key].__engine) return;
+      obj[key] = fn; obj[key].__engine = true; done++;
+    };
+    route(root.OmegaDesign, 'run', function (o) { return run(o); });
+    route(root.OmegaSiteBuild, 'build', function (o) {
+      return run({ mode: 'fixed', itMw: (o && o.itMw) || 40 });
+    });
+    route(root.OmegaMaxFit, 'run', function () { return run({ mode: 'max' }); });
+    route(root.OmegaCapacity, 'solve', function () { return run({ mode: 'max' }); });
+    route(root.OmegaComputePlace, 'build', function (o) {
+      var it = 40;
+      try { it = (root._omegaComputeLast && root._omegaComputeLast.itKw / 1000) || 40; } catch (e) {}
+      var plan = run({ mode: 'fixed', itMw: it });
+      return plan ? root._omegaComputePlaced : null;
+    });
+    route(root.OmegaSolarZone, 'fill', function () {
+      /* Solar is part of the plan, not a second pass. */
+      var plan = root._omegaPlan;
+      return plan ? plan.solar : null;
+    });
+    if (root.OmegaMaxFit && typeof root.OmegaMaxFit.fillSolar === 'function' && !root.OmegaMaxFit.fillSolar.__engine) {
+      root.OmegaMaxFit.fillSolar = function () { return root._omegaPlan ? root._omegaPlan.solar : null; };
+      root.OmegaMaxFit.fillSolar.__engine = true; done++;
+    }
+    return done;
+  }
+
+  /* Everything the engine or any earlier placer drew. */
+  function clearAll() {
+    var keep = [], removed = 0;
+    (S.shapes || []).forEach(function (sh) {
+      var mine = sh && (sh.omegaCompute || sh.autoLayout || sh.omegaYard
+        || sh.omegaSolarZone || sh.omegaGasTie);
+      if (mine) {
+        removed++;
+        try {
+          var el = document.querySelector('#csvg [data-shid="' + sh.id + '"]');
+          if (el && el.parentNode) el.parentNode.removeChild(el);
+        } catch (e) {}
+      } else keep.push(sh);
+    });
+    S.shapes = keep;
+    try { if (root.OmegaBuildLabels) root.OmegaBuildLabels.clear(); } catch (e) {}
+    return removed;
+  }
+
   function hook() {
-    if (!root.OmegaDesign || root.OmegaDesign.__engine) return false;
-    root.OmegaDesign.run = function (opts) { return run(opts); };
-    root.OmegaDesign.__engine = true;
-    if (root.console) console.info(TAG + ' Design Site now runs through OmegaEngine');
-    return true;
+    var n = takeOver();
+    if (root.OmegaComputePlace && !root.OmegaComputePlace.clearAll.__engine) {
+      root.OmegaComputePlace.clearAll = clearAll;
+      root.OmegaComputePlace.clearAll.__engine = true;
+    }
+    if (n && root.console) console.info(TAG + ' ' + n + ' placement paths now route through OmegaEngine');
+    return !!(root.OmegaDesign && root.OmegaDesign.run.__engine);
   }
   function boot() {
-    var n = 0, iv = setInterval(function () { if (hook() || ++n > 40) clearInterval(iv); }, 400);
+    var n = 0, iv = setInterval(function () { hook(); if (++n > 40) clearInterval(iv); }, 400);
   }
-  root.OmegaAutoDesign = { run: run, draw: draw, last: function () { return root._omegaPlan || null; } };
+  root.OmegaAutoDesign = { run: run, draw: draw, clearAll: clearAll,
+                           last: function () { return root._omegaPlan || null; } };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
