@@ -155156,7 +155156,9 @@ if (root.console && console.info) {
   var TAG = '[ComputeMode]';
 
   var KEY = 'omega.ui.compute';
-  var TABS = ['home', 'analyze', 'estimate', 'output'];
+  /* Patch 116: the Compute tab (Patch 114) is the compute workspace and
+     belongs in the curated set. */
+  var TABS = ['home', 'compute', 'analyze', 'estimate', 'output'];
 
   /* label -> group caption, in the order the video lays them out. */
   var TOOLS = [
@@ -155280,6 +155282,7 @@ if (root.console && console.info) {
     undo = []; made = []; on = false;
     try { localStorage.removeItem(KEY); } catch (e) {}
     badge();
+    try { if (root.OmegaComputeTab && root.OmegaComputeTab.place) root.OmegaComputeTab.place(); } catch (e) {}
     if (root.console) console.info(TAG + ' off \u2014 full ribbon restored.');
     return true;
   }
@@ -160919,6 +160922,12 @@ if (root.console && console.info) {
   }
   function place() {
     var moved = 0;
+    /* Patch 116: Compute MODE (Patch 59) gathers Compute Build and Load
+       Screen into its Analyze groups by label. While it is on, this
+       mover stands down -- otherwise the two fight every 500 ms and the
+       mode's Build group is left empty. When the mode turns off it puts
+       the nodes back where it found them, which is here. */
+    try { if (root.OmegaComputeMode && root.OmegaComputeMode.isOn()) return 0; } catch (e) {}
     Object.keys(PLAN).forEach(function (key) {
       var body = panel(key); if (!body) return;
       var prev = null;
