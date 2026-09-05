@@ -1681,8 +1681,12 @@ window.onerror = function(msg, src, line, col, err) {
   <!-- File / application dropdown -->
   <div id="app-menu">
     <button class="menu-item" onclick="rbRun(newProject)"><span class="mi-ico">＋</span> New Project</button>
-    <button class="menu-item" onclick="rbRun(openBessGuidedBuild)"><span class="mi-ico">🔋</span> BESS Guided Build</button>
-    <button class="menu-item" onclick="rbRun(openDcfcBuild)"><span class="mi-ico">🚗</span> DCFC Build</button>
+    <!-- Patch 95: the guided builds are BUILD tools and they live on the
+         Build ribbon, where the rest of the build tracks are. File is for
+         what you do to the PROJECT — new, open, save, print, export — and
+         mixing two build tracks into that list made the shortest menu in
+         the app the one you had to read. Both are unchanged and still one
+         click away under Build. -->
     <button class="menu-item" onclick="rbRun(openProjectsModal)"><span class="mi-ico">▤</span> Open Projects…</button>
     <button class="menu-item" onclick="rbRun(saveProject)"><span class="mi-ico">▽</span> Save<span class="mi-key">⌘S</span></button>
     <div class="menu-sep"></div>
@@ -26973,6 +26977,23 @@ function updateCostEst() {
   window._BNZ_DETAIL = _bnz;
   window._BNZ_TOTAL = bnzTotal;
 
+  /* Patch 93: the enclosures themselves. Never estimated — only what has
+     been entered in Compute Cost, so a proposal cannot carry a made-up
+     pod price. Accelerators are deliberately NOT here: different owner,
+     different life, and they do not belong in a site capex total. */
+  var _computeTotal = 0, _computePods = 0;
+  try{
+    if(window.OmegaComputeCost){
+      var _cc = OmegaComputeCost.figures();
+      _computePods = _cc.pods || 0;
+      _computeTotal = _cc.siteCapex || 0;
+      window._COMPUTE_IT_TOTAL = _cc.itTotal || 0;
+      window._COMPUTE_MW = _cc.mw || 0;
+    }
+  }catch(e){}
+  window._COMPUTE_TOTAL = _computeTotal;
+  window._COMPUTE_PODS = _computePods;
+
   var _dcRom = { active:false, total:0, lines:[] };
   try{ if(typeof omegaDataCenterROM==='function') _dcRom = omegaDataCenterROM(); }catch(e){}
   var dcTotal = _dcRom.active ? _dcRom.total : 0;
@@ -26987,9 +27008,9 @@ function updateCostEst() {
   window._BESS_IS_BENCHMARK = _benchBess > 0;
   window._SOLAR_IS_BENCHMARK = solarTotal > 0;
 
-  const inScope = (bessTotal > 0) || (evTotal > 0) || (_placedKw > 0) || (solarTotal > 0) || (dcTotal > 0) || (bnzTotal > 0);
+  const inScope = (bessTotal > 0) || (evTotal > 0) || (_placedKw > 0) || (solarTotal > 0) || (dcTotal > 0) || (bnzTotal > 0) || (_computeTotal > 0) || (_computePods > 0);
 
-  const sub = inScope ? (bessTotal + solarTotal + siteEq + indirect + evTotal + dcTotal + bnzTotal) : 0;
+  const sub = inScope ? (bessTotal + solarTotal + siteEq + indirect + evTotal + dcTotal + bnzTotal + _computeTotal) : 0;
   const contPct = +($v('ce-cont')||10)/100;
   const cont = sub * contPct;
   let TOTAL = sub + cont;
@@ -27019,6 +27040,14 @@ function updateCostEst() {
       </div>`;
     bd.innerHTML =
       (solarTotal > 0 ? row('  Solar PV (equip + install)', solarTotal, '#FBBF24') : '') +
+      (_computeTotal > 0
+        ? row('  Compute enclosures \u00d7' + _computePods, _computeTotal, '#8B7BD8')
+        : (_computePods > 0
+          ? `<div style="display:flex;justify-content:space-between;padding:6px 0">
+              <span style="color:var(--sub);font-size:10.5px">Compute enclosures \u00d7${_computePods}
+                <span style="opacity:.75">\u2014 no price entered</span></span>
+              <span style="color:var(--amber);font-size:10.5px;font-family:'IBM Plex Mono',monospace">set in Compute Cost</span>
+            </div>` : '')) +
       (dcTotal > 0 ? row('  Data Centre Electrical (ROM)', dcTotal, '#38BDF8') : '') +
       (bnzTotal > 0 ? row('  Building Envelope', bnzTotal, '#A78BFA') : '') +
       row('  BESS Equipment + Install', bessTotal, 'var(--accent)') +
@@ -34157,8 +34186,36 @@ function exportSpecSheet() {
   const projectName = document.getElementById('pname')?.value || 'BESS Project';
   const address     = document.getElementById('addr-in')?.value || '';
   const today       = new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'});
-  const kwh_total   = S.bessList.reduce((s,x)=>s+(+(x.kwh||0))*(+(x.qty||1)),0);
-  const kw_total    = S.bessList.reduce((s,x)=>s+(+(x.kw||0))*(+(x.qty||1)),0);
+  /* Patch 92: these read S.bessList, the BESS CONFIG list, and nothing
+     else. A campus laid out by Design Site places SHAPES — compute pods,
+     fuel cells, battery containers, PV — and never touches bessList, so
+     the sheet reported 0 kWh / 0 kW on a 40 MW site. The drawing is
+     added to the totals, and everything on it gets its own section. */
+  const _campus = (function(){
+    var c = { pods:0, podKw:0, gen:0, genKw:0, genModel:'', bess:0, bessKw:0, bessKwh:0,
+              pv:0, pvKw:0, sub:null, fences:0, ctrl:0, feederFt:0 };
+    try {
+      (S.shapes||[]).forEach(function(sh){
+        if(!sh) return;
+        if(sh.omegaController){ c.ctrl++; return; }
+        if(sh.omegaFence || sh.omegaCampus){
+          if(sh.kind==='rect' && sh.campusLabel) c.fences++;
+          return;
+        }
+        if(sh.kind==='derdc'){ c.pods++; c.podKw += +sh.kw||0; }
+        else if(sh.kind==='deralt'){ c.gen++; c.genKw += +sh.kw||0; c.genModel = sh.model||c.genModel; }
+        else if(sh.kind==='bespad'){ c.bess++; c.bessKw += +sh.kw||0; c.bessKwh += +sh.kwh||0; }
+        else if(sh.kind==='dersolar'){ c.pv++; c.pvKw += +sh.kw||0; }
+        else if(sh.kind==='substation'){ c.sub = sh; }
+      });
+      (S.conduits||[]).forEach(function(x){
+        if(x && (x.omegaCampus||x.omegaFence)) c.feederFt += +x.ftLen||0;
+      });
+    } catch(e){}
+    return c;
+  })();
+  const kwh_total   = S.bessList.reduce((s,x)=>s+(+(x.kwh||0))*(+(x.qty||1)),0) + _campus.bessKwh;
+  const kw_total    = S.bessList.reduce((s,x)=>s+(+(x.kw||0))*(+(x.qty||1)),0) + _campus.bessKw;
   const emsOn       = document.getElementById('ems-toggle')?.checked === true;
   const emsRate     = +(document.getElementById('ems-rate')?.value||12);
   const emsAnnual   = window._EMS_ANNUAL || 0;
@@ -34337,6 +34394,37 @@ function exportSpecSheet() {
   <thead><tr><th>Equipment</th><th>Description</th><th>Specification</th><th>Standard / Notes</th></tr></thead>
   <tbody>${eqRows || '<tr><td colspan="4" style="color:#888">Place equipment on site map to populate</td></tr>'}</tbody>
 </table>
+
+${(function(){
+  var c = _campus, r = '';
+  var line = function(a,b,cc,d){ return '<tr><td>'+a+'</td><td>'+b+'</td><td>'+cc+'</td><td>'+d+'</td></tr>'; };
+  if(c.pods) r += line('Compute pod \u00d7'+c.pods, 'Modular data-centre container',
+    Math.round(c.podKw).toLocaleString()+' kW IT total',
+    'Load, not generation. Confirm pod rating and PUE with the operator.');
+  if(c.gen) r += line('On-site generation \u00d7'+c.gen, c.genModel||'Prime mover',
+    Math.round(c.genKw).toLocaleString()+' kW total',
+    'Sized to close the gap the utility will not carry. Confirm gas supply.');
+  if(c.bess) r += line('Battery container \u00d7'+c.bess, 'Outdoor ESS enclosure',
+    Math.round(c.bessKw).toLocaleString()+' kW / '+Math.round(c.bessKwh).toLocaleString()+' kWh',
+    'NFPA 855 / IFC 1207 clearances applied on the drawing.');
+  if(c.pv) r += line('Solar array \u00d7'+c.pv, 'Fixed-tilt ground mount',
+    Math.round(c.pvKw).toLocaleString()+' kW-DC',
+    'Row geometry from the ground-layout engine.');
+  if(c.sub) r += line('Utility substation', (c.sub.label||'Substation'),
+    (isFinite(+c.sub.capMw)? (+c.sub.capMw)+' MW firm':'capacity not set')
+    + (c.sub.voltage? ' \u00b7 '+c.sub.voltage : ''),
+    'Firm capacity is the figure entered on the drawn substation \u2014 confirm with the utility.');
+  if(c.ctrl) r += line('Master controller', 'Control house / switching yard', '\u2014',
+    'Every fenced compound ties back to this point.');
+  if(c.fences) r += line('Fenced compounds \u00d7'+c.fences, 'Chain-link security fence', '\u2014',
+    'Compound separation per the clearances on the drawing.');
+  if(c.feederFt) r += line('MV duct bank', 'Trenched medium-voltage feeders',
+    Math.round(c.feederFt).toLocaleString()+' ft', 'Length measured from the drawn routing.');
+  if(!r) return '';
+  return '<h2>Campus Equipment (from the drawing)</h2>'
+    + '<table><thead><tr><th>Item</th><th>Description</th><th>Rating</th><th>Notes</th></tr></thead>'
+    + '<tbody>'+r+'</tbody></table>';
+})()}
 
 <h2>Conduit & Wiring Schedule</h2>
 <table>
@@ -58468,6 +58556,75 @@ function omegaOneLineExport(){
     addComp('PCS', bBus, 'pcs', { kw:bKw||null });
   }
 
+  /* ── Compute and on-site generation drawn on the site map ──────────
+     Patch 96: this walked S.elements for a data-centre LOAD and
+     omegaBessKw for storage, and knew nothing about the shapes Design
+     Site places. A campus of compute pods, fuel cells or turbines and
+     battery containers produced a one-line with a utility source, a
+     transformer and nothing under it — which is the drawing saying
+     the site is empty when it is not.
+
+     Everything below is counted off the drawing, and each block only
+     appears when something is actually there. */
+  try{
+    var _cs = { pods:0, podKw:0, gen:0, genKw:0, genModel:'', bess:0, bessKw:0, bessKwh:0, ctrl:0 };
+    (S.shapes||[]).forEach(function(sh){
+      if(!sh) return;
+      if(sh.omegaController){ _cs.ctrl++; return; }
+      if(sh.omegaFence || sh.omegaCampus) return;
+      if(sh.kind==='derdc'){ _cs.pods++; _cs.podKw += +sh.kw||0; }
+      else if(sh.kind==='deralt'){ _cs.gen++; _cs.genKw += +sh.kw||0; _cs.genModel = sh.model||_cs.genModel; }
+      else if(sh.kind==='bespad'){ _cs.bess++; _cs.bessKw += +sh.kw||0; _cs.bessKwh += +sh.kwh||0; }
+    });
+
+    /* On-site generation: prime movers sit on their own bus and close
+       the gap the utility will not carry, so they belong beside the
+       main bus rather than under a load. */
+    if(_cs.gen > 0){
+      var genBus = addNode('Generation bus', sysKv, 'pv');
+      addBranch(genBus, mainK, 'conductor', 'Generation feeder');
+      addComp((_cs.genModel || 'Prime mover') + ' \u00d7' + _cs.gen, genBus, 'generator',
+        { kw: _cs.genKw || null, units: _cs.gen, each_kw: _cs.gen ? Math.round(_cs.genKw/_cs.gen) : null });
+      notes.push('On-site generation is drawn from the site map: ' + _cs.gen + ' unit(s), '
+        + Math.round(_cs.genKw).toLocaleString() + ' kW total. Machine impedance and '
+        + 'ride-through come from the vendor, not the drawing \u2014 emitted null, and '
+        + 'short-circuit will block until they are supplied.');
+    }
+
+    /* Storage drawn as containers, when the BESS config list is empty.
+       Both paths must not double-count, so this only fires when the
+       itemised list contributed nothing. */
+    if(_cs.bess > 0 && !(bKw>0 || bKwh>0)){
+      var bBus2 = addNode('BESS bus', sysKv, 'pq');
+      addBranch(bBus2, mainK, 'conductor', 'BESS feeder');
+      addComp('BESS container \u00d7' + _cs.bess, bBus2, 'bess',
+        { kw:_cs.bessKw||null, kwh:_cs.bessKwh||null, units:_cs.bess });
+      addComp('PCS', bBus2, 'pcs', { kw:_cs.bessKw||null });
+    }
+
+    /* Compute: an IT load with its own distribution, which is what the
+       whole site exists to serve. */
+    if(_cs.pods > 0){
+      var itKw = _cs.podKw || _cs.pods*1000;
+      var pue = 0; try{ pue = (S.omegaSizing && +S.omegaSizing.pue) || 0; }catch(e){}
+      var facKw = itKw * (pue>0 ? pue : 1.3);
+      var cBus = addNode('Compute bus', sysKv, 'pq');
+      addBranch(mainK, cBus, 'conductor', 'Compute feeder');
+      addComp('Compute pods \u00d7' + _cs.pods, cBus, 'it_load',
+        { kw:Math.round(facKw), it_kw:Math.round(itKw), pue:(pue>0?pue:1.3), units:_cs.pods });
+      addComp('UPS', cBus, 'ups', { kw:Math.round(itKw) });
+      notes.push('Compute is ' + _cs.pods + ' pod(s), ' + Math.round(itKw).toLocaleString()
+        + ' kW IT, at PUE ' + (pue>0 ? pue : '1.3 (assumed \u2014 no saved sizing)')
+        + '. The UPS is a fault source with no sequence model: short-circuit will block '
+        + 'until the vendor curve is supplied.');
+    }
+
+    /* The control yard, where every compound ties together. */
+    if(_cs.ctrl > 0){
+      addComp('Master controller', mainK, 'controller', { role:'site EMS / microgrid control' });
+    }
+  }catch(e){}
+
   /* ── Loads, including a data centre if one is placed ── */
   try{
     (S.elements||[]).forEach(function(el){
@@ -60399,11 +60556,32 @@ function omegaDataCenterROM(){
     var el = (S.elements||[]).filter(function(e){
       return e && (e.loadKind==='datacenter') && (+e.loadKw>0 || +e.loadItKw>0);
     })[0];
-    if(!el) return out;
 
-    var itKw  = +el.loadItKw || 0;
-    var pue   = +el.loadPue  || 0;
-    var facKw = +el.loadKw   || (itKw && pue ? itKw*pue : itKw);
+    var itKw = 0, pue = 0, facKw = 0;
+    if(el){
+      itKw  = +el.loadItKw || 0;
+      pue   = +el.loadPue  || 0;
+      facKw = +el.loadKw   || (itKw && pue ? itKw*pue : itKw);
+    } else {
+      /* Patch 93: this only ever fired on a Compute Build ELEMENT. A campus
+         laid out by Design Site places compute pods as SHAPES and never
+         creates that element, so 40 MW of IT priced at zero and the
+         proposal, the cost panel and the spec sheet all agreed with each
+         other about nothing being there. The pods on the drawing are the
+         load; read them. */
+      var _pods = 0, _podKw = 0;
+      (S.shapes||[]).forEach(function(sh){
+        if(sh && sh.kind==='derdc'){ _pods++; _podKw += +sh.kw||0; }
+      });
+      if(_pods){
+        itKw = _podKw || _pods*1000;
+        try{ pue = (S.omegaSizing && +S.omegaSizing.pue) || 0; }catch(e){}
+        if(!(pue>0)) pue = 1.3;
+        facKw = itKw*pue;
+        out.fromDrawing = true;
+        out.pods = _pods;
+      }
+    }
     if(!(facKw>0)) return out;
 
     out.active=true; out.itKw=itKw; out.facilityKw=facKw;
@@ -63206,20 +63384,45 @@ function _renderSubstation(g, sh){
   c1.setAttribute('fill','none'); c1.setAttribute('stroke',ink); c1.setAttribute('stroke-width','1.6'); g.appendChild(c1);
   var c2=_mkNS('circle'); c2.setAttribute('cx',cx+rr*0.55); c2.setAttribute('cy',cy); c2.setAttribute('r',rr);
   c2.setAttribute('fill','none'); c2.setAttribute('stroke',ink); c2.setAttribute('stroke-width','1.6'); g.appendChild(c2);
-  /* capacity readout chip */
+  /* CAPACITY READOUT — NO CHIP.
+
+     This was an opaque dark rectangle sized to nearly the full width of
+     the yard, with the label drawn on top of it. It covered the thing it
+     was labelling, and because the label is text and the chip is a rect,
+     turning labels off hid the text and left the black slab behind. A
+     backing box that can outlive its own text is the bug; removing it is
+     the fix. The label now sits ABOVE the yard in haloed text — a dark
+     stroke painted behind the fill — which reads over any aerial and
+     leaves nothing behind when it is hidden.
+
+     Patch 78 already replaces this function at runtime. This is the same
+     change made at the source, so a build where that override has not
+     installed yet still does not draw a slab over the substation. */
   var cap=(isFinite(+sh.capMw)?(+sh.capMw):0);
-  var line1=(sh.label||'Utility Substation');
-  var line2=cap.toLocaleString()+' MW firm'+(sh.voltage?(' \u00b7 '+sh.voltage):'');
-  var fs=Math.max(9, Math.min(15, w*0.055));
-  var chipW=Math.max(line1.length, line2.length)*fs*0.56+14;
-  chipW=Math.min(chipW, Math.max(w-6, 80));
-  var chx=cx-chipW/2, chy=y+h*0.60;
-  var chip=_mkNS('rect'); chip.setAttribute('x',chx); chip.setAttribute('y',chy);
-  chip.setAttribute('width',chipW); chip.setAttribute('height',fs*2+12); chip.setAttribute('rx',5);
-  chip.setAttribute('fill','rgba(10,12,22,0.86)'); chip.setAttribute('stroke',ink); chip.setAttribute('stroke-width','1');
-  g.appendChild(chip);
-  _evText(g, cx, chy+fs+2, line1, fs, '#F5C871', 'middle', '700');
-  _evText(g, cx, chy+fs*2+6, line2, fs*0.92, '#E2EEF9', 'middle', '600');
+  var line1=(sh.label||'Utility Substation').toUpperCase();
+  var line2=(cap>0 ? cap.toLocaleString()+' MW firm' : 'capacity not set')
+    +(sh.voltage?(' \u00b7 '+sh.voltage):'');
+  var ppf=0; try{ ppf=(S && +S.pxPerFt>0)?+S.pxPerFt:0; }catch(e){}
+  var fs=Math.max(9, Math.min(22, ppf>0 ? ppf*2.0 : Math.min(w,h)*0.13));
+  var ly = (y > fs*2.8) ? (y - fs*1.5) : (y + h + fs*1.4);
+  function halo(tx, ty, txt, size, fill, weight){
+    var t=_mkNS('text');
+    t.setAttribute('x',tx); t.setAttribute('y',ty);
+    t.setAttribute('font-size',size); t.setAttribute('fill',fill);
+    t.setAttribute('font-weight',weight); t.setAttribute('text-anchor','start');
+    t.setAttribute('font-family','Arial,Helvetica,sans-serif');
+    t.setAttribute('stroke','rgba(6,10,18,0.92)');
+    t.setAttribute('stroke-width',Math.max(2,size*0.28));
+    t.setAttribute('stroke-linejoin','round');
+    t.setAttribute('paint-order','stroke fill');
+    t.setAttribute('class','omega-utillabel');
+    t.setAttribute('pointer-events','none');
+    t.textContent=txt; g.appendChild(t);
+  }
+  if(Math.min(w,h) > 26){
+    halo(x, ly, line1, fs, '#F5C871', '800');
+    halo(x, ly+fs*1.12, line2, fs*0.82, cap>0?'#E2EEF9':'#F87171', '600');
+  }
 }
 
 /* Floating properties panel for a substation. */
@@ -100245,7 +100448,14 @@ button[style*="linear-gradient"][aria-disabled="true"]{
     inverter: 'pcs', pcs: 'pcs', fuel_cell: 'fuelcell', sofc: 'fuelcell',
     generator: 'genset', genset: 'genset', ups: 'ups', evse: 'evse',
     ev_charger: 'evse', load: 'load', meter: 'meter', transformer: 'xfmr',
-    breaker: 'breaker', switchgear: 'switchgear', utility: 'utility'
+    breaker: 'breaker', switchgear: 'switchgear', utility: 'utility',
+    /* Patch 96: an IT load fell through to the generic 'load' box, so a
+       compute campus drew as an anonymous rectangle next to the
+       batteries. The sheet already has an itload symbol; it was simply
+       never mapped. A controller has no symbol of its own and reads as
+       the panel it lives in. */
+    it_load: 'itload', datacenter: 'itload', compute: 'itload',
+    controller: 'panel', ems: 'panel', crah: 'crah', pdu: 'pdu'
   };
 
   function fromGraph(graph, opts) {
@@ -124955,18 +125165,73 @@ SEL.split(', ').map(function (s) { return s + ' label, ' + s + ' td, ' + s + ' t
         made.shapes += importSolar(sh, K, made);
         return;
       }
+      /* FOOTPRINT SHAPES CARRY ONE POINT AND A SIZE IN FEET.
+
+         Patch 97: the generic path below needs two points. A compute pod,
+         a fuel cell, a genset and a battery container are all kind + a
+         single origin + lf/wf in FEET, so every one of them fell through
+         the same way the solar array used to and the import came back
+         with nothing but the boundary. That is the empty drawing in
+         Architecture Mode on a site with a full campus on it.
+
+         These are drawn at their true footprint, on the right layer, with
+         the real block where the library has one. Feet go straight to
+         inches — no pixel round trip, so the size cannot drift with the
+         drawing scale. */
+      var _ft = (+sh.lf > 0 && +sh.wf > 0) ? { lf: +sh.lf, wf: +sh.wf } : null;
+      if (_ft && sh.pts && sh.pts.length === 1) {
+        var _o = sh.pts[0];
+        var _wIn = _ft.lf * 12, _hIn = _ft.wf * 12;
+        var _cx = (_o.x * K) + _wIn / 2;
+        var _cy = -(_o.y * K) - _hIn / 2;
+        var _rot = -(+sh.rot || 0) * D2R;
+        var _kind = String(sh.kind || '');
+        var _isBess = _kind === 'bespad' && !sh.omegaController;
+        var _blk = _isBess ? (_ft.lf > 30 ? 'bess-40' : 'bess-20') : null;
+        var _lyr = _kind === 'derdc' ? 'E-COMP-EQPM'
+                 : _kind === 'deralt' || _kind === 'derwind' ? 'E-GENR-EQPM'
+                 : _isBess ? 'E-STOR-EQPM' : 'E-POWR-EQPM';
+        try { E.ensureLayer(_lyr, 2); } catch (e) {}
+        if (_blk && E.BLOCKS[_blk]) {
+          var _d = E.BLOCKS[_blk];
+          var _sc = _wIn / Math.max(_d.w, _d.h);
+          if (!(_sc > 0) || !isFinite(_sc)) _sc = 1;
+          if (E.addBlock(ST.doc, _blk, _cx, _cy, _rot, _sc)) made.blocks++;
+        } else {
+          E.add(ST.doc, { t: 'pline', closed: true, layer: _lyr,
+                          pts: rectPts(_cx, _cy, _wIn, _hIn, _rot) });
+          made.boxes++;
+        }
+        var _lb = String(sh.model || sh.label || '').trim();
+        if (_lb) {
+          E.add(ST.doc, { t: 'text', layer: 'A-ANNO-TEXT', x: _cx,
+                          y: _cy - _hIn / 2 - 14, h: 12, rot: 0,
+                          s: _lb.toUpperCase(), mid: true });
+          made.labels++;
+        }
+        made.shapes++;
+        return;
+      }
+
       if (!sh.pts || !sh.pts.length) return;
       var p = sh.pts.map(function (q) { return { x: q.x * K, y: -q.y * K }; });
       var k = String(sh.kind || '');
-      var lyr = /solar|der/i.test(k) ? 'E-SOLR-MODL'
+      /* Patch 97: a campus fence is a rect tagged omegaCampus, and a
+         substation is a two-point yard. Both were landing on the parking
+         layer as open polylines. */
+      var _campusFence = !!(sh.omegaFence || sh.omegaCampus);
+      var lyr = _campusFence ? 'C-FENC'
+              : k === 'substation' ? 'E-POWR-EQPM'
+              : /solar|der/i.test(k) ? 'E-SOLR-MODL'
               : /park/i.test(k) ? 'C-PKNG'
               : /pad/i.test(k) ? 'C-PKNG'
               : /fenc/i.test(k) ? 'C-FENC'
               : /bound|prop/i.test(k) ? 'C-TOPO' : 'C-PKNG';
+      if (_campusFence || k === 'substation') { try { E.ensureLayer(lyr, 3); } catch (e) {} }
       if (k === 'circle' && p.length >= 2) {
         E.add(ST.doc, { t: 'circle', layer: lyr, cx: p[0].x, cy: p[0].y,
           r: Math.hypot(p[1].x - p[0].x, p[1].y - p[0].y) });
-      } else if (k === 'rect' && p.length >= 2) {
+      } else if ((k === 'rect' || k === 'substation') && p.length >= 2) {
         E.add(ST.doc, { t: 'pline', closed: true, layer: lyr, pts: [
           { x: p[0].x, y: p[0].y }, { x: p[1].x, y: p[0].y },
           { x: p[1].x, y: p[1].y }, { x: p[0].x, y: p[1].y }] });
@@ -124975,7 +125240,7 @@ SEL.split(', ').map(function (s) { return s + ' label, ' + s + ' td, ' + s + ' t
                         layer: lyr, pts: p });
       } else return;
       made.shapes++;
-      var slbl = String(sh.label || '').trim();
+      var slbl = String(sh.campusLabel || sh.label || '').trim();
       if (slbl) {
         var bb = { x: 0, y: 0 }, i;
         for (i = 0; i < p.length; i++) { bb.x += p[i].x; bb.y += p[i].y; }
@@ -144928,7 +145193,13 @@ function grabSatellite(){
    yield engine instead of from a form. */
 function siteFacts(){
   var f = { arrays: 0, kwdc: 0, storage: 0, mount: [], addr: '', lat: null, lng: null,
-            month: null, hour: null };
+            month: null, hour: null,
+            /* Patch 90: the prompt was written for a rooftop array on a
+               commercial building and knew nothing else. A greenfield
+               energy campus has containers, transformers, a lattice
+               dead-end, gravel yards and chain-link — and no streets, no
+               kerbs and no parked cars anywhere near it. */
+            pods: 0, gensets: 0, substation: false, fences: 0, acres: 0, greenfield: false };
   try {
     var V = root.OmegaSiteVis && root.OmegaSiteVis._V && root.OmegaSiteVis._V();
     if (V && V.site && V.site.items) {
@@ -144940,6 +145211,11 @@ function siteFacts(){
           if (f.mount.indexOf(m) < 0) f.mount.push(m);
         }
         if (/^bess-/.test(it.arch)) f.storage++;
+        if (it.arch === 'compute-pod') f.pods++;
+        if (it.arch === 'genset') f.gensets++;
+        if (it.arch === 'substation') f.substation = true;
+        if (it.arch === 'compound') f.fences++;
+        if (it.arch === 'building') f.buildings = (f.buildings || 0) + 1;
       });
     }
     if (V && V.opts) { f.month = V.opts.day; f.hour = V.opts.hour; }
@@ -144952,7 +145228,87 @@ function siteFacts(){
     try { var pn = document.getElementById('pname'); if (pn && pn.value) f.addr = pn.value; } catch (e) {}
   }
   try { var g = omegaGeo(); if (g) { f.lat = g.lat; f.lng = g.lng; } } catch (e) {}
+  try {
+    var m = window.OmegaBuildable && OmegaBuildable.measure();
+    if (m && m.ok) f.acres = m.grossAc;
+  } catch (e) {}
+  /* A site with containers, gensets or a substation yard and no buildings
+     to speak of is open ground, and everything about how it should be
+     lit, surfaced and surrounded follows from that. */
+  f.greenfield = (f.pods + f.storage + f.gensets > 0 || f.substation) && !(f.buildings > 1);
   return f;
+}
+
+/* THE PROMPT WAS DESCRIBING THE WRONG PLACE.
+
+   Everything in the original single-image prompt — kerbs, lane markings,
+   sidewalks, street trees, parked cars, white massing — belongs to a
+   rooftop array on a commercial building in a town. Fed to a greenfield
+   battery and compute campus in farmland it fights the control image on
+   every noun, and the result reads as a cartoon of a business park.
+
+   A utility-scale yard is a photograph, not a visualisation, and it is
+   made of a short list of very specific things: white 40 ft ISO
+   enclosures in ranks on compacted crushed stone, chain-link fence with
+   three barbed strands on canted arms, green oil-filled transformers on
+   concrete, a galvanised lattice dead-end structure, fixed-tilt module
+   rows on low racking over grass, graded dirt access roads, and farmland
+   running to a treeline. Naming those gets the reference image; asking
+   for "photoreal, high detail" gets more stuff.
+
+   Camera direction is included on purpose. "Aerial oblique" is a
+   category; "drone at roughly 400 ft, 35 mm equivalent, level horizon
+   high in frame" is a shot, and the difference is most of the gap
+   between the two images. */
+function greenfieldPrompt(f, light, mountRule){
+  var parts = [];
+  parts.push('A photograph, not an illustration: aerial drone photograph of a working '
+    + 'utility-scale energy site on open farmland, taken from roughly 400 ft, 35 mm '
+    + 'equivalent lens, camera tilted about 40 degrees below horizontal, horizon high in '
+    + 'frame with distant fields and a treeline beyond the site.');
+  parts.push('Match the provided view exactly for the position, orientation, spacing and '
+    + 'extent of every piece of equipment. Do not add, move, resize or re-orient anything, '
+    + 'and do not invent buildings, roads or equipment that is not in the view.');
+
+  if (f.storage) {
+    parts.push('Battery enclosures: white 40 ft ISO-format containers with ribbed corrugated '
+      + 'sides, corner castings, door hardware on the end, and roof-mounted HVAC units \u2014 '
+      + 'set in straight ranks on a compacted crushed-stone pad, each on a low concrete plinth, '
+      + 'with even service aisles between rows.');
+  }
+  if (f.pods) {
+    parts.push('Compute modules: white container-format data-centre pods in a regular grid, '
+      + 'with continuous roof cooling plant and cable hoods on the end wall, on crushed stone.');
+  }
+  if (f.gensets) {
+    parts.push('Generation: grey enclosed generator packages in a row on concrete pads with '
+      + 'exhaust stacks and radiator ends, on a gravel yard.');
+  }
+  if (f.substation) {
+    parts.push('Substation yard: green oil-filled power transformers with radiator banks and '
+      + 'porcelain bushings on a concrete pad, a galvanised steel lattice dead-end structure '
+      + 'carrying the incoming line onto insulator strings, tubular bus on standoff insulators, '
+      + 'a small control house, all inside a gravel yard behind chain-link fence.');
+  }
+  if (f.arrays) {
+    parts.push((mountRule(f) || '') + 'Solar: dark blue-black modules with thin silver framing '
+      + 'in long even rows on low fixed-tilt racking, grass or bare earth between the rows.');
+  }
+  if (f.fences) {
+    parts.push('Security fencing: galvanised chain-link on steel posts with a top rail and '
+      + 'three barbed strands on outward-canted arms, following the compound edges.');
+  }
+  parts.push('Ground and surroundings: compacted crushed-stone yards, graded dirt access '
+    + 'roads with tyre tracks, mown grass and cropped farmland with hedgerows and field '
+    + 'boundaries running to the horizon. No kerbs, no lane markings, no sidewalks, no street '
+    + 'furniture, no parked cars, no town.');
+  parts.push(light + ', clear sky with light haze toward the horizon, natural colour, '
+    + 'realistic materials and weathering, sharp focus throughout.');
+  parts.push('No people, no vehicles other than at most one service pickup, no text, no '
+    + 'signage, no logos, no watermarks, no lens flare. Any map attribution lettering '
+    + 'visible on the ground in the source is an artefact: replace it with the surface '
+    + 'underneath.');
+  return parts.join(' ');
 }
 
 function buildPrompt(f, style, twoImage){
@@ -145035,7 +145391,8 @@ function buildPrompt(f, style, twoImage){
      + 'Keep the original lighting, shadow direction and season from image 1. '
      + 'Photoreal, sharp, no people, no text, no logos, no new landscaping.')
 
-    : ('Photorealistic architectural visualisation, aerial oblique view, of an '
+    : (f.greenfield ? greenfieldPrompt(f, light, mountRule)
+     : 'Photorealistic architectural visualisation, aerial oblique view, of an '
      + 'existing commercial site. Match the provided image exactly for building '
      + 'massing, roof outlines, road layout, parking geometry, and the position, '
      + 'orientation and extent of every solar array. Do not add, move, resize or '
@@ -153366,15 +153723,36 @@ if (root.console && console.info) {
           + '<meta name="viewport" content="width=device-width,initial-scale=1">'
           + '<title>' + esc(project) + '</title><style>'
           + paletteCss()
-          + 'body{margin:0;padding:42px 20px 80px;background:#141414;color:var(--text);'
+          /* Patch 92: the export shipped the editor's dark palette. A
+             report is read on a laptop in daylight, forwarded, and
+             printed — and a black page prints as a black page or as
+             washed-out grey, neither of which anybody wants in front of
+             a landowner. The document is paper: white ground, dark
+             text, the same accents. The screen keeps its dark theme;
+             only the exported file is re-themed. */
+          + ':root{--text:#15181B;--sub:#5B6470;--border:#E3E8EE;--panel:#FFFFFF;'
+          + '--accent:#5B3FD8;--pos:#1B8A4B;--warn:#B45309}'
+          + 'body{margin:0;padding:42px 20px 80px;background:#FFFFFF;color:#15181B;'
           + "font-family:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',sans-serif;"
           + 'line-height:1.5;-webkit-font-smoothing:antialiased}'
+          /* Anything the app drew with a light-on-dark inline colour has to
+             be pulled back, or it disappears on white. */
+          + '.doc [style*="#E0E0E0"],.doc [style*="#FFFFFF"]{color:#15181B!important}'
+          + '.doc [style*="#9A9A9A"]{color:#5B6470!important}'
+          + '.doc [style*="#4ADE80"]{color:#1B8A4B!important}'
+          + '.doc [style*="#F59E0B"],.doc [style*="#F5C871"]{color:#B45309!important}'
+          + '.doc [style*="#8B7BD8"],.doc [style*="#A78BFA"]{color:#5B3FD8!important}'
+          + '.doc [style*="rgba(47,181,74"]{background:#EFFAF3!important;'
+          + 'border-color:#BBE7CC!important}'
+          + '.doc [style*="rgba(245,158,11"]{background:#FFF8EC!important;'
+          + 'border-color:#F2D9A8!important}'
+          + '.doc [style*="rgba(255,255,255,.0"]{background:#F7F9FB!important}'
           + '.doc{max-width:760px;margin:0 auto}'
           + 'img{max-width:100%;height:auto;display:block}'
           + 'code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em}'
           + '.foot{max-width:760px;margin:44px auto 0;padding-top:16px;'
           + 'border-top:1px solid var(--border);font-size:10.5px;color:var(--sub);line-height:1.7}'
-          + '@media print{body{background:#fff;color:#111}'
+          + '@media print{body{background:#fff;color:#111;padding:0}'
           + '.doc,.foot{max-width:none}}'
           + '</style></head><body><div class="doc">'
           + body.innerHTML
@@ -158378,23 +158756,23 @@ if (root.console && console.info) {
 
   function kpi(v, unit, label, tone) {
     return '<div style="flex:1;min-width:120px">'
-      + '<div style="font-size:26px;font-weight:800;color:' + (tone || '#E0E0E0')
+      + '<div style="font-size:26px;font-weight:800;color:' + (tone || 'var(--text,#E0E0E0)')
       + ';font-family:\'IBM Plex Mono\',monospace;line-height:1.1">' + v
-      + (unit ? '<span style="font-size:12px;font-weight:600;color:#9A9A9A;margin-left:4px">'
+      + (unit ? '<span style="font-size:12px;font-weight:600;color:var(--sub,#9A9A9A);margin-left:4px">'
         + unit + '</span>' : '') + '</div>'
-      + '<div style="font-size:10.5px;color:#9A9A9A;margin-top:3px">' + label + '</div></div>';
+      + '<div style="font-size:10.5px;color:var(--sub,#9A9A9A);margin-top:3px">' + label + '</div></div>';
   }
   function row(k, v, basis) {
     return '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:14px;'
-      + 'padding:7px 0;border-bottom:1px solid rgba(255,255,255,.06)">'
+      + 'padding:7px 0;border-bottom:1px solid var(--border,rgba(255,255,255,.12))">'
       + '<div style="flex:1"><div style="font-size:12.5px;color:var(--text,#E0E0E0)">' + k + '</div>'
-      + (basis ? '<div style="font-size:10px;color:#9A9A9A;margin-top:2px">' + basis + '</div>' : '')
+      + (basis ? '<div style="font-size:10px;color:var(--sub,#9A9A9A);margin-top:2px">' + basis + '</div>' : '')
       + '</div><div style="font-size:13px;font-weight:700;font-family:\'IBM Plex Mono\',monospace;'
-      + 'color:#4ADE80;white-space:nowrap">' + v + '</div></div>';
+      + 'color:var(--pos,#1B8A4B);white-space:nowrap">' + v + '</div></div>';
   }
   function head(t) {
     return '<div style="font-size:10px;letter-spacing:1.2px;text-transform:uppercase;'
-      + 'color:#8B7BD8;margin:20px 0 6px">' + t + '</div>';
+      + 'color:var(--accent,#8B7BD8);margin:20px 0 6px">' + t + '</div>';
   }
 
   function html() {
@@ -158412,11 +158790,11 @@ if (root.console && console.info) {
 
     /* Hero: what it is, and the two or three numbers that decide it. */
     h += '<div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;'
-      + 'padding-bottom:14px;border-bottom:1px solid rgba(255,255,255,.08)">'
+      + 'padding-bottom:14px;border-bottom:1px solid var(--border,rgba(255,255,255,.14))">'
       + '<div style="flex:1;min-width:200px">'
-      + '<div style="font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:#8B7BD8">'
+      + '<div style="font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:var(--accent,#8B7BD8)">'
       + esc(a.label) + '</div>'
-      + '<div style="font-size:11px;color:#9A9A9A;margin-top:4px">'
+      + '<div style="font-size:11px;color:var(--sub,#9A9A9A);margin-top:4px">'
       + (land && land.ok ? n1(land.grossAc) + ' ac parcel \u00b7 ' + n1(land.buildableAc) + ' ac buildable'
                          : 'parcel not measured') + '</div></div>'
       + kpi(cl.kw > 0 ? n1(cl.kw / 1000) : '\u2014', 'MW', 'Utility capacity \u00b7 '
@@ -158498,10 +158876,10 @@ if (root.console && console.info) {
     var conf = led.filter(function (x) { return x.ok; });
     h += conf.length
       ? conf.map(function (x) {
-          return '<div style="display:flex;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06)">'
+          return '<div style="display:flex;gap:8px;padding:6px 0;border-bottom:1px solid var(--border,rgba(255,255,255,.12))">'
             + '<span style="color:#4ADE80;font-weight:800">\u2713</span><div>'
             + '<div style="font-size:12.5px;color:var(--text,#E0E0E0)">' + x.item + '</div>'
-            + '<div style="font-size:10px;color:#9A9A9A;margin-top:2px">' + x.basis + '</div></div></div>';
+            + '<div style="font-size:10px;color:var(--sub,#9A9A9A);margin-top:2px">' + x.basis + '</div></div></div>';
         }).join('')
       : '<div style="font-size:11.5px;color:#F59E0B;line-height:1.6">Nothing on this project is '
         + 'confirmed yet. Everything below is an estimate or a drawing, which is a normal place '
@@ -158509,14 +158887,14 @@ if (root.console && console.info) {
 
     h += head('To confirm before anybody spends money');
     h += led.filter(function (x) { return !x.ok; }).map(function (x) {
-      return '<div style="display:flex;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06)">'
+      return '<div style="display:flex;gap:8px;padding:6px 0;border-bottom:1px solid var(--border,rgba(255,255,255,.12))">'
         + '<span style="color:#F59E0B;font-weight:800">\u25cb</span><div>'
         + '<div style="font-size:12.5px;color:var(--text,#E0E0E0)">' + x.item + '</div>'
-        + '<div style="font-size:10px;color:#9A9A9A;margin-top:2px">' + x.basis
+        + '<div style="font-size:10px;color:var(--sub,#9A9A9A);margin-top:2px">' + x.basis
         + (x.todo ? ' \u2014 <span style="color:#F5C871">' + x.todo + '</span>' : '') + '</div></div></div>';
     }).join('');
 
-    h += '<div style="font-size:10px;color:#9A9A9A;margin-top:16px;line-height:1.6">'
+    h += '<div style="font-size:10px;color:var(--sub,#9A9A9A);margin-top:16px;line-height:1.6">'
       + 'Every figure here is measured off this drawing or entered on this project. Nothing is '
       + 'filled in from a default. Planning rates are labelled as such and are not quotes; '
       + 'code references are the sizing basis, not a compliance statement.</div>';
@@ -158577,6 +158955,328 @@ if (root.console && console.info) {
   else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
   if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaOverview;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 91 — THE DRAWING IS THE RECORD
+ *  ---------------------------------------------------------------------
+ *  TWO SYMPTOMS, ONE CAUSE. "No compute build on this project yet" on a
+ *  site carrying forty pods, and a legend that lists three items on a
+ *  drawing carrying seventy shapes. Both come from reading something
+ *  other than the drawing.
+ *
+ *  1. THE COMPUTE SCREEN reads root._omegaComputeLast, which is set when
+ *  a design runs and lives only in memory. Reload the page — or, on this
+ *  project, fail to save and come back — and it is gone, while the pods
+ *  are still sitting on the canvas. The screen then says nothing was
+ *  built, which is not just unhelpful, it is false.
+ *
+ *  So the sizing is written onto S, where it saves with the project, and
+ *  when even that is missing it is RECONSTRUCTED from the pods on the
+ *  drawing and labelled as reconstructed. A number rebuilt from the
+ *  geometry is honest; a screen claiming nothing exists is not.
+ *
+ *  2. THE LEGEND was wrapped around renderLegend, which works only if
+ *  nothing else writes to the legend afterwards. Several things do. A
+ *  wrapper cannot win that race, so this stops trying: it watches the
+ *  legend node and puts the census back whenever the node is rewritten
+ *  without it. Observing the DOM is the only approach that does not
+ *  depend on being the last writer.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Record]';
+  var MARK = 'data-omega-census';
+
+  function S_() { return root.S; }
+
+  /* ── 1. compute facts that survive a reload ─────────────────────────── */
+
+  function podsOnDrawing() {
+    var n = 0, kw = 0;
+    try {
+      (S_().shapes || []).forEach(function (sh) {
+        if (!sh || sh.kind !== 'derdc') return;
+        n++; kw += (+sh.kw || 0);
+      });
+    } catch (e) {}
+    return { n: n, kw: kw };
+  }
+
+  function ceilingKw() {
+    try { return root.OmegaDesign.ceiling().kw || 0; } catch (e) { return 0; }
+  }
+
+  /* Everything the compute screen reads, rebuilt from what is on the
+     canvas. PUE is the one thing the geometry cannot state, so it is
+     taken from the saved sizing where there is one and otherwise from
+     the engine default — and the result is flagged so nothing downstream
+     mistakes it for a design that was actually run. */
+  function reconstruct() {
+    var p = podsOnDrawing();
+    if (!p.n) return null;
+    var saved = null;
+    try { saved = S_().omegaSizing || null; } catch (e) {}
+    var pue = (saved && saved.pue) || 1.3;
+    var itKw = p.kw || p.n * 1000;
+    var facKw = itKw * pue;
+    var util = ceilingKw();
+    var gen = 0, genN = 0, genKw = 0;
+    try {
+      (S_().shapes || []).forEach(function (sh) {
+        if (!sh || sh.kind !== 'deralt') return;
+        genN++; genKw += (+sh.kw || 0);
+      });
+    } catch (e) {}
+    gen = genKw;
+    var bessKw = 0, bessKwh = 0;
+    try {
+      (S_().shapes || []).forEach(function (sh) {
+        if (!sh || sh.kind !== 'bespad' || sh.omegaController) return;
+        bessKw += (+sh.kw || 0); bessKwh += (+sh.kwh || 0);
+      });
+    } catch (e) {}
+    return {
+      itKw: itKw, itMw: itKw / 1000, facKw: facKw, critKw: itKw, utilKw: util,
+      genNeedKw: Math.max(0, facKw - util), fcKw: gen, fcBlocks: genN,
+      bessKw: bessKw, bessKwh: bessKwh, pods: p.n, pue: pue,
+      reconstructed: true,
+      basis: 'rebuilt from ' + p.n + ' pods on the drawing'
+        + (saved ? ' and the saved sizing' : ' at the default PUE of ' + pue)
+    };
+  }
+
+  /* Write the sizing where it will be saved with the project, so the
+     next session does not have to reconstruct anything. */
+  function persist() {
+    try {
+      var last = root._omegaComputeLast;
+      if (last && last.facKw > 0 && S_()) {
+        var cur = S_().omegaSizing;
+        if (!cur || cur.facKw !== last.facKw || cur.itKw !== last.itKw) {
+          S_().omegaSizing = JSON.parse(JSON.stringify(last));
+          S_().omegaSizingAt = Date.now();
+        }
+      }
+    } catch (e) {}
+  }
+
+  /* Fill the in-memory slot the screens read, from the project first and
+     the drawing second. Never overwrites a live design. */
+  function restore() {
+    try {
+      if (root._omegaComputeLast && root._omegaComputeLast.facKw > 0) { persist(); return false; }
+      var s = S_(); if (!s) return false;
+      if (s.omegaSizing && s.omegaSizing.facKw > 0) {
+        root._omegaComputeLast = s.omegaSizing;
+        if (root.console) console.info(TAG + ' compute sizing restored from the saved project');
+        return true;
+      }
+      var r = reconstruct();
+      if (r) {
+        root._omegaComputeLast = r;
+        if (root.console) console.info(TAG + ' no saved sizing \u2014 ' + r.basis
+          + '. Run Design Site to replace it with a designed one.');
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  /* ── 2. the legend, put back whenever it is rewritten ───────────────── */
+
+  function rows() {
+    try {
+      if (root.OmegaCampus && typeof root.OmegaCampus.legendRows === 'function') {
+        return root.OmegaCampus.legendRows() || '';
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  function paint() {
+    var host = document.getElementById('lgd-items');
+    if (!host) return false;
+    if (host.querySelector('[' + MARK + ']')) return false;      /* already there */
+    var h = rows();
+    if (!h) return false;
+    var block = document.createElement('div');
+    block.setAttribute(MARK, '1');
+    block.innerHTML = h;
+    /* First, because what is on the drawing is what the key is for. */
+    host.insertBefore(block, host.firstChild);
+    return true;
+  }
+
+  var observing = false;
+  function watch() {
+    if (observing) return true;
+    var host = document.getElementById('lgd-items');
+    if (!host) return false;
+    /* A wrapper around renderLegend only wins if nothing writes after
+       it, and several things do. Watching the node is the only way that
+       does not depend on being last. */
+    var mo = new MutationObserver(function () {
+      if (paintPending) return;
+      paintPending = true;
+      setTimeout(function () { paintPending = false; try { paint(); } catch (e) {} }, 60);
+    });
+    mo.observe(host, { childList: true, subtree: false });
+    observing = true;
+    paint();
+    return true;
+  }
+  var paintPending = false;
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      watch(); restore(); persist();
+      if (++n > 240) clearInterval(iv);
+    }, 1000);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaRecord.status()');
+  }
+
+  root.OmegaRecord = {
+    reconstruct: reconstruct, restore: restore, persist: persist,
+    repaintLegend: function () {
+      var host = document.getElementById('lgd-items');
+      var old = host && host.querySelector('[' + MARK + ']');
+      if (old) old.parentNode.removeChild(old);
+      return paint();
+    },
+    status: function () {
+      var p = podsOnDrawing(), s = S_() || {};
+      var o = {
+        podsOnDrawing: p.n, podKw: p.kw,
+        savedSizing: !!(s.omegaSizing && s.omegaSizing.facKw > 0),
+        inMemory: !!(root._omegaComputeLast && root._omegaComputeLast.facKw > 0),
+        reconstructed: !!(root._omegaComputeLast && root._omegaComputeLast.reconstructed),
+        legendCensusPainted: !!(document.getElementById('lgd-items')
+          && document.getElementById('lgd-items').querySelector('[' + MARK + ']'))
+      };
+      if (root.console) console.table ? console.table(o) : console.log(o);
+      return o;
+    }
+  };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaRecord;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 94 — NO EMPTY GROUPS ON THE RIBBON
+ *  ---------------------------------------------------------------------
+ *  Edit › SCALE was a caption with nothing above it. The two buttons are
+ *  in the markup; they were hidden by the duplicate sweep, because the
+ *  same Calibrate Scale and Clear Scale live in Build › Ground and that
+ *  sweep keeps one of each and hides the rest.
+ *
+ *  That is the right call — a command in two places is a command that
+ *  gets clicked in the wrong one — but it left the GROUP behind. A
+ *  labelled box with no contents reads as something broken or something
+ *  still loading, and either way it makes somebody stop and look at a
+ *  region of the screen that has nothing in it.
+ *
+ *  This is deliberately general rather than a fix for that one panel.
+ *  Any group whose buttons are all gone gets hidden, and it comes back
+ *  the moment one returns — mode switches, feature flags and the
+ *  expand() calls on the consolidated buttons all repopulate panels at
+ *  runtime, so this has to be a live rule, not a one-off tidy.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Ribbon]';
+  var FLAG = 'data-omega-empty';
+
+  function visible(el) {
+    if (!el) return false;
+    if (el.hidden) return false;
+    var s = el.style;
+    if (s && (s.display === 'none' || s.visibility === 'hidden')) return false;
+    /* offsetParent is null for anything in a hidden ribbon TAB, so it
+       cannot be used here: every panel on an inactive tab would look
+       empty and get hidden for good. Read the computed style of the
+       button itself instead. */
+    try {
+      var c = root.getComputedStyle(el);
+      if (c && (c.display === 'none' || c.visibility === 'hidden')) return false;
+    } catch (e) {}
+    return true;
+  }
+
+  function sweep() {
+    var panels = document.querySelectorAll('#ribbon .rpanel');
+    var hid = 0, shown = 0;
+    for (var i = 0; i < panels.length; i++) {
+      var p = panels[i];
+      var body = p.querySelector('.rpanel-body');
+      if (!body) continue;
+      var btns = body.querySelectorAll('.rbtn, .rbtn-wrap, input, select, label');
+      var any = false;
+      for (var j = 0; j < btns.length; j++) {
+        if (visible(btns[j])) { any = true; break; }
+      }
+      /* Some panels are legitimately just a readout with no controls —
+         only ones that HELD buttons and now hold none are hidden. */
+      if (!any && btns.length > 0) {
+        if (p.style.display !== 'none') { p.style.display = 'none'; p.setAttribute(FLAG, '1'); hid++; }
+      } else if (p.getAttribute(FLAG) && any) {
+        p.style.display = ''; p.removeAttribute(FLAG); shown++;
+      }
+    }
+    return { hidden: hid, restored: shown };
+  }
+
+  var pending = null;
+  function later() {
+    clearTimeout(pending);
+    pending = setTimeout(function () { try { sweep(); } catch (e) {} }, 150);
+  }
+
+  function boot() {
+    var rb = document.getElementById('ribbon');
+    if (!rb) { setTimeout(boot, 500); return; }
+    sweep();
+    /* Panels are repopulated at runtime by mode switches and by the
+       expand() calls on the consolidated buttons, so this watches
+       rather than running once. */
+    try {
+      new MutationObserver(later).observe(rb, {
+        childList: true, subtree: true, attributes: true,
+        attributeFilter: ['style', 'hidden', 'class']
+      });
+    } catch (e) {}
+    var n = 0, iv = setInterval(function () { sweep(); if (++n > 20) clearInterval(iv); }, 1000);
+    if (root.console) console.info(TAG + ' empty ribbon groups hidden \u2014 OmegaRibbon.audit()');
+  }
+
+  root.OmegaRibbon = {
+    sweep: sweep,
+    audit: function () {
+      var rows = [];
+      var panels = document.querySelectorAll('#ribbon .rpanel');
+      for (var i = 0; i < panels.length; i++) {
+        var cap = panels[i].querySelector('.rpanel-cap');
+        var body = panels[i].querySelector('.rpanel-body');
+        var btns = body ? body.querySelectorAll('.rbtn') : [];
+        var vis = 0;
+        for (var j = 0; j < btns.length; j++) if (visible(btns[j])) vis++;
+        rows.push({ group: cap ? cap.textContent.trim() : '(unnamed)',
+                    buttons: btns.length, visible: vis,
+                    hiddenByThis: panels[i].getAttribute(FLAG) === '1' });
+      }
+      if (root.console) console.table ? console.table(rows) : console.log(rows);
+      return rows;
+    }
+  };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
