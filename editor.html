@@ -147773,6 +147773,208 @@ if (root.console && console.info) {
 
 <script>
 /* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 73 — THE RIGHT MACHINE FOR THE GAP
+ *  ---------------------------------------------------------------------
+ *  A 120 MW gap came out as 434 fuel cell blocks. The layout was not
+ *  sloppy; the equipment selection was. DERC_ALT tops out at a 750 kW
+ *  natural-gas genset, so anything above about 30 MW can only be
+ *  expressed as hundreds of small units. Nothing is built that way.
+ *  Past roughly 30 MW a site uses reciprocating engines, and past
+ *  roughly 100 MW it uses aeroderivative turbines, for reasons that
+ *  have nothing to do with drawing: fuel skids, exhaust stacks,
+ *  maintenance crews and spare parts all scale per UNIT, not per
+ *  megawatt.
+ *
+ *  So the prime mover is chosen by the size of the gap. The rule is the
+ *  smallest class whose unit count lands in a buildable band, which
+ *  keeps modular granularity where it is affordable and switches to
+ *  bigger machines only when the count says it has to.
+ *
+ *  This is also why the drawing was unreadable. 434 objects at 9 x 6 ft
+ *  is a smear at any zoom. 48 objects at 45 x 12 ft is a plant.
+ *
+ *  FOOTPRINTS ARE PLANNING FIGURES
+ *  The dimensions below are package-plus-enclosure approximations for
+ *  each class, not vendor drawings, and they exclude fuel skids,
+ *  exhaust, SCR and switchgear, which on a real plant add substantially
+ *  to the footprint. They are labelled that way wherever they print.
+ *  Replace them from a real quote before anything load-bearing.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[PrimeMover]';
+
+  /* Smallest first. Each entry is a class, not a product. */
+  var CLASSES = [
+    { id: 'sofc',    label: 'SOFC fuel cell',        kw: 300,   lf: 9,   wf: 6,
+      abbr: 'FC', fuel: 'natural gas',
+      note: 'Modular, quiet, high efficiency. Granular N+1.' },
+    { id: 'gen_ng',  label: 'Natural-gas genset',    kw: 750,   lf: 14,  wf: 5,
+      abbr: 'NG', fuel: 'natural gas',
+      note: 'Containerised reciprocating set.' },
+    { id: 'recip',   label: 'Reciprocating engine',  kw: 2500,  lf: 45,  wf: 12,
+      abbr: 'RECIP', fuel: 'natural gas',
+      note: 'Package plus enclosure and radiator. Excludes fuel skid and SCR.' },
+    { id: 'recip_l', label: 'Large recip engine',    kw: 10000, lf: 60,  wf: 16,
+      abbr: 'RECIP-L', fuel: 'natural gas',
+      note: 'Powerhouse-scale set. Excludes balance of plant.' },
+    { id: 'turbine', label: 'Aeroderivative turbine', kw: 30000, lf: 90, wf: 26,
+      abbr: 'GT', fuel: 'natural gas',
+      note: 'Generator package. Excludes inlet, exhaust, SCR and fuel compression.' },
+    { id: 'turbine_l', label: 'Large gas turbine',   kw: 50000, lf: 110, wf: 32,
+      abbr: 'GT-L', fuel: 'natural gas',
+      note: 'Generator package only. Balance of plant is substantial.' }
+  ];
+
+  /* The band that makes a plant rather than a smear or a single point of
+     failure. Below the floor there are too few units for N+1 to mean
+     anything; above the ceiling the count stops being buildable and
+     starts being a rendering problem.
+
+     150 is deliberately generous at the top: it keeps a 34 MW gap on
+     115 SOFC blocks, which is a real modular design and the one the
+     reference build uses. */
+  var CFG = { minUnits: 4, maxUnits: 150 };
+
+  function select(gapKw, opts) {
+    opts = opts || {};
+    if (!(gapKw > 0)) return null;
+    var forced = opts.classId;
+    if (forced) {
+      for (var f = 0; f < CLASSES.length; f++) {
+        if (CLASSES[f].id === forced) {
+          return withCount(CLASSES[f], gapKw, 'chosen by hand');
+        }
+      }
+    }
+    var i, c, n;
+    /* Smallest class whose count fits the band. */
+    for (i = 0; i < CLASSES.length; i++) {
+      c = CLASSES[i];
+      n = Math.ceil(gapKw / c.kw);
+      if (n <= CFG.maxUnits && n >= CFG.minUnits) {
+        return withCount(c, gapKw, 'smallest class under ' + CFG.maxUnits + ' units');
+      }
+    }
+    /* Gap too small for any class to reach the floor: take the smallest
+       machine and accept a low count. */
+    if (Math.ceil(gapKw / CLASSES[0].kw) < CFG.minUnits) {
+      return withCount(CLASSES[0], gapKw, 'gap smaller than one full block set');
+    }
+    /* Gap too large for even the biggest: take it and say so. */
+    return withCount(CLASSES[CLASSES.length - 1], gapKw,
+      'gap exceeds the largest class \u2014 count is above what a single plant would carry');
+  }
+
+  function withCount(c, gapKw, why) {
+    var n = Math.ceil(gapKw / c.kw);
+    return {
+      id: c.id, label: c.label, kw: c.kw, lf: c.lf, wf: c.wf,
+      abbr: c.abbr, fuel: c.fuel, note: c.note,
+      units: n, totalKw: n * c.kw, why: why,
+      footprintBasis: 'package plus enclosure, approximate \u2014 excludes balance of plant'
+    };
+  }
+
+  /* ── wire into the sizer ────────────────────────────────────────────── */
+
+  /* The sizer hardcodes DERC_ALT.fuelcell_sofc. Rather than rewrite it,
+     the result is corrected afterward: the gap is the sizer's, the
+     machine that closes it is this module's. */
+  function wrapSize() {
+    if (!root.OmegaCompute || typeof root.OmegaCompute.size !== 'function') return false;
+    if (root.OmegaCompute.size.__prime) return true;
+    var orig = root.OmegaCompute.size;
+    root.OmegaCompute.size = function (cfg) {
+      var r = orig.apply(this, arguments);
+      try {
+        if (r && r.genNeedKw > 0) {
+          var sel = select(r.genNeedKw, cfg || {});
+          if (sel) {
+            /* Redundancy is applied on top of the served count, exactly
+               as the original did. */
+            var rf = 1;
+            try {
+              var red = String((cfg && cfg.redundancy) || 'n1').toLowerCase();
+              rf = red === 'n2' ? 1.15 : red === 'n1' ? 1.0 : 1.0;
+            } catch (e) {}
+            var base = sel.units;
+            var withRed = (String((cfg && cfg.redundancy) || 'n1').toLowerCase() === 'n')
+              ? base : base + 1;      /* N+1 adds one machine, not 15% */
+            r.fcBlocks = withRed;
+            r.fcKw = withRed * sel.kw;
+            r.fcBlockKw = sel.kw;
+            r.fcSpec = { label: sel.label, kw: sel.kw, lf: sel.lf, wf: sel.wf,
+                         abbr: sel.abbr, fuel: sel.fuel };
+            r.primeMover = sel;
+            /* Gas demand scales with the machines actually selected. */
+            if (r.gasMmbtuHr != null && sel.totalKw > 0) {
+              var heat = 0;
+              try { heat = root.OmegaCompute.heatRate ? root.OmegaCompute.heatRate() : 0; } catch (e) {}
+              if (heat > 0) {
+                r.gasMmbtuHr = +((r.fcKw * heat) / 1e6).toFixed(2);
+                r.gasScfh = Math.round(r.gasMmbtuHr * 1e6 / 1020);
+              }
+            }
+          }
+        }
+      } catch (e) { if (root.console) console.warn(TAG, e && e.message); }
+      return r;
+    };
+    root.OmegaCompute.size.__prime = true;
+    if (root.console) console.info(TAG + ' prime mover now scales with the gap');
+    return true;
+  }
+
+  /* ── report it ──────────────────────────────────────────────────────── */
+
+  function describe() {
+    var r = null;
+    try { r = root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute(); } catch (e) {}
+    if (!r || !r.primeMover) return null;
+    var p = r.primeMover;
+    return p.units + ' \u00d7 ' + (p.kw >= 1000 ? (p.kw / 1000) + ' MW' : p.kw + ' kW')
+      + ' ' + p.label + ' \u2014 ' + (p.totalKw / 1000).toFixed(1) + ' MW. '
+      + p.why + '. Footprint is ' + p.footprintBasis + '.';
+  }
+
+  function compare(gapMw) {
+    var kw = (+gapMw || 0) * 1000;
+    var rows = CLASSES.map(function (c) {
+      var n = Math.ceil(kw / c.kw);
+      return {
+        machine: c.label,
+        rating: (c.kw >= 1000 ? (c.kw / 1000) + ' MW' : c.kw + ' kW'),
+        units: n,
+        footprint_ft: c.lf + ' x ' + c.wf,
+        verdict: n > CFG.maxUnits ? 'too many' : n < CFG.minUnits ? 'too few' : 'buildable'
+      };
+    });
+    if (root.console && console.table) console.table(rows);
+    return rows;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      if (wrapSize() || ++n > 40) clearInterval(iv);
+    }, 400);
+    if (root.console) {
+      console.info(TAG + ' ready \u2014 OmegaPrimeMover.compare(gapMw) shows the options');
+    }
+  }
+
+  root.OmegaPrimeMover = {
+    select: select, classes: CLASSES, config: CFG,
+    describe: describe, compare: compare
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
  *  OMEGA PATCH 60 — WHAT FITS HERE
  *  ---------------------------------------------------------------------
  *  Compute Build answers "I need 40 MW, does this site take it?".
