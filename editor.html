@@ -154348,6 +154348,7 @@ if (root.console && console.info) {
     ctrlLabel: 'MASTER CONTROLLER',
     fenceStandoffFt: 12,             /* security fence outside each block */
     minSolarFt: 120,                 /* below this a solar field is noise */
+    solarFields: 4,                  /* open ground is rarely one rectangle */
     grid: 110,                       /* mask cells across the long side   */
     snapFt: 25,                      /* compounds start on this lattice   */
     alignBonusFt: 60,                /* pull toward sharing an edge line  */
@@ -154654,13 +154655,28 @@ if (root.console && console.info) {
       });
     });
 
-    /* Solar takes the largest rectangle still free, found for real. */
+    /* SOLAR GETS EVERY FIELD, NOT THE BIGGEST ONE.
+
+       Taking only the largest free rectangle threw away the rest of the
+       parcel: on a site whose compounds sit in the middle, the open
+       ground is three or four fields, and reporting one of them as "the
+       land available" understated it by a factor of four. Fields are
+       taken in size order until they stop being worth fencing. */
     if (!why) {
-      var free = freeRect(M, taken, CL.gutterFt * P);
-      if (free && (free.x2 - free.x1) > CAMPUS.minSolarFt * P
-               && (free.y2 - free.y1) > CAMPUS.minSolarFt * P) {
-        free.label = 'SOLAR FIELD'; free.kind = 'solar';
-        zones.solar = free;
+      var blocked = taken.slice(), fields = [];
+      for (var f = 0; f < CAMPUS.solarFields; f++) {
+        var free = freeRect(M, blocked, CL.gutterFt * P);
+        if (!free) break;
+        if ((free.x2 - free.x1) < CAMPUS.minSolarFt * P
+         || (free.y2 - free.y1) < CAMPUS.minSolarFt * P) break;
+        free.label = 'SOLAR FIELD' + (fields.length ? ' ' + (fields.length + 1) : '');
+        free.kind = 'solar';
+        fields.push(free);
+        blocked = blocked.concat([free]);
+      }
+      if (fields.length) {
+        zones.solar = fields[0];
+        zones.solarFields = fields;
       }
     }
 
@@ -154886,12 +154902,141 @@ if (root.console && console.info) {
              target: target, forced: forced, obstacles: fences };
   }
 
+  /* ── solar, sized against what it actually displaces ────────────────── */
+
+  /* THE OLD TEST WAS AGAINST THE WRONG NUMBER.
+
+     The engine asked one question — does solar beat the marginal source
+     — and answered it with "gas, if there is a gap". On this site that
+     is $24.5/MWh of fuel against $40 of solar, so solar never got
+     built, on a parcel with sixty spare acres.
+
+     But a compute campus runs both sources at once. The utility serves
+     to its ceiling and gas covers the rest, and at any given midday hour
+     BOTH are running. A megawatt-hour of solar does not displace "the
+     marginal source" in the abstract; it displaces the DEAREST source
+     running at that moment, which here is utility energy at $65, not
+     gas at $25. Solar is worth building right up to the point where the
+     only thing left to displace is the cheap source.
+
+     So the sizing is tiered, in merit order, dearest displaced first:
+
+       tier 1  up to the utility's own load  →  displaces $65/MWh
+       tier 2  up to the gas load            →  displaces fuel + var O&M
+
+     Each tier is built only if solar's levelised cost beats that tier's
+     rate. The array stops where the arithmetic stops paying, and the
+     plan says which tier ended it — that is the difference between "no
+     solar" and "10 MW of solar and here is why not 40".
+
+     TWO ASSUMPTIONS, BOTH STATED. A compute load is flat and far larger
+     than any array here, so every solar kWh is consumed on site and
+     none is exported. And an array sized to a tier's kW-AC is taken to
+     sit inside that tier at every hour it produces; the real overlap is
+     an 8760 question and this is a planning figure. */
+  function solarPlan(ev, input, cfg) {
+    var z = ev.zones.solar;
+    if (input.solar === false) return { built: false, reason: 'not elected' };
+    if (!z) return { built: false, reason: 'no ground left after the compounds' };
+    var E = root.OmegaEngine, P = input.pxPerFt;
+    var fields = ev.zones.solarFields || [z];
+    var polys = [], ac = 0;
+    fields.forEach(function (r) {
+      var cl = E.geom.clipByRect(input.polygon, r);
+      if (cl.length < 3) return;
+      var a = E.geom.area(cl) / (P * P) / 43560;
+      if (a < 0.25) return;
+      polys.push({ poly: cl, ac: a }); ac += a;
+    });
+    if (!polys.length) return { built: false, reason: 'no field big enough to be worth fencing' };
+    var clipped = polys[0].poly;
+
+    var s = ev.sizing;
+    var utilKw = Math.max(0, Math.min(s.utilKw, s.facKw));
+    var gasKw = s.gen ? Math.max(0, Math.min(s.gen.kwTotal, s.facKw - s.utilKw)) : 0;
+    var gasRate = s.gen ? s.gen.fuelPerMwh + (cfg.gasVarOmPerMwh || 0) : 0;
+    var utilRate = cfg.utilityEnergyPerMwh;
+    var lcoe = cfg.solarLcoePerMwh;
+
+    var tiers = [];
+    if (utilKw > 0) tiers.push({ kwAc: utilKw, rate: utilRate, src: 'utility energy' });
+    if (gasKw > 0) tiers.push({ kwAc: gasKw, rate: gasRate, src: 'on-site fuel' });
+    tiers.sort(function (a, b) { return b.rate - a.rate; });
+
+    var wantAc = 0, taken = [], stoppedBy = null;
+    for (var i = 0; i < tiers.length; i++) {
+      if (lcoe < tiers[i].rate) { wantAc += tiers[i].kwAc; taken.push(tiers[i]); }
+      else { stoppedBy = tiers[i]; break; }
+    }
+    if (wantAc <= 0) {
+      return { built: false, acres: ac, polygon: clipped, polygons: polys, kwDc: 0, kwAc: 0, mwhYr: 0,
+        displacesPerMwh: tiers.length ? tiers[0].rate : 0,
+        displaces: tiers.length ? tiers[0].src : 'nothing',
+        lcoePerMwh: lcoe, savingPerYr: 0, shiftKwh: 0,
+        reason: 'solar at $' + lcoe + '/MWh does not beat ' + (tiers.length ? tiers[0].src : 'anything')
+          + ' at $' + Math.round(tiers.length ? tiers[0].rate : 0) + '/MWh \u2014 land left open' };
+    }
+
+    var kwDcWant = wantAc * cfg.solarDcAc;
+    var kwDcLand = ac / cfg.solarAcPerMwDc * 1000;
+    var landBound = kwDcLand < kwDcWant;
+    var kwDc = Math.min(kwDcWant, kwDcLand);
+    var kwAc = kwDc / cfg.solarDcAc;
+
+    /* Energy, and what each megawatt-hour of it saves. The array fills
+       the dearest tier first, so the saving is allocated the same way. */
+    var mwhYr = kwAc * cfg.solarCf * 8760 / 1000 * 1000;   /* kWh basis -> MWh */
+    mwhYr = (kwAc / 1000) * cfg.solarCf * 8760;
+    var left = kwAc, saveYr = 0, mix = [];
+    taken.forEach(function (t) {
+      var share = Math.min(left, t.kwAc); left -= share;
+      if (share <= 0) return;
+      var m = (share / 1000) * cfg.solarCf * 8760;
+      saveYr += m * (t.rate - lcoe);
+      mix.push({ src: t.src, mwhYr: m, rate: t.rate, savePerYr: m * (t.rate - lcoe) });
+    });
+
+    var facMwh = (s.facKw / 1000) * (cfg.loadFactor || 0.9) * 8760;
+    var why = 'solar at $' + lcoe + '/MWh displaces ' + taken[0].src + ' at $'
+      + Math.round(taken[0].rate) + '/MWh';
+    if (landBound) why += ' \u2014 land-bound at ' + Math.round(ac) + ' ac, not economics';
+    else if (stoppedBy) why += ' \u2014 stopped where the next megawatt would only displace '
+      + stoppedBy.src + ' at $' + Math.round(stoppedBy.rate) + '/MWh, under its own cost';
+    else why += ' \u2014 the whole load is covered in daylight';
+
+    /* Storage only earns a shift where solar would otherwise spill, and a
+       flat compute load larger than the array never spills. Said out
+       loud rather than sized to zero in silence. */
+    var surplusKw = Math.max(0, kwAc - s.facKw);
+    var shiftKwh = (cfg.shiftSolar && surplusKw > 0) ? surplusKw * 4 : 0;
+
+    return {
+      built: true, polygon: clipped, polygons: polys, fields: polys.length, acres: ac,
+      pvInverters: Math.max(1, Math.ceil(kwAc / cfg.yard.pvinv.kwAcEach)),
+      kwDc: kwDc, kwAc: kwAc, mwhYr: mwhYr,
+      offsetPct: facMwh > 0 ? mwhYr / facMwh * 100 : 0,
+      displacesPerMwh: taken[0].rate, displaces: taken[0].src,
+      lcoePerMwh: lcoe, savingPerYr: saveYr, tiers: mix,
+      landBound: landBound, stoppedBy: stoppedBy ? stoppedBy.src : null,
+      shiftKwh: shiftKwh,
+      shiftNote: shiftKwh > 0 ? 'shifting the daytime surplus into the evening'
+        : 'no shift: the array never exceeds the load, so nothing spills',
+      reason: why
+    };
+  }
+
   /* ── entry ──────────────────────────────────────────────────────────── */
 
   function design(input, overrides) {
     var E = root.OmegaEngine;
     var cfg = Object.assign({}, E.DEFAULTS, overrides || {});
     if (overrides && overrides.rideMin != null) cfg.rideMin = +overrides.rideMin;
+    /* Fuel is not the whole cost of a running engine. Oil, filters,
+       top-end work and the overhaul reserve are per-MWh too, and leaving
+       them out makes on-site generation look cheaper than it is against
+       everything it competes with. Planning figure; replace it with the
+       O&M contract when there is one. */
+    if (cfg.gasVarOmPerMwh == null) cfg.gasVarOmPerMwh = 6;
     var errors = [];
     if (!input.polygon || input.polygon.length < 3) errors.push('no boundary');
     if (!(input.pxPerFt > 0)) errors.push('no scale');
@@ -154907,7 +155052,7 @@ if (root.console && console.info) {
       ev = evaluate(+input.itMw || 40, input, cfg);
     }
 
-    var sol = E.solarPlan(ev, input, cfg);
+    var sol = solarPlan(ev, input, cfg);
     if (sol.built && sol.shiftKwh > 0 && ev.sizing.bess) {
       ev.sizing.bess.kwh += sol.shiftKwh;
       ev.sizing.bess.basis += ' + ' + Math.round(sol.shiftKwh).toLocaleString() + ' kWh solar shift';
@@ -155062,6 +155207,20 @@ if (root.console && console.info) {
 
     /* Ties are drawn by the fencing pass too, from the fences that end
        up on the plan rather than from the zones that were planned. */
+
+    /* The adapter lays out the first solar field. The others are real
+       ground too, and leaving them undrawn is how a 31-acre array
+       reports as a 12-acre one. */
+    try {
+      var extra = (plan.solar && plan.solar.polygons) || [];
+      for (var f = 1; f < extra.length; f++) {
+        var lay = root.computeGroundLayout({ boundary: extra[f].poly,
+          exclusions: (root._alExclusions || []) });
+        if (!lay) continue;
+        var sh2 = root.applyGroundLayout(extra[f].poly, lay, root._alExclusions || []);
+        if (sh2) { sh2.omegaCompute = true; sh2.omegaSolarZone = true; }
+      }
+    } catch (e) { if (root.console) console.warn(TAG + ' extra solar fields', e && e.message); }
 
     root._omegaCampusPlan = plan;
     /* Fences, the control yard and the ties, drawn from what is now on
@@ -155292,7 +155451,7 @@ if (root.console && console.info) {
     var gasMwh = Math.max(0, facMwh - solarMwh - gridMwh);
 
     var cGrid = cfg.utilityEnergyPerMwh || 65;
-    var cGas = s.gen ? s.gen.fuelPerMwh : 0;
+    var cGas = s.gen ? s.gen.fuelPerMwh + (cfg.gasVarOmPerMwh || 0) : 0;
     var cSolar = cfg.solarLcoePerMwh || 40;
     var cost = gridMwh * cGrid + gasMwh * cGas + solarMwh * cSolar;
     var blended = facMwh > 0 ? cost / facMwh : 0;
