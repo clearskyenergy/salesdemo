@@ -10588,9 +10588,23 @@ function _ppCollectFleet(){
 
   for(var i=0;i<S.shapes.length;i++){
     var s=S.shapes[i]; if(s.kind!=='assembly' && s.kind!=='bespad') continue;
+    /* Patch 104: THE MASTER CONTROLLER IS NOT A BATTERY.
+       It is drawn as a bespad because that is the only to-scale pad
+       shape in the app, so it was counted as a storage unit with no
+       rating — which on its own was enough to make the fleet report
+       "units placed, 0 kWh" and send every consumer to the fallback. */
+    if(s.omegaController) continue;
     out.units++;
-    var kwh=(s.unitKwh!=null?s.unitKwh:0);
-    var kw =(s.unitKw!=null ?s.unitKw :0);
+    /* TWO FIELD NAMES FOR ONE RATING, AGAIN.
+       The BESS pad tool writes unitKwh/unitKw. The campus builder writes
+       kwh/kw, like every other DER shape in the file. Reading only the
+       first meant a designed campus reported a fleet of containers with
+       no capacity: the rail, the proposal, the spec sheet, the value
+       stack and the BOM all then fell back to the BESS Config dialog,
+       which is empty on a campus project. That is the 0 kWh / 0 kW on
+       the proposal and the blank BESS rows in Results. */
+    var kwh=(s.unitKwh!=null?s.unitKwh:(s.kwh!=null?+s.kwh:0));
+    var kw =(s.unitKw!=null ?s.unitKw :(s.kw!=null ?+s.kw :0));
     var cost=(s.unitCost!=null?s.unitCost:null);
     out.totalKwh+=kwh; out.totalKw+=kw;
     if(cost!=null) out.totalCost+=cost; else out.anyMissingCost=true;
@@ -25868,6 +25882,11 @@ function openProposalExport() {
   // Pre-fill fields from editor
   const addr = document.getElementById('addr-in')?.value || '';
   const proj = document.getElementById('pname')?.value || 'BESS Installation';
+  /* Patch 103: the project type drove the whole cover and defaulted to
+     BESS whatever was drawn, so a compute campus went out as a "Battery
+     Energy Storage System Installation Proposal". Set it from the
+     drawing before the dialog is shown. */
+  try { _proposalTypeAutoselect(); } catch (e) {}
   document.getElementById('prop-address').value = addr;
   document.getElementById('prop-project').value = proj;
   document.getElementById('prop-num').value = 'NX-' + new Date().getFullYear() + '-' + String(Date.now()).slice(-4);
@@ -26025,12 +26044,82 @@ var PROPOSAL_TYPES = {
   bess_ev: { badge:'BESS + EV CHARGING PROPOSAL', title:'Battery Storage &amp;<br>EV Charging<br>Installation Proposal', spec:'BESS + EV Charging Configuration', specNoun:'battery storage and EV charging system', equipLabel:'BESS + EV Equipment',
              intro:'This proposal outlines a combined battery energy storage and EV charging installation including site design, electrical engineering, equipment supply, installation labor, commissioning, and utility interconnection services.' },
   bess_data:{ badge:'BESS + COMPUTE PROPOSAL', title:'Battery Storage &amp;<br>Distributed Compute<br>Installation Proposal', spec:'BESS + Compute Configuration', specNoun:'battery storage and distributed compute system', equipLabel:'BESS + Compute Equipment',
-             intro:'This proposal outlines a combined battery energy storage and distributed compute installation including power design, electrical engineering, equipment supply, installation labor, commissioning, and utility interconnection services.' }
+             intro:'This proposal outlines a combined battery energy storage and distributed compute installation including power design, electrical engineering, equipment supply, installation labor, commissioning, and utility interconnection services.' },
+  /* Patch 103: the list stopped at BESS-shaped projects, so a solar
+     field, a generation plant and a compute campus with on-site
+     generation all had to be issued as a "Battery Energy Storage System
+     Installation Proposal". The cover of a proposal is the first thing
+     read and the last thing remembered; it has to say what the project
+     is. */
+  solar:   { badge:'SOLAR PROPOSAL', title:'Solar PV<br>System<br>Installation Proposal', spec:'PV System Configuration', specNoun:'solar PV system', equipLabel:'PV Equipment',
+             intro:'This proposal outlines a solar PV installation including site design, electrical engineering, module and inverter supply, installation labor, commissioning, and utility interconnection services.' },
+  solar_bess:{ badge:'SOLAR + STORAGE PROPOSAL', title:'Solar PV &amp;<br>Battery Storage<br>Installation Proposal', spec:'PV + Storage Configuration', specNoun:'solar and storage system', equipLabel:'PV + Storage Equipment',
+             intro:'This proposal outlines a combined solar PV and battery energy storage installation including site design, electrical engineering, equipment supply, installation labor, commissioning, and utility interconnection services.' },
+  campus:  { badge:'COMPUTE CAMPUS PROPOSAL', title:'Compute Campus<br>&amp; On-Site Power<br>Development Proposal', spec:'Campus &amp; Power Configuration', specNoun:'compute campus with on-site generation', equipLabel:'Campus Equipment',
+             intro:'This proposal outlines a compute campus with on-site power: load-first sizing against the utility ceiling, firm on-site generation to close the gap, ride-through storage, and the interconnection, civil and permitting work required to build it.' },
+  gen:     { badge:'ON-SITE GENERATION PROPOSAL', title:'On-Site<br>Generation<br>Installation Proposal', spec:'Generation Configuration', specNoun:'on-site generation plant', equipLabel:'Generation Equipment',
+             intro:'This proposal outlines an on-site generation installation including prime mover supply, fuel and electrical balance of plant, installation labor, commissioning, and utility interconnection services.' }
 };
+
+/* What the drawing says this project is. The dropdown still wins if
+   somebody changes it — this only decides what it starts on, because a
+   default that contradicts the drawing is the one nobody notices. */
+function _proposalTypeFromDrawing(){
+  try{
+    var c={pods:0,gen:0,bess:0,pv:0,ev:0};
+    (S.shapes||[]).forEach(function(sh){
+      if(!sh || sh.omegaFence || sh.omegaCampus) return;
+      if(sh.kind==='derdc') c.pods++;
+      else if(sh.kind==='deralt'||sh.kind==='derwind') c.gen++;
+      else if(sh.kind==='bespad'||sh.kind==='assembly') c.bess++;
+      else if(sh.kind==='dersolar') c.pv++;
+      else if(/^ev(post|cab|unit|l2)$/.test(sh.kind||'')) c.ev++;
+    });
+    (S.elements||[]).forEach(function(e){
+      if(!e) return;
+      if(e.loadKind==='datacenter') c.pods++;
+      if(e.bgbRole==='bess') c.bess++;
+    });
+    if(c.pods && (c.gen||c.bess)) return 'campus';
+    if(c.pods && c.bess) return 'bess_data';
+    if(c.pods) return 'data';
+    if(c.gen && !c.pv && !c.bess) return 'gen';
+    if(c.pv && c.bess) return 'solar_bess';
+    if(c.pv) return 'solar';
+    if(c.ev && c.bess) return 'bess_ev';
+    if(c.ev) return 'ev';
+    if(c.bess) return 'bess';
+  }catch(e){}
+  return null;
+}
 function _proposalType(){
   var sel=document.getElementById('prop-type');
   var k=(sel&&sel.value)||'bess';
   return PROPOSAL_TYPES[k]||PROPOSAL_TYPES.bess;
+}
+
+/* Set the dropdown from the drawing the first time the dialog is opened
+   on a project. Touched by the user once, it stays where they put it. */
+function _proposalTypeAutoselect(){
+  var sel=document.getElementById('prop-type');
+  if(!sel || sel.dataset.omegaTouched==='1') return null;
+  var k=_proposalTypeFromDrawing();
+  if(!k || !PROPOSAL_TYPES[k]) return null;
+  sel.value=k;
+  if(!sel.__omegaWatch){
+    sel.addEventListener('change', function(){ sel.dataset.omegaTouched='1'; });
+    sel.__omegaWatch=true;
+  }
+  var host=sel.parentNode;
+  if(host && !document.getElementById('prop-type-why')){
+    var d=document.createElement('div');
+    d.id='prop-type-why';
+    d.style.cssText='font-size:9.5px;color:#8FA3B8;margin-top:4px;line-height:1.5';
+    d.textContent='Set from what is on the drawing. Change it if the proposal is for '
+      + 'something else \u2014 it decides the cover, the badge and the equipment wording.';
+    host.appendChild(d);
+  }
+  return k;
 }
 
 function buildProposalHTML({proj,addr,client,utility,rep,propNum,today,c,bessRows,condRows,sitemapDataUrl}) {
@@ -44775,8 +44864,12 @@ async function exportPermitPDF() {
           <div><label style="font-size:10px;color:#6B8CAE;display:block;margin-bottom:3px">Project Type</label>
             <select id="prop-type" style="width:100%;background:rgba(255,255,255,.06);border:1px solid #1E3A5F;color:#E2EEF9;border-radius:6px;padding:6px 10px;font-size:12px;font-family:inherit">
               <option value="bess">BESS (Battery Storage)</option>
+              <option value="solar">Solar PV</option>
+              <option value="solar_bess">Solar + Storage</option>
               <option value="ev">EV Charging</option>
               <option value="data">Data / Compute</option>
+              <option value="campus">Compute Campus + On-Site Power</option>
+              <option value="gen">On-Site Generation</option>
               <option value="ppa">PPA (Power Purchase Agreement)</option>
               <option value="bess_ev">BESS + EV Charging</option>
               <option value="bess_data">BESS + Data / Compute</option>
@@ -135138,10 +135231,13 @@ function buildGround(site, span){
       wg.position.set(_cx, 0.01, _cz);
       wg.receiveShadow = true;
       V.groundGrp.add(wg);
+      V.__wideGroundOk = true;      /* the clean image is down; no screenshot */
       V.needsRender = true;
     }, undefined, function(){
-      if(window.console) console.warn('[ground] Static Maps refused — enable "Maps Static API" on the key. '
-        + 'Falling back to the frozen capture, which only covers the drawing viewport.');
+      if(window.console) console.warn('[ground] Static Maps refused \u2014 enable "Maps Static API" '
+        + 'on the key. Falling back to the frozen viewport capture, which is holed wherever '
+        + 'a map tile had not finished loading and carries the attribution text in the pixels.');
+      try { if (window.__omegaAddCapturePlane) window.__omegaAddCapturePlane(); } catch(e){}
     });
 
     /* ── AND A WIDER ONE BEHIND IT ──────────────────────────────────────
@@ -135186,6 +135282,41 @@ function buildGround(site, span){
     }, undefined, function(){});
   }
 
+  /* ── THE BLOTCHING IS THE FROZEN CAPTURE ─────────────────────────────
+     Patch 105. Two ground planes were being drawn: a server-rendered
+     Static Maps image, which is one clean picture, and a frozen
+     html2canvas screenshot of the drawing viewport, which is laid ON TOP
+     of it at y=0.02.
+
+     That screenshot is the striping, the offset bands and the giant
+     "Google Imagery" lettering across the ground. html2canvas cannot
+     read map tiles it did not finish loading, so it returns them as
+     holes and half-rows, and it captures the map's own attribution text
+     as part of the picture. Putting it over a clean image can only make
+     the clean image worse.
+
+     So the capture is now a FALLBACK, not an overlay: it is used when
+     Static Maps has no key, no coordinate, or refuses. When the wide
+     image loads, the screenshot is never drawn. */
+  var _capturePlaced = false;
+  function addCapturePlane(){
+    if (_capturePlaced || V.disposed) return;
+    _capturePlaced = true;
+    _loadCapture();
+  }
+  window.__omegaAddCapturePlane = addCapturePlane;
+
+  if (wideSrc && wideSpanFt > 0) {
+    /* Give Static Maps a moment; if it has not produced a plane, fall
+       back rather than leaving the ground bare. */
+    setTimeout(function(){
+      if (!V.disposed && !V.__wideGroundOk) addCapturePlane();
+    }, 6000);
+  } else {
+    addCapturePlane();
+  }
+
+  function _loadCapture(){
   var loader = new THREE.TextureLoader();
   loader.load(src, function(tex){
     if(V.disposed) return;
@@ -135258,6 +135389,8 @@ function buildGround(site, span){
 
     V.needsRender = true;
   }, undefined, function(){ /* image unavailable — the base plane stands in */ });
+  }
+
 }
 
 /* Release the GPU side of a discarded subtree.
