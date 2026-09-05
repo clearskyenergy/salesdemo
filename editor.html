@@ -155771,6 +155771,19 @@ if (root.console && console.info) {
         + 'Nothing is estimated from what is here instead \u2014 an acreage derived from '
         + 'the wrong input is worse than no acreage.</div></div>';
     } else {
+      /* One sentence first. Somebody who reads nothing else should still
+         come away with the number they came for. */
+      body = '<div style="background:rgba(47,181,74,.10);border:1px solid rgba(47,181,74,.4);'
+        + 'border-radius:9px;padding:13px 14px;line-height:1.6;margin-bottom:6px">'
+        + '<div style="font-size:13.5px;font-weight:700;color:#4ADE80">'
+        + n1(m.buildableAc) + ' buildable acres of ' + n1(m.grossAc) + '</div>'
+        + '<div style="font-size:11.5px;color:#E0E0E0;margin-top:5px">'
+        + (m.exclAc > 0 ? n1(m.exclAc) + ' ac excluded and ' : '')
+        + n1(m.setbackAc) + ' ac in the ' + m.setbackFt + ' ft setback. '
+        + (m.compoundAc + m.pvAc > 0
+            ? n1(m.compoundAc + m.pvAc) + ' ac spent, ' + n1(m.openAc) + ' ac still open.'
+            : 'Nothing built on it yet.')
+        + '</div></div>';
       rows(m).forEach(function (r) {
         if (r[1] == null) {
           body += '<div style="font-size:10px;letter-spacing:1.2px;text-transform:uppercase;'
@@ -156089,6 +156102,490 @@ if (root.console && console.info) {
   else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
   if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaSaveCodec;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 82 — ELECTRICAL SIZING
+ *  ---------------------------------------------------------------------
+ *  What RatedPower has that this does not is the electrical layer. The
+ *  app knows how many kW-DC are on the ground and how many acres they
+ *  take. It has never said how many modules are in a string, how many
+ *  strings land on an inverter, or whether the plant can hold the power
+ *  factor the utility will ask for at the point of interconnection.
+ *
+ *  Those are the three questions that turn an area into a design, and
+ *  none of them needs weather data or a licence — they are datasheet
+ *  arithmetic with named code references:
+ *
+ *    STRING LENGTH is bounded at both ends. The high end is the
+ *    open-circuit voltage on the coldest morning of the year, which is
+ *    what NEC 690.7 sizes against, and it must stay under the system
+ *    voltage rating. The low end is the maximum-power voltage on the
+ *    hottest afternoon, which must stay above the inverter's MPPT
+ *    window or the inverter drops off the knee and the array is
+ *    throttled by its own wiring.
+ *
+ *    STRINGS PER INVERTER are bounded by input current: short-circuit
+ *    current at 125% per NEC 690.8(A), against the inverter's maximum
+ *    DC input.
+ *
+ *    REACTIVE CAPABILITY is bounded by the inverters' apparent power.
+ *    An interconnection agreement asks for a power factor at the POI,
+ *    and whether the inverters can hold it is sqrt(S² − P²) against
+ *    P·tan(acos(pf)). If they cannot, the shortfall is a capacitor bank
+ *    somebody has to buy, and finding that out at the study stage is
+ *    the whole point.
+ *
+ *  ON DATASHEETS, AND WHAT THIS WILL NOT DO
+ *  There is no equipment library here with real manufacturer numbers in
+ *  it, because a datasheet value that is close but wrong is worse than
+ *  a blank field — it will be believed. Defaults are GENERIC and are
+ *  labelled generic on the panel, every one of them is editable, and
+ *  the two site temperatures have no default at all: without a record
+ *  low, the cold-voltage check is refused rather than computed against
+ *  a guess. That check is the one that decides whether the array is
+ *  legal.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Electrical]';
+  var LS = 'omega.elec';
+
+  /* Generic planning placeholders. Shapes of modern utility-scale gear,
+     not any particular product. Replace every one from the datasheet
+     before this means anything. */
+  var DEF = {
+    /* module */
+    pMod: 585, vocStc: 53.4, vmpStc: 44.6, iscStc: 13.9, impStc: 13.1,
+    bVoc: -0.25,          /* %/K, temperature coefficient of Voc  */
+    bVmp: -0.31,          /* %/K, temperature coefficient of Vmp  */
+    /* inverter */
+    invKw: 4000, invKva: 4400, vSysMax: 1500, vMppLo: 875, vMppHi: 1350,
+    iDcMax: 12000, pfMin: 0.90,
+    /* site — deliberately empty */
+    tMin: null, tMax: null, tRise: 25,
+    /* system */
+    dcac: 1.25, pfTarget: 0.95
+  };
+
+  function cfg() {
+    var c = {};
+    for (var k in DEF) c[k] = DEF[k];
+    try {
+      var s = JSON.parse(localStorage.getItem(LS) || 'null');
+      if (s) for (var j in s) if (j in c) c[j] = s[j];
+    } catch (e) {}
+    return c;
+  }
+  function save(c) { try { localStorage.setItem(LS, JSON.stringify(c)); } catch (e) {} }
+
+  function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+  function n2(v) { return (Math.round(v * 100) / 100).toFixed(2); }
+  function n0(v) { return Math.round(v).toLocaleString(); }
+
+  /* What the drawing actually holds, so this checks the design rather
+     than being a calculator that happens to sit in the same app. */
+  function fromDrawing() {
+    var kwDc = 0, arrays = 0, pvInv = 0;
+    try {
+      (root.S.shapes || []).forEach(function (sh) {
+        if (!sh) return;
+        if (sh.kind === 'dersolar') { kwDc += +sh.kw || 0; arrays++; }
+        if (sh.omegaYard && /inverter/i.test(String(sh.label || sh.model || ''))) pvInv++;
+      });
+    } catch (e) {}
+    return { kwDc: kwDc, arrays: arrays, pvInv: pvInv };
+  }
+
+  /* ── the arithmetic ─────────────────────────────────────────────────── */
+
+  function size(c, kwDc) {
+    var out = { warnings: [], blocked: [] };
+
+    /* Cold Voc — NEC 690.7. No record low, no answer. */
+    if (c.tMin == null || !isFinite(+c.tMin)) {
+      out.blocked.push('Record low ambient temperature is not set, so the maximum string '
+        + 'length cannot be checked against NEC 690.7. Enter the lowest expected ambient '
+        + 'for this site \u2014 ASHRAE extreme annual minimum is the usual basis.');
+    } else {
+      out.vocCold = c.vocStc * (1 + (c.bVoc / 100) * (+c.tMin - 25));
+      out.nMax = Math.floor(c.vSysMax / out.vocCold);
+      out.vStringCold = null;
+    }
+
+    /* Hot Vmp against the MPPT window. */
+    if (c.tMax == null || !isFinite(+c.tMax)) {
+      out.blocked.push('Maximum ambient temperature is not set, so the minimum string '
+        + 'length cannot be checked against the inverter MPPT window. ASHRAE 0.4% design '
+        + 'dry bulb is the usual basis.');
+    } else {
+      out.tCell = +c.tMax + (+c.tRise || 0);
+      out.vmpHot = c.vmpStc * (1 + (c.bVmp / 100) * (out.tCell - 25));
+      out.nMin = Math.ceil(c.vMppLo / out.vmpHot);
+    }
+
+    if (out.nMax != null && out.nMin != null) {
+      if (out.nMin > out.nMax) {
+        out.blocked.push('No legal string length: the MPPT window needs at least ' + out.nMin
+          + ' modules and the system voltage rating allows at most ' + out.nMax
+          + '. Change the inverter, the module, or the system voltage class.');
+      } else {
+        /* Longest legal string: fewest strings, fewest combiners, least
+           copper. Nothing else in the range is cheaper. */
+        out.n = out.nMax;
+        out.vStringCold = out.n * out.vocCold;
+        out.vStringHot = out.n * out.vmpHot;
+        out.headroomV = c.vSysMax - out.vStringCold;
+        if (out.headroomV < 20) {
+          out.warnings.push('Only ' + n0(out.headroomV) + ' V of margin under the '
+            + c.vSysMax + ' V rating on the coldest morning. A colder year than the one '
+            + 'used here puts the array over.');
+        }
+        out.stringKw = out.n * c.pMod / 1000;
+      }
+    }
+
+    /* Strings, inverters, and the DC/AC that results. */
+    if (out.n && kwDc > 0) {
+      out.strings = Math.ceil(kwDc / out.stringKw);
+      out.modules = out.strings * out.n;
+      out.kwDcActual = out.modules * c.pMod / 1000;
+
+      out.iString = c.iscStc * 1.25;                 /* NEC 690.8(A) */
+      out.stringsPerInvCurrent = Math.floor(c.iDcMax / out.iString);
+      /* A 2% tolerance on the ceiling. Without it, an array that lands
+         0.04% over the DC/AC target adds a whole second inverter and
+         halves the ratio — a rounding sliver deciding a megawatt of
+         equipment. */
+      out.invByPower = Math.max(1, Math.ceil(out.kwDcActual / (c.invKw * c.dcac) - 0.02));
+      out.stringsPerInv = Math.ceil(out.strings / Math.max(1, out.invByPower));
+      if (out.stringsPerInv > out.stringsPerInvCurrent) {
+        out.invByCurrent = Math.ceil(out.strings / out.stringsPerInvCurrent);
+        out.inverters = out.invByCurrent;
+        out.invBoundBy = 'DC input current';
+      } else {
+        out.inverters = out.invByPower;
+        out.invBoundBy = 'the ' + n2(c.dcac) + ' DC/AC target';
+      }
+      out.stringsPerInv = Math.ceil(out.strings / out.inverters);
+      out.kwAc = out.inverters * c.invKw;
+      out.dcacActual = out.kwAc > 0 ? out.kwDcActual / out.kwAc : 0;
+      if (out.dcacActual > c.dcac + 0.02) {
+        out.warnings.push('The resulting DC/AC is ' + n2(out.dcacActual) + ', above the '
+          + n2(c.dcac) + ' target \u2014 clipping will be higher than assumed.');
+      }
+    }
+
+    /* Reactive capability at the POI. */
+    if (out.kwAc > 0) {
+      var P = out.kwAc;
+      var pf = Math.min(0.999, Math.max(0.5, +c.pfTarget || 0.95));
+      out.qRequired = P * Math.tan(Math.acos(pf));
+      out.sTotal = out.inverters * c.invKva;
+      out.qAvailable = Math.sqrt(Math.max(0, out.sTotal * out.sTotal - P * P));
+      out.pfAtRating = P / out.sTotal;
+      out.qShortfall = Math.max(0, out.qRequired - out.qAvailable);
+      if (out.qShortfall > 0) {
+        out.warnings.push('The inverters cannot hold ' + n2(pf) + ' power factor at full '
+          + 'output: ' + n0(out.qShortfall) + ' kvar short. That is a capacitor bank or a '
+          + 'larger inverter apparent-power rating, and it belongs in the interconnection '
+          + 'application.');
+      }
+    }
+    return out;
+  }
+
+  /* ── panel ──────────────────────────────────────────────────────────── */
+
+  var IN = 'width:100%;background:#0B1626;border:1px solid #3A3A3A;color:#E0E0E0;'
+    + 'border-radius:6px;padding:7px;font-size:12px;font-family:inherit;box-sizing:border-box';
+  var LB = 'font-size:9.5px;color:#9A9A9A;text-transform:uppercase;letter-spacing:.5px;'
+    + 'display:block;margin-bottom:3px';
+  var HD = 'font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:#8B7BD8;'
+    + 'margin:16px 0 8px';
+
+  function field(id, label, val, step) {
+    return '<div style="flex:1;min-width:96px"><label style="' + LB + '">' + label + '</label>'
+      + '<input id="' + id + '" type="number" step="' + (step || 'any') + '" value="'
+      + (val == null ? '' : val) + '" style="' + IN + '"></div>';
+  }
+
+  function open() {
+    var c = cfg(), d = fromDrawing();
+    var old = document.getElementById('omega-elec');
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+
+    var w = document.createElement('div');
+    w.id = 'omega-elec';
+    w.style.cssText = 'position:fixed;inset:0;z-index:9200;background:rgba(0,0,0,.6);'
+      + 'display:flex;align-items:center;justify-content:center;padding:20px';
+
+    /* THE ANSWER FIRST, THE DATASHEET LAST.
+
+       The first version of this dialog opened as fifteen numeric fields
+       and a button, which is the same mistake the nine-button Prepare
+       Site panel was. Almost nobody changes a temperature coefficient;
+       almost everybody wants to know how many modules are in a string.
+
+       So the panel opens on the answer, recomputes as you type, and
+       keeps the equipment datasheet folded away until somebody actually
+       wants it. When it cannot answer, it asks for exactly the two
+       numbers it is missing and nothing else. */
+    w.innerHTML = '<div style="background:#1E1E1E;border:1px solid #3A3A3A;border-radius:12px;'
+      + 'padding:22px;max-width:600px;width:100%;max-height:90vh;overflow:auto;font-family:inherit">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center">'
+      + '<div style="font-size:17px;font-weight:700;color:#E0E0E0">Electrical sizing</div>'
+      + '<button data-a="x" style="background:none;border:none;color:#9A9A9A;font-size:20px;'
+      + 'cursor:pointer;line-height:1">\u00d7</button></div>'
+      + '<div style="font-size:11px;color:#9A9A9A;margin:4px 0 14px;line-height:1.5">'
+      + 'How the array wires up, and whether it can hold the power factor the utility '
+      + 'will ask for.</div>'
+
+      /* The three things that change per project, and nothing else. */
+      + '<div style="display:flex;gap:8px">'
+      + field('el-kw', 'kW-DC', d.kwDc > 0 ? Math.round(d.kwDc) : '', '1')
+      + field('el-tmin', 'Record low \u00b0C', c.tMin, '0.5')
+      + field('el-tmax', 'Design high \u00b0C', c.tMax, '0.5')
+      + '</div>'
+      + '<div style="font-size:10px;color:#9A9A9A;margin-top:5px;line-height:1.5">'
+      + (d.kwDc > 0
+          ? 'DC size read from ' + d.arrays + ' drawn array' + (d.arrays === 1 ? '' : 's') + '. '
+          : 'No solar drawn \u2014 type a DC size. ')
+      + 'Temperatures: ASHRAE extreme annual minimum and 0.4% design dry bulb for this site.</div>'
+
+      + '<div id="el-out" style="margin-top:16px"></div>'
+
+      /* Everything below is folded away. */
+      + '<details style="margin-top:16px"><summary style="cursor:pointer;font-size:11.5px;'
+      + 'color:#8B7BD8;outline:none">Targets \u00b7 DC/AC, power factor, cell rise</summary>'
+      + '<div style="display:flex;gap:8px;margin-top:10px">'
+      + field('el-dcac', 'DC/AC target', c.dcac, '0.01')
+      + field('el-pf', 'POI power factor', c.pfTarget, '0.01')
+      + field('el-trise', 'Cell rise K', c.tRise, '1')
+      + '</div></details>'
+
+      + '<details style="margin-top:8px"><summary style="cursor:pointer;font-size:11.5px;'
+      + 'color:#8B7BD8;outline:none">Equipment \u2014 generic placeholders, not a product</summary>'
+      + '<div style="font-size:10.5px;color:#F59E0B;margin:8px 0 10px;line-height:1.5">'
+      + 'These are shapes of modern utility-scale gear, not any particular module or '
+      + 'inverter. Replace each from the datasheet before quoting anything.</div>'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+      + field('el-pmod', 'Pmax W', c.pMod, '1') + field('el-voc', 'Voc V', c.vocStc, '0.1')
+      + field('el-vmp', 'Vmp V', c.vmpStc, '0.1') + field('el-isc', 'Isc A', c.iscStc, '0.1')
+      + '</div><div style="display:flex;gap:8px;margin-top:6px">'
+      + field('el-bvoc', '\u03b2Voc %/K', c.bVoc, '0.01')
+      + field('el-bvmp', '\u03b2Vmp %/K', c.bVmp, '0.01')
+      + '</div>'
+      + '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">'
+      + field('el-ikw', 'Inverter kW', c.invKw, '1') + field('el-ikva', 'kVA', c.invKva, '1')
+      + field('el-vsys', 'Vsys max', c.vSysMax, '10')
+      + '</div><div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">'
+      + field('el-vlo', 'MPPT min V', c.vMppLo, '5')
+      + field('el-vhi', 'MPPT max V', c.vMppHi, '5')
+      + field('el-idc', 'Max DC A', c.iDcMax, '10')
+      + '</div></details>'
+
+      + '<div style="display:flex;gap:8px;margin-top:18px">'
+      + '<button data-a="copy" style="flex:1;padding:11px;background:rgba(255,255,255,.05);'
+      + 'border:1px solid #3A3A3A;color:#E0E0E0;border-radius:8px;cursor:pointer;'
+      + 'font-family:inherit;font-size:12px">Copy the numbers</button>'
+      + '<button data-a="x" style="padding:11px 18px;background:#2FB54A;color:#0A1628;'
+      + 'border:none;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;'
+      + 'font-size:12px">Done</button></div></div>';
+
+    var lastText = '';
+
+    function read() {
+      var g = function (id) {
+        var e = document.getElementById(id);
+        if (!e || e.value === '') return null;
+        var v = parseFloat(e.value);
+        return isFinite(v) ? v : null;
+      };
+      var c2 = cfg();
+      c2.dcac = g('el-dcac') || 1.25; c2.pfTarget = g('el-pf') || 0.95;
+      c2.tMin = g('el-tmin'); c2.tMax = g('el-tmax'); c2.tRise = g('el-trise') || 0;
+      c2.pMod = g('el-pmod') || DEF.pMod; c2.vocStc = g('el-voc') || DEF.vocStc;
+      c2.vmpStc = g('el-vmp') || DEF.vmpStc; c2.iscStc = g('el-isc') || DEF.iscStc;
+      c2.bVoc = g('el-bvoc'); if (c2.bVoc == null) c2.bVoc = DEF.bVoc;
+      c2.bVmp = g('el-bvmp'); if (c2.bVmp == null) c2.bVmp = DEF.bVmp;
+      c2.invKw = g('el-ikw') || DEF.invKw; c2.invKva = g('el-ikva') || DEF.invKva;
+      c2.vSysMax = g('el-vsys') || DEF.vSysMax;
+      c2.vMppLo = g('el-vlo') || DEF.vMppLo; c2.vMppHi = g('el-vhi') || DEF.vMppHi;
+      c2.iDcMax = g('el-idc') || DEF.iDcMax;
+      return { c: c2, kw: g('el-kw') || 0 };
+    }
+
+    function run() {
+      var r = read(); save(r.c);
+      var s = size(r.c, r.kw);
+      var host = document.getElementById('el-out');
+      var h = '', lines = [];
+      var row = function (k, v, basis) {
+        lines.push(k + ': ' + v + '  (' + basis + ')');
+        h += '<div style="display:flex;justify-content:space-between;align-items:baseline;'
+          + 'gap:12px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05)">'
+          + '<div style="flex:1"><div style="font-size:12.5px;color:#E0E0E0">' + k + '</div>'
+          + '<div style="font-size:10px;color:#9A9A9A;margin-top:1px">' + basis + '</div></div>'
+          + '<div style="font-size:13px;font-weight:700;color:#4ADE80;white-space:nowrap">'
+          + v + '</div></div>';
+      };
+
+      /* ONE SENTENCE FIRST. Somebody who reads nothing else should still
+         come away with the answer, or with the one thing to go and find
+         out. */
+      if (s.blocked.length) {
+        var need = [];
+        if (r.c.tMin == null) need.push('the record low');
+        if (r.c.tMax == null) need.push('the design high');
+        h += '<div style="background:rgba(245,158,11,.10);border:1px solid rgba(245,158,11,.45);'
+          + 'border-radius:9px;padding:13px 14px;line-height:1.6">'
+          + '<div style="font-size:13px;font-weight:700;color:#F5C871">Needs '
+          + (need.length ? need.join(' and ') : 'a site temperature') + '</div>'
+          + '<div style="font-size:11.5px;color:#E0E0E0;margin-top:5px">'
+          + (r.kw > 0 ? '' : 'Add a DC size, and ')
+          + 'fill the temperature box' + (need.length > 1 ? 'es' : '')
+          + ' above. String length is decided by voltage on the coldest morning and the '
+          + 'hottest afternoon, so a guess there is a guess about whether the array is legal '
+          + '\u2014 nothing is assumed for you.</div></div>';
+        s.blocked.forEach(function (b) { lines.push('BLOCKED: ' + b); });
+      } else if (s.n && s.strings) {
+        var pfOk = !(s.qShortfall > 0);
+        h += '<div style="background:rgba(47,181,74,.10);border:1px solid rgba(47,181,74,.4);'
+          + 'border-radius:9px;padding:13px 14px;line-height:1.6">'
+          + '<div style="font-size:13.5px;font-weight:700;color:#4ADE80">'
+          + s.n + ' modules per string \u00b7 ' + n0(s.strings) + ' strings \u00b7 '
+          + n0(s.inverters) + ' inverter' + (s.inverters === 1 ? '' : 's') + '</div>'
+          + '<div style="font-size:11.5px;color:#E0E0E0;margin-top:5px">'
+          + n0(s.modules) + ' modules, ' + n1(s.kwDcActual / 1000) + ' MW-DC on '
+          + n1(s.kwAc / 1000) + ' MW-AC, DC/AC ' + n2(s.dcacActual) + '. '
+          + (pfOk
+              ? 'The inverters can hold ' + n2(r.c.pfTarget) + ' power factor on their own.'
+              : 'They are ' + n0(s.qShortfall) + ' kvar short of ' + n2(r.c.pfTarget)
+                + ' power factor \u2014 that is a capacitor bank.')
+          + '</div></div>';
+        lines.push(s.n + ' modules/string, ' + s.strings + ' strings, ' + s.inverters + ' inverters');
+      }
+      if (s.n) {
+        h += '<div style="' + HD + '">String</div>';
+        row('Modules per string', String(s.n),
+            'longest legal string \u2014 fewest strings, least copper');
+        row('Voc at ' + n1(r.c.tMin) + '\u00b0C',
+            n0(s.vStringCold) + ' V',
+            'NEC 690.7 \u00b7 ' + n0(s.headroomV) + ' V under the ' + n0(r.c.vSysMax) + ' V rating');
+        row('Vmp at ' + n0(s.tCell) + '\u00b0C cell', n0(s.vStringHot) + ' V',
+            'must stay above the MPPT floor; minimum legal string is ' + s.nMin + ' modules');
+      }
+      if (s.strings) {
+        h += '<div style="' + HD + '">Array</div>';
+        row('Strings', n0(s.strings), n0(s.modules) + ' modules \u00b7 '
+            + n0(s.kwDcActual) + ' kW-DC as built out');
+        row('Inverters', n0(s.inverters), 'bound by ' + s.invBoundBy
+            + ' \u00b7 ' + s.stringsPerInv + ' strings each, ' + s.stringsPerInvCurrent
+            + ' allowed by current');
+        row('String current', n1(s.iString) + ' A', 'Isc \u00d7 125%, NEC 690.8(A)');
+        row('DC/AC as built', n2(s.dcacActual), n0(s.kwAc) + ' kW-AC installed');
+      }
+      if (s.qRequired != null) {
+        h += '<div style="' + HD + '">Reactive at the POI</div>';
+        row('Required', n0(s.qRequired) + ' kvar',
+            'to hold ' + n2(r.c.pfTarget) + ' pf at ' + n0(s.kwAc) + ' kW');
+        row('Inverter capability', n0(s.qAvailable) + ' kvar',
+            '\u221a(S\u00b2 \u2212 P\u00b2) at ' + n0(s.sTotal) + ' kVA total');
+        row(s.qShortfall > 0 ? 'Shortfall' : 'Margin',
+            n0(s.qShortfall > 0 ? s.qShortfall : s.qAvailable - s.qRequired) + ' kvar',
+            s.qShortfall > 0 ? 'capacitor bank or larger inverters' : 'inverters alone can hold it');
+      }
+      if (s.warnings.length) {
+        h += '<div style="' + HD + ';color:#F59E0B">Worth knowing</div>';
+        s.warnings.forEach(function (x) {
+          lines.push('NOTE: ' + x);
+          h += '<div style="font-size:11px;color:#F0B323;line-height:1.6;margin-bottom:6px">'
+            + x + '</div>';
+        });
+      }
+      h += '<div style="font-size:10px;color:#9A9A9A;margin-top:12px;line-height:1.6">'
+        + 'Code references are the sizing basis, not a compliance statement. The AHJ and the '
+        + 'inverter manufacturer both get a say, and the equipment values above are generic '
+        + 'until you replace them.</div>';
+      host.innerHTML = h;
+      lastText = 'ELECTRICAL SIZING\n\n' + lines.join('\n');
+      if (root.console && console.table && s.n) {
+        console.table([{ modulesPerString: s.n, strings: s.strings, modules: s.modules,
+          inverters: s.inverters, kwDc: Math.round(s.kwDcActual), kwAc: Math.round(s.kwAc),
+          dcac: +n2(s.dcacActual), kvarRequired: Math.round(s.qRequired || 0),
+          kvarAvailable: Math.round(s.qAvailable || 0) }]);
+      }
+      root._omegaElec = s;
+      return s;
+    }
+
+    /* Recompute as you type. A dialog with a Calculate button makes the
+       person do the bookkeeping of remembering to press it, and every
+       number here is cheap enough to redo on a keystroke. */
+    var pending = null;
+    w.addEventListener('input', function () {
+      clearTimeout(pending);
+      pending = setTimeout(function () { try { run(); } catch (e) {} }, 220);
+    });
+
+    w.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-a]') : null;
+      if (!b) { if (e.target === w) w.remove(); return; }
+      var a = b.getAttribute('data-a');
+      if (a === 'copy') {
+        if (!lastText) run();
+        try { navigator.clipboard.writeText(lastText); b.textContent = 'Copied'; } catch (er) {}
+        return;
+      }
+      w.remove();
+    });
+    document.body.appendChild(w);
+    setTimeout(run, 0);
+    return true;
+  }
+
+  /* ── ribbon ─────────────────────────────────────────────────────────── */
+
+  function inject() {
+    var host = document.getElementById('rb-buildable') || document.getElementById('rb-trace-exclusion');
+    if (!host || !host.parentNode) return false;
+    if (document.getElementById('rb-elec')) return true;
+    var b = document.createElement('button');
+    b.className = 'rbtn'; b.id = 'rb-elec';
+    b.title = 'Electrical Sizing \u2014 modules per string against NEC 690.7 and the MPPT '
+      + 'window, strings per inverter against 690.8(A), and the reactive capability at the POI.';
+    b.onclick = open;
+    b.innerHTML = '<span class="rb-ico" style="color:#F59E0B">\u26a1</span>'
+      + '<span class="rb-lbl">Electrical<br>Sizing</span>';
+    host.parentNode.insertBefore(b, host.nextSibling);
+    try { if (root.OmegaMode && root.OmegaMode.keep) root.OmegaMode.keep(/rb-elec/); } catch (e) {}
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () { if (inject() || ++n > 40) clearInterval(iv); }, 500);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaElectrical.open()');
+  }
+
+  root.OmegaElectrical = {
+    open: open, size: size, defaults: DEF, config: cfg,
+    fromDrawing: fromDrawing,
+    /* Console use: OmegaElectrical.check({tMin:-12, tMax:38}) */
+    check: function (over) {
+      var c = cfg();
+      if (over) for (var k in over) if (k in c) c[k] = over[k];
+      var s = size(c, fromDrawing().kwDc);
+      if (root.console) console.log(s);
+      return s;
+    }
+  };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaElectrical;
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
