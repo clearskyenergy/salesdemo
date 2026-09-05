@@ -53886,19 +53886,44 @@ function sebCompute(){
   var surplus=Math.max(0, genTotal-consumeTotal);
   var reliancePct=consumeTotal>0 ? (gridImport/consumeTotal*100) : 0;
 
-  /* SELF-SUPPLY IS NOT AN ANNUAL SUBTRACTION.
+  /* SELF-SUPPLY IS NOT AN ANNUAL SUBTRACTION, AND COINCIDENCE IS NOT ONE
+     NUMBER.
+
      min(generation, consumption) says solar at noon serves a load at
-     midnight. What generation can actually serve is the part that happens
-     while the load is on, plus whatever the battery can time-shift. Both
-     bounds are reported: the annual-energy figure, and the coincidence
-     limited one that is the honest planning number. */
-  var overlap=_sebNum('genLoadOverlap',0.50);        /* editable */
-  var coincidentGen=genTotal*overlap;
+     midnight, so a coincidence factor is right in principle. Applying
+     ONE factor to all generation is not: a gas engine or a fuel cell is
+     dispatchable and runs when the load runs, so its coincidence is 1.0
+     by definition. Multiplying it by 0.5 said half of a 100 MW prime
+     mover cannot reach a flat 24/7 compute load, which is not a
+     modelling assumption, it is wrong.
+
+     Patch 101: firm generation is coincident; solar and wind carry the
+     editable overlap. That figure was the reason a site with 310 GWh of
+     generation against 315 GWh of load reported 49% self-supplied.
+
+     AND THE TWO NUMBERS HAVE TO ADD UP. Grid reliance was computed on
+     the ANNUAL net while self-supply was computed on the COINCIDENT
+     energy — two different models side by side on the same panel, which
+     is why 2% and 49% did not make 100%. The load is served by
+     something: whatever DER cannot cover at the moment it is needed is
+     imported. One model now, and the two shares sum to 100 by
+     construction. Generation that cannot be used is reported separately
+     as curtailment, because that is what it is. */
+  var overlap=_sebNum('genLoadOverlap',0.50);        /* solar + wind only */
+  var firmGen=genGas;                                /* dispatchable, follows load */
+  var variableGen=genSolar+genWind;
+  var coincidentGen=firmGen + variableGen*overlap;
   var shiftable=bessThroughput*rte;                  /* delivered, not stored */
   var selfBound=Math.min(genTotal, consumeTotal);
-  var selfSupply=Math.min(selfBound, coincidentGen+shiftable);
+  var selfSupply=Math.min(consumeTotal, coincidentGen+shiftable);
   var selfPct=consumeTotal>0 ? (selfSupply/consumeTotal*100) : 0;
   var selfPctEnergyOnly=consumeTotal>0 ? (selfBound/consumeTotal*100) : 0;
+  /* Re-derive the import from the same model, so the panel cannot show
+     two answers to one question. */
+  gridImport=Math.max(0, consumeTotal-selfSupply);
+  reliancePct=consumeTotal>0 ? (gridImport/consumeTotal*100) : 0;
+  var curtailed=Math.max(0, genTotal-selfSupply);
+  surplus=curtailed;
   /* $ */
   var gridCost=_sebNum('gridCost',(typeof DER_GRID_COST!=='undefined'?DER_GRID_COST:0.11));
   var importBill=gridImport*gridCost;
@@ -53908,7 +53933,8 @@ function sebCompute(){
     gen:{ solar:genSolar, wind:genWind, gas:genGas, total:genTotal },
     con:{ dc:dcKwh, chg:chgKwh, fac:facKwh, bessLoss:bessLossKwh, extra:siteExtra, total:consumeTotal },
     selfSupply:selfSupply, selfSupplyEnergyOnly:selfBound,
-    gridImport:gridImport, surplus:surplus,
+    gridImport:gridImport, surplus:surplus, curtailed:curtailed,
+    firmGen:firmGen, variableGen:variableGen,
     reliancePct:reliancePct, selfPct:selfPct, selfPctEnergyOnly:selfPctEnergyOnly,
     gridCost:gridCost, importBill:importBill,
     dcDuty:dcDuty, chgDuty:chgDuty, cyclesYr:cyclesYr, rte:rte,
@@ -53919,9 +53945,14 @@ function sebCompute(){
         +loadFactor+' load factor' : 'No facility load placed \u2014 consumption is DER losses only'),
       (cyclesYr>=365 ? cyclesYr+' full cycles a year is a merchant duty; a peak-shaving '
         +'battery cycles far less and its round-trip loss is smaller' : null),
-      'Self-supply is bounded by generation that coincides with load ('+(overlap*100).toFixed(0)
-        +'%) plus what the battery can shift \u2014 an annual subtraction alone would credit '
-        +'midday solar against a midnight load.'
+      'Firm generation is treated as coincident with load \u2014 an engine or a fuel cell '
+        +'runs when the load runs. Solar and wind carry the '+(overlap*100).toFixed(0)
+        +'% overlap, because an annual subtraction alone would credit midday solar against '
+        +'a midnight load.',
+      (curtailed>0 ? Math.round(curtailed).toLocaleString()+' kWh/yr is generated and cannot be '
+        +'used at the moment it is produced \u2014 curtailed, or exported if the '
+        +'interconnection allows it.' : null),
+      'Grid reliance and self-supply are two shares of the same load and sum to 100%.'
     ].filter(Boolean)
   };
 }
@@ -148095,23 +148126,85 @@ if (root.console && console.info) {
     } catch (e) {}
 
     try {
-      var r = root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute();
-      if (r) {
-        add('Load', 'IT load', (r.itKw / 1000).toFixed(1), 'MW', 'Entered');
-        add('Load', 'PUE', (+r.pue).toFixed(2), '', 'Entered');
+      /* Patch 100: this read ONE source — OmegaLayoutFacts.compute() —
+         which is in-memory only. After a reload, or on this project
+         where the save is failing, it returns null and the export loses
+         Load, Generation, Fuel, Storage, Layout and the screening
+         verdict in one go. That is the report that "shrank": twenty-three
+         rows became nine, and the nine that survived are the ones read
+         from the drawing and the geocoder rather than from memory.
+
+         The sizing now falls back to the saved project, then to a
+         reconstruction from the pods on the drawing, and the basis
+         column says which of the three it was. A figure rebuilt from
+         geometry is worth printing as long as it is labelled; a missing
+         section is not. */
+      var r = null, rBasis = 'Entered';
+      try { r = root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute(); } catch (e) {}
+      if (!r || !(r.facKw > 0)) {
+        r = root._omegaComputeLast || null;
+        if (r) rBasis = 'Last design in this session';
+      }
+      if (!r || !(r.facKw > 0)) {
+        try { r = (S.omegaSizing && S.omegaSizing.facKw > 0) ? S.omegaSizing : null; } catch (e) {}
+        if (r) rBasis = 'Saved with the project';
+      }
+      if (!r || !(r.facKw > 0)) {
+        try { r = root.OmegaRecord && root.OmegaRecord.reconstruct(); } catch (e) {}
+        if (r) rBasis = 'Rebuilt from the pods on the drawing';
+      }
+      if (r && r.facKw > 0) {
+        var _pue = +r.pue || (r.itKw ? r.facKw / r.itKw : 0);
+        add('Load', 'IT load', (r.itKw / 1000).toFixed(1), 'MW', rBasis);
+        if (_pue > 0) add('Load', 'PUE', _pue.toFixed(2), '',
+          rBasis === 'Rebuilt from the pods on the drawing'
+            ? 'Assumed \u2014 no saved sizing' : rBasis);
         add('Load', 'Facility load', (r.facKw / 1000).toFixed(1), 'MW', 'IT x PUE');
         add('Load', 'Gap to close on site', ((r.genNeedKw || 0) / 1000).toFixed(1), 'MW',
           'Facility less utility ceiling');
         if (r.fcBlocks) {
-          add('Generation', 'SOFC blocks', r.fcBlocks, 'count', r.redundancy || 'N+1');
+          add('Generation', 'Generation blocks', r.fcBlocks, 'count', r.redundancy || 'N+1');
           add('Generation', 'On-site generation', (r.fcKw / 1000).toFixed(1), 'MW', 'Block count x rating');
-          add('Fuel', 'Gas demand', r.gasMmbtuHr, 'MMBtu/hr', 'Heat rate at full generation');
-          add('Fuel', 'Approximate volume', r.gasScfh || '', 'scfh', '~1,020 Btu/scf');
+          if (r.gasMmbtuHr) add('Fuel', 'Gas demand', r.gasMmbtuHr, 'MMBtu/hr', 'Heat rate at full generation');
+          if (r.gasScfh) add('Fuel', 'Approximate volume', r.gasScfh, 'scfh', '~1,020 Btu/scf');
         }
         if (r.bessKwh) {
-          add('Storage', 'Ride-through', r.bessKwh, 'kWh', r.rideMin + ' min on critical bus');
+          add('Storage', 'Ride-through', r.bessKwh, 'kWh',
+            (r.rideMin ? r.rideMin + ' min on critical bus' : 'On critical bus'));
         }
+      } else {
+        add('Load', 'Compute sizing', 'not available', '',
+          'No design in memory, none saved, and no pods on the drawing to rebuild from');
       }
+
+      /* What is physically on the plan, whatever the sizing says. This
+         section cannot go blank while the equipment is visible. */
+      try {
+        var _c = { pods: 0, podKw: 0, gen: 0, genKw: 0, bess: 0, bessKwh: 0, pv: 0, pvKw: 0, fences: 0, ft: 0 };
+        (S.shapes || []).forEach(function (sh) {
+          if (!sh) return;
+          if (sh.omegaFence || sh.omegaCampus) {
+            if (sh.kind === 'rect' && sh.campusLabel) _c.fences++;
+            return;
+          }
+          if (sh.kind === 'derdc') { _c.pods++; _c.podKw += +sh.kw || 0; }
+          else if (sh.kind === 'deralt') { _c.gen++; _c.genKw += +sh.kw || 0; }
+          else if (sh.kind === 'bespad' && !sh.omegaController) { _c.bess++; _c.bessKwh += +sh.kwh || 0; }
+          else if (sh.kind === 'dersolar') { _c.pv++; _c.pvKw += +sh.kw || 0; }
+        });
+        (S.conduits || []).forEach(function (x) {
+          if (x && (x.omegaCampus || x.omegaFence)) _c.ft += +x.ftLen || 0;
+        });
+        if (_c.pods) add('Drawn', 'Compute pods', _c.pods + ' \u00b7 '
+          + Math.round(_c.podKw).toLocaleString() + ' kW IT', 'count', 'Counted on the drawing');
+        if (_c.gen) add('Drawn', 'Generation units', _c.gen + ' \u00b7 '
+          + Math.round(_c.genKw).toLocaleString() + ' kW', 'count', 'Counted on the drawing');
+        if (_c.bess) add('Drawn', 'Battery containers', _c.bess + ' \u00b7 '
+          + Math.round(_c.bessKwh).toLocaleString() + ' kWh', 'count', 'Counted on the drawing');
+        if (_c.pv) add('Drawn', 'Solar', Math.round(_c.pvKw).toLocaleString(), 'kW-DC', 'Counted on the drawing');
+        if (_c.fences) add('Drawn', 'Fenced compounds', _c.fences, 'count', 'Counted on the drawing');
+        if (_c.ft) add('Drawn', 'MV duct bank', Math.round(_c.ft), 'ft', 'Measured from the drawn routing');
+      } catch (e) {}
       var gm = root.OmegaGas && root.OmegaGas.main();
       if (gm) {
         add('Fuel', 'Nearest transmission main', gm.miles, 'mi',
@@ -159087,7 +159180,84 @@ if (root.console && console.info) {
 
   /* ── 2. the legend, put back whenever it is rewritten ───────────────── */
 
+  /* SELF-CONTAINED, ON PURPOSE.
+
+     This used to call OmegaCampus.legendRows(). If that module fails to
+     load for any reason — an engine that is not there yet, an exception
+     in an unrelated part of it — the legend silently loses its census
+     and there is nothing on screen to say why. The count of what is on
+     the drawing is too basic to depend on the design engine, so it is
+     computed here from S.shapes and nothing else. */
+  function ownRows() {
+    var S = S_(); if (!S || !S.shapes) return '';
+    var P = 0; try { P = +S.pxPerFt > 0 ? +S.pxPerFt : 0; } catch (e) {}
+    var g = {}, order = [], fences = 0, fenceAc = 0, ctrl = 0, subs = [];
+    var add = function (key, mark, name, kw, kwh) {
+      if (!g[key]) { g[key] = { mark: mark, name: name, n: 0, kw: 0, kwh: 0 }; order.push(key); }
+      g[key].n++; g[key].kw += (+kw || 0); g[key].kwh += (+kwh || 0);
+    };
+    S.shapes.forEach(function (sh) {
+      if (!sh) return;
+      if (sh.omegaController) { ctrl++; return; }
+      if (sh.omegaFence || sh.omegaCampus) {
+        if (sh.kind === 'rect' && sh.campusLabel && sh.pts && sh.pts.length > 1) {
+          fences++;
+          if (P > 0) fenceAc += Math.abs(sh.pts[1].x - sh.pts[0].x) / P
+                              * Math.abs(sh.pts[1].y - sh.pts[0].y) / P / 43560;
+        }
+        return;
+      }
+      if (sh.kind === 'derdc') add('pod', '\u25a6', sh.model || 'Compute pod', sh.kw);
+      else if (sh.kind === 'deralt') add('gen' + (sh.model || ''), '\u2299', sh.model || 'Generator', sh.kw);
+      else if (sh.kind === 'derwind') add('wind', '\u2732', sh.model || 'Wind turbine', sh.kw);
+      else if (sh.kind === 'bespad') add('bess' + (sh.model || ''), '\u25ac',
+        sh.model || 'BESS container', sh.kw, sh.kwh);
+      else if (sh.kind === 'dersolar') add('pv', '\u2600', 'Solar array', sh.kw);
+      else if (sh.kind === 'substation') subs.push(sh);
+      else if (sh.omegaYard) add('yard' + (sh.label || sh.kind), '\u25a3',
+        sh.label || sh.model || 'Tie-in equipment');
+    });
+    var out = [];
+    subs.forEach(function (sb) {
+      out.push({ mark: '\u26a1', name: sb.label || 'Utility substation',
+        note: (isFinite(+sb.capMw) ? (+sb.capMw).toLocaleString() + ' MW firm' : 'capacity not set')
+          + (sb.voltage ? ' \u00b7 ' + sb.voltage : '') });
+    });
+    order.forEach(function (k) {
+      var G = g[k], parts = [];
+      if (G.kw) parts.push(Math.round(G.kw).toLocaleString() + ' kW');
+      if (G.kwh) parts.push(Math.round(G.kwh).toLocaleString() + ' kWh');
+      out.push({ mark: G.mark, name: G.name + (G.n > 1 ? ' \u00d7' + G.n : ''),
+                 note: parts.join(' \u00b7 ') || 'counted on the drawing' });
+    });
+    if (fences) out.push({ mark: '\u25a2', name: 'Fenced compounds \u00d7' + fences,
+      note: fenceAc > 0 ? (Math.round(fenceAc * 10) / 10).toFixed(1) + ' ac inside the fence lines'
+                        : 'security fence' });
+    if (ctrl) out.push({ mark: '\u25c9', name: 'Master controller',
+      note: 'the pad in the middle \u2014 every compound ties here' });
+    var ft = 0, runs = 0;
+    (S.conduits || []).forEach(function (c) {
+      if (!c || !(c.omegaCampus || c.omegaFence)) return;
+      runs++; ft += (+c.ftLen || 0);
+    });
+    if (runs) out.push({ mark: '\u2500', name: 'MV duct bank \u00d7' + runs,
+      note: Math.round(ft).toLocaleString() + ' ft trenched' });
+    if (!out.length) return '';
+    var h = '';
+    out.forEach(function (r) {
+      h += '<div class="li"><div class="li-ico" style="font-size:11px">' + r.mark + '</div>'
+        + '<span class="li-txt">' + r.name
+        + (r.note ? '<br><span style="font-size:8px;opacity:.65">' + r.note + '</span>' : '')
+        + '</span></div>';
+    });
+    return '<div style="font-size:8px;font-weight:800;letter-spacing:.8px;opacity:.6;'
+      + 'margin:8px 0 4px">ON THE DRAWING</div>' + h;
+  }
+
   function rows() {
+    var own = '';
+    try { own = ownRows(); } catch (e) {}
+    if (own) return own;
     try {
       if (root.OmegaCampus && typeof root.OmegaCampus.legendRows === 'function') {
         return root.OmegaCampus.legendRows() || '';
@@ -159139,7 +159309,7 @@ if (root.console && console.info) {
   }
 
   root.OmegaRecord = {
-    reconstruct: reconstruct, restore: restore, persist: persist,
+    legendRows: ownRows, reconstruct: reconstruct, restore: restore, persist: persist,
     repaintLegend: function () {
       var host = document.getElementById('lgd-items');
       var old = host && host.querySelector('[' + MARK + ']');
@@ -159277,6 +159447,560 @@ if (root.console && console.info) {
   if (typeof document === 'undefined') { /* node */ }
   else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 98 — THE SUBSTATION SLAB, FOR GOOD
+ *  ---------------------------------------------------------------------
+ *  The opaque chip behind the substation label has now been removed
+ *  twice: once by replacing _renderSubstation at runtime (patch 78) and
+ *  once at the source (patch 95). It is still on the drawing, which
+ *  means at least one path is drawing it that neither of those covers —
+ *  a cached render, an older build, or a second renderer somewhere in
+ *  the file.
+ *
+ *  Rather than hunt a third candidate, this removes the object by what
+ *  it IS rather than by who drew it: inside a substation's group, an
+ *  opaque dark filled rectangle is never legitimate. The yard wash is
+ *  translucent amber; the fence is a stroke with no fill; the equipment
+ *  is strokes. Anything filled near-black is a label backing, and a
+ *  label backing that can outlive its own text is the whole bug.
+ *
+ *  It runs on every render of a substation and once over whatever is
+ *  already on the canvas, and it puts the haloed label back if the
+ *  render that drew the slab did not.
+ *
+ *  DETAIL AT LOW ZOOM. A yard drawn at 20 px wide cannot show a gantry,
+ *  a bus and a transformer bank; it shows them as noise. Below that
+ *  size the internals are dropped and the fence line is left, which is
+ *  what a substation looks like on a zoomed-out plan.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[SubstationClean]';
+  var NS = 'http://www.w3.org/2000/svg';
+
+  /* Near-black, and opaque enough to hide what is under it. */
+  function isSlab(el) {
+    if (!el || el.tagName !== 'rect') return false;
+    var f = (el.getAttribute('fill') || '').toLowerCase();
+    if (!f || f === 'none' || f === 'transparent') return false;
+    var m = f.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+))?/);
+    var r, g, b, a = 1;
+    if (m) { r = +m[1]; g = +m[2]; b = +m[3]; a = m[4] === undefined ? 1 : +m[4]; }
+    else if (/^#([0-9a-f]{6})$/.test(f)) {
+      var h = f.slice(1);
+      r = parseInt(h.slice(0, 2), 16); g = parseInt(h.slice(2, 4), 16); b = parseInt(h.slice(4, 6), 16);
+    } else return false;
+    /* Dark and mostly opaque. The yard wash is amber at 0.07, so it
+       cannot be caught by this even by accident. */
+    return (r + g + b) / 3 < 60 && a >= 0.5;
+  }
+
+  function clean(sh) {
+    var g = document.querySelector('#csvg [data-shid="' + sh.id + '"]');
+    if (!g) return 0;
+    var rects = g.querySelectorAll('rect'), killed = 0;
+    for (var i = 0; i < rects.length; i++) {
+      if (isSlab(rects[i])) { rects[i].parentNode.removeChild(rects[i]); killed++; }
+    }
+    if (!killed) return 0;
+
+    /* If the label was drawn on top of the slab, it is now floating over
+       the yard it was covering. Move it out and give it a halo so it
+       does not need a box to be readable. */
+    var texts = g.querySelectorAll('text');
+    if (texts.length) {
+      var a = sh.pts[0], b = sh.pts[1];
+      var x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+      var h = Math.abs(b.y - a.y);
+      var fs = 12;
+      try { fs = Math.max(9, Math.min(22, (+root.S.pxPerFt > 0 ? +root.S.pxPerFt : 6) * 2)); } catch (e) {}
+      var above = y > fs * 2.8;
+      for (var t = 0; t < texts.length; t++) {
+        var el = texts[t];
+        el.setAttribute('x', x);
+        el.setAttribute('y', (above ? y - fs * 1.5 : y + h + fs * 1.4) + t * fs * 1.12);
+        el.setAttribute('text-anchor', 'start');
+        el.setAttribute('stroke', 'rgba(6,10,18,0.92)');
+        el.setAttribute('stroke-width', Math.max(2, fs * 0.28));
+        el.setAttribute('stroke-linejoin', 'round');
+        el.setAttribute('paint-order', 'stroke fill');
+        el.setAttribute('class', 'omega-utillabel');
+      }
+    }
+    return killed;
+  }
+
+  /* Internals are noise below a size a plan could read them at. */
+  function simplify(sh) {
+    var g = document.querySelector('#csvg [data-shid="' + sh.id + '"]');
+    if (!g || !sh.pts || sh.pts.length < 2) return;
+    var w = Math.abs(sh.pts[1].x - sh.pts[0].x), h = Math.abs(sh.pts[1].y - sh.pts[0].y);
+    var small = Math.min(w, h) < 26;
+    var kids = g.childNodes;
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (!k.tagName) continue;
+      /* Keep the first rect (the yard) and drop the rest when tiny. */
+      if (small && (k.tagName === 'circle' || k.tagName === 'line'
+        || (k.tagName === 'text'))) {
+        k.setAttribute('display', 'none');
+      } else if (!small && k.getAttribute && k.getAttribute('display') === 'none') {
+        k.removeAttribute('display');
+      }
+    }
+  }
+
+  function sweep() {
+    var n = 0;
+    try {
+      (root.S.shapes || []).forEach(function (sh) {
+        if (!sh || sh.kind !== 'substation') return;
+        n += clean(sh); simplify(sh);
+      });
+    } catch (e) {}
+    return n;
+  }
+
+  function wrap() {
+    if (typeof root.renderShape !== 'function' || root.renderShape.__subclean) return false;
+    var orig = root.renderShape;
+    root.renderShape = function (sh) {
+      var r = orig.apply(this, arguments);
+      try {
+        if (sh && sh.kind === 'substation') { clean(sh); simplify(sh); }
+      } catch (e) {}
+      return r;
+    };
+    root.renderShape.__subclean = true;
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      wrap();
+      var k = sweep();
+      if (k && root.console) {
+        console.info(TAG + ' removed ' + k + ' opaque label backing(s) from the substation \u2014 '
+          + 'the label now sits outside the yard.');
+      }
+      if (++n > 60) clearInterval(iv);
+    }, 800);
+  }
+
+  root.OmegaSubstationClean = { sweep: sweep, clean: clean, isSlab: isSlab };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaSubstationClean;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 99 — WHICH BUILD IS THIS
+ *  ---------------------------------------------------------------------
+ *  Several rounds of "it is still doing X" have ended with the fix being
+ *  present in the file and absent from the browser. That is not a bug in
+ *  the fix, it is a bug in not being able to tell, and it costs a round
+ *  trip every time.
+ *
+ *  This stamps the build and lists what is actually loaded. One line in
+ *  the console on every load, one command to see the inventory, and the
+ *  stamp on the title bar so a screenshot carries it. From here a
+ *  screenshot answers the question by itself.
+ *
+ *  The list is derived from the modules that are really on window, not
+ *  from a hand-kept version number that can be edited without the code
+ *  changing. A module that failed to load reports as missing, which is
+ *  the case that matters — a patch that threw on the way in looks
+ *  exactly like a patch that was never deployed, and until now both
+ *  looked like "the fix does not work".
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Build]';
+
+  /* Each entry is a thing somebody has asked for, and the object that
+     has to exist for it to work. */
+  var MODULES = [
+    { n: 77, k: 'OmegaCampus',        what: 'campus layout, quadrants, energy mix' },
+    { n: 78, k: 'OmegaSubstationSymbol', what: 'substation symbol without the label slab' },
+    { n: 80, k: 'OmegaBuildable',     what: 'buildable area' },
+    { n: 81, k: 'OmegaSaveCodec',     what: 'save: nested arrays + size pruning' },
+    { n: 82, k: 'OmegaElectrical',    what: 'string and inverter sizing' },
+    { n: 83, k: 'OmegaFenceTie',      what: 'fences, controller, duct bank, wheel passthrough' },
+    { n: 85, k: 'OmegaPrimeMover',    what: 'prime mover picker and custom turbine' },
+    { n: 86, k: 'OmegaPpf',           what: 'drawing scale recovery' },
+    { n: 88, k: 'OmegaComputeCost',   what: 'compute enclosure vs accelerator capex' },
+    { n: 89, k: 'OmegaOverview',      what: 'report overview and confirmed ledger' },
+    { n: 91, k: 'OmegaRecord',        what: 'compute facts survive reload, legend census' },
+    { n: 94, k: 'OmegaRibbon',        what: 'empty ribbon groups hidden' },
+    { n: 98, k: 'OmegaSubstationClean', what: 'substation label slab removal' }
+  ];
+
+  /* Source-level edits have no module to look for, so they are detected
+     by a marker that only exists once the edit is in. */
+  var EDITS = [
+    { n: 79, what: '3D: fenced compounds and substation yard',
+      test: function () { try { return !!(root.OmegaSiteVis && root.OmegaSiteVis.ARCH
+        && root.OmegaSiteVis.ARCH['compound']); } catch (e) { return false; } } },
+    { n: 84, what: '3D: compute is its own archetype',
+      test: function () { try { return !!(root.OmegaSiteVis && root.OmegaSiteVis.ARCH
+        && root.OmegaSiteVis.ARCH['compute-pod']); } catch (e) { return false; } } },
+    { n: 87, what: 'Compute and Fence layer chips',
+      test: function () {
+        try {
+          for (var i = 0; i < root.O2_CLASSES.length; i++) {
+            if (root.O2_CLASSES[i].key === 'compute') return true;
+          }
+        } catch (e) {}
+        try {
+          var t = document.querySelectorAll('#o2-toolbar, .o2-cls');
+          for (var j = 0; j < t.length; j++) {
+            if (/Compute/.test(t[j].textContent || '')) return true;
+          }
+        } catch (e) {}
+        return false;
+      } },
+    { n: 93, what: 'cost engine sees compute pods',
+      test: function () {
+        try { return !!(root.omegaDataCenterROM
+          && /derdc/.test(root.omegaDataCenterROM.toString())); } catch (e) { return false; }
+      } },
+    { n: 96, what: 'one-line includes compute and generation',
+      test: function () {
+        try { return !!(root.omegaOneLineExport
+          && /Compute bus/.test(root.omegaOneLineExport.toString())); } catch (e) { return false; }
+      } }
+  ];
+
+  function inventory() {
+    var rows = [], missing = [];
+    MODULES.forEach(function (m) {
+      var ok = !!root[m.k];
+      rows.push({ patch: m.n, loaded: ok, provides: m.what });
+      if (!ok) missing.push(m.n);
+    });
+    EDITS.forEach(function (e) {
+      var ok = false; try { ok = !!e.test(); } catch (x) {}
+      rows.push({ patch: e.n, loaded: ok, provides: e.what });
+      if (!ok) missing.push(e.n);
+    });
+    rows.sort(function (a, b) { return a.patch - b.patch; });
+    return { rows: rows, missing: missing, total: rows.length,
+             present: rows.length - missing.length };
+  }
+
+  function stamp() {
+    var inv = inventory();
+    var txt = 'build ' + inv.present + '/' + inv.total;
+    var el = document.getElementById('omega-build-stamp');
+    if (!el) {
+      var host = document.getElementById('pn-title');
+      host = host && host.parentNode ? host.parentNode : document.body;
+      el = document.createElement('span');
+      el.id = 'omega-build-stamp';
+      el.style.cssText = 'font-size:9px;letter-spacing:.5px;opacity:.5;margin-left:10px;'
+        + 'font-family:ui-monospace,Menlo,monospace;cursor:pointer;vertical-align:middle';
+      el.title = 'Patches loaded in this browser. Click for the list.';
+      el.onclick = function () { report(); };
+      host.appendChild(el);
+    }
+    el.textContent = txt;
+    el.style.color = inv.missing.length ? '#F59E0B' : '#4ADE80';
+    return inv;
+  }
+
+  function report() {
+    var inv = inventory();
+    if (root.console) {
+      console.info(TAG + ' ' + inv.present + ' of ' + inv.total + ' patches loaded in THIS browser'
+        + (inv.missing.length ? ' \u2014 missing: ' + inv.missing.join(', ')
+          + '. A patch that threw on the way in looks identical to one that was never deployed; '
+          + 'check the console above for the error before assuming the file is stale.' : '.'));
+      if (console.table) console.table(inv.rows); else console.log(inv.rows);
+    }
+    return inv;
+  }
+
+  function boot() {
+    setTimeout(function () {
+      var inv = stamp();
+      if (root.console) {
+        console.info(TAG + ' ' + inv.present + '/' + inv.total + ' patches loaded'
+          + (inv.missing.length ? ' \u2014 missing ' + inv.missing.join(', ')
+            + ' \u2014 run OmegaBuild.report()' : ' \u2014 OmegaBuild.report() for the list'));
+      }
+    }, 4000);
+    var n = 0, iv = setInterval(function () { stamp(); if (++n > 10) clearInterval(iv); }, 3000);
+  }
+
+  root.OmegaBuild = { report: report, inventory: inventory, stamp: stamp };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 102 — THE SUBSTATION LOOKUP HAS NO DATA SOURCE
+ *  ---------------------------------------------------------------------
+ *  "No substations returned within 5 mi" on a site 2.3 miles from a
+ *  138 kV tap is not a radius problem. The lookup queries two hardcoded
+ *  ArcGIS feature services that were HIFLD Open mirrors, and HIFLD Open
+ *  was SHUT DOWN by DHS in August 2025. The layers behind those two URLs
+ *  are gone or unreachable, every failure is swallowed by a bare
+ *  .catch(), and the user is told to widen a radius that cannot help.
+ *
+ *  Three changes, in order of how much they matter:
+ *
+ *  1. A SOURCE THAT IS STILL PUBLISHED. OpenStreetMap is added as a
+ *     fallback through Overpass. It is maintained, it has no key, it
+ *     covers every country, and power=substation is one of the better
+ *     tagged features in it. It is not HIFLD — coverage is uneven and a
+ *     rural tap may be missing — so results say which source they came
+ *     from and OSM results are labelled as community data rather than
+ *     presented as the same thing.
+ *
+ *  2. THE FAILURE HAS TO NAME ITSELF. Each source now reports what
+ *     actually happened: HTTP status, a network or CORS block, or a
+ *     genuine zero-result. "The endpoint may be unreachable" was true
+ *     and useless; "HIFLD mirror 1: HTTP 400, mirror 2: network blocked,
+ *     OSM: 3 found" is something somebody can act on.
+ *
+ *  3. WIDEN AUTOMATICALLY. The original comment says "widen the radius
+ *     if empty" and the code never did. It now retries at 2x and 4x
+ *     before giving up, and says it did.
+ *
+ *  WHAT THIS DOES NOT DO: invent a capacity. Everything downstream of
+ *  the lookup is still a voltage-class prior, still labelled a screening
+ *  estimate, and still worth less than a will-serve letter.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Substation]';
+
+  /* Mirrors that still publish the HIFLD substation layer. Order is
+     "most likely to answer" — they are checked in turn and the first
+     with features wins. */
+  var MIRRORS = [
+    { url: 'https://services.arcgis.com/G4S1dGvn7PIgYd6Y/ArcGIS/rest/services/HIFLD_electric_power_substations/FeatureServer/0',
+      name: 'HIFLD mirror (ORNL hosted)' },
+    { url: 'https://services5.arcgis.com/HDRa0B57OVrv2E1q/ArcGIS/rest/services/Electric_Substations/FeatureServer/0',
+      name: 'HIFLD mirror (Electric_Substations)' },
+    { url: 'https://services6.arcgis.com/tboeqGwETr5ppr5Q/arcgis/rest/services/HFILD_Electric_Utility_Layers/FeatureServer/0',
+      name: 'HIFLD mirror (utility layers)' }
+  ];
+
+  var OVERPASS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter'
+  ];
+
+  var diag = [];
+
+  function note(src, msg) { diag.push({ source: src, result: msg }); }
+
+  function haversineMi(a1, o1, a2, o2) {
+    var R = 3958.8, t = Math.PI / 180;
+    var dA = (a2 - a1) * t, dO = (o2 - o1) * t;
+    var h = Math.sin(dA / 2) * Math.sin(dA / 2)
+      + Math.cos(a1 * t) * Math.cos(a2 * t) * Math.sin(dO / 2) * Math.sin(dO / 2);
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+  }
+
+  /* ── ArcGIS ─────────────────────────────────────────────────────────── */
+
+  function queryArc(m, lat, lng, radMi) {
+    var dLat = radMi / 69;
+    var dLng = radMi / (69 * Math.max(0.15, Math.cos(lat * Math.PI / 180)));
+    var geom = [(lng - dLng), (lat - dLat), (lng + dLng), (lat + dLat)].join(',');
+    var q = m.url + '/query?f=json&where=1%3D1&outFields=*&returnGeometry=true&outSR=4326'
+      + '&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects'
+      + '&geometry=' + encodeURIComponent(geom) + '&resultRecordCount=60';
+    return fetch(q).then(function (r) {
+      if (!r.ok) { note(m.name, 'HTTP ' + r.status); return []; }
+      return r.json().then(function (j) {
+        if (j && j.error) { note(m.name, 'service error ' + (j.error.code || '') + ' ' + (j.error.message || '')); return []; }
+        var f = (j && j.features) || [];
+        if (!f.length) { note(m.name, 'reachable, 0 features in the box'); return []; }
+        note(m.name, f.length + ' found');
+        return f.map(function (ft) {
+          var a = ft.attributes || {}, g = ft.geometry || {};
+          var kv = a.MAX_VOLT != null ? a.MAX_VOLT
+                 : (a.max_volt != null ? a.max_volt : (a.VOLTAGE != null ? a.VOLTAGE : null));
+          return {
+            name: a.NAME || a.name || a.SUB_NAME || 'Substation',
+            owner: a.OWNER || a.owner || a.COMPANY || '',
+            state: a.STATE || a.state || '', status: a.STATUS || a.status || '',
+            kv: (isFinite(+kv) && +kv > 0) ? +kv : null,
+            kvMin: null, lat: g.y, lng: g.x, src: m.url, sourceName: m.name
+          };
+        }).filter(function (s) { return isFinite(s.lat) && isFinite(s.lng); });
+      });
+    }).catch(function (e) {
+      note(m.name, 'network or CORS blocked' + (e && e.message ? ' (' + e.message + ')' : ''));
+      return [];
+    });
+  }
+
+  /* ── OpenStreetMap ──────────────────────────────────────────────────── */
+
+  function queryOsm(lat, lng, radMi, idx) {
+    idx = idx || 0;
+    if (idx >= OVERPASS.length) return Promise.resolve([]);
+    var m = Math.round(radMi * 1609.34);
+    var q = '[out:json][timeout:25];('
+      + 'node["power"="substation"](around:' + m + ',' + lat + ',' + lng + ');'
+      + 'way["power"="substation"](around:' + m + ',' + lat + ',' + lng + ');'
+      + ');out center 60;';
+    return fetch(OVERPASS[idx], { method: 'POST', body: 'data=' + encodeURIComponent(q),
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
+      .then(function (r) {
+        if (!r.ok) { note('OpenStreetMap', 'HTTP ' + r.status); return queryOsm(lat, lng, radMi, idx + 1); }
+        return r.json().then(function (j) {
+          var els = (j && j.elements) || [];
+          var out = els.map(function (e) {
+            var la = e.lat != null ? e.lat : (e.center && e.center.lat);
+            var lo = e.lon != null ? e.lon : (e.center && e.center.lon);
+            var t = e.tags || {};
+            /* OSM voltage is in volts and can be a semicolon list; the
+               highest is the one that sets the class. */
+            var kv = null;
+            if (t.voltage) {
+              var vals = String(t.voltage).split(';').map(function (v) { return parseFloat(v); })
+                .filter(function (v) { return isFinite(v) && v > 0; });
+              if (vals.length) kv = Math.max.apply(null, vals) / 1000;
+            }
+            return { name: t.name || t.operator || 'Substation (OSM)',
+                     owner: t.operator || '', state: '', status: '',
+                     kv: kv, kvMin: null, lat: la, lng: lo,
+                     src: 'openstreetmap', sourceName: 'OpenStreetMap',
+                     community: true };
+          }).filter(function (s) { return isFinite(s.lat) && isFinite(s.lng); });
+          note('OpenStreetMap', out.length ? out.length + ' found' : 'reachable, none tagged nearby');
+          return out;
+        });
+      })
+      .catch(function (e) {
+        note('OpenStreetMap', 'blocked' + (e && e.message ? ' (' + e.message + ')' : ''));
+        return queryOsm(lat, lng, radMi, idx + 1);
+      });
+  }
+
+  /* ── the search ─────────────────────────────────────────────────────── */
+
+  function decorate(rows, lat, lng) {
+    var S = root.OmegaSubstation;
+    rows.forEach(function (s) {
+      s.miles = +haversineMi(lat, lng, s.lat, s.lng).toFixed(2);
+      var b = Math.atan2(Math.sin((s.lng - lng) * Math.PI / 180) * Math.cos(s.lat * Math.PI / 180),
+        Math.cos(lat * Math.PI / 180) * Math.sin(s.lat * Math.PI / 180)
+        - Math.sin(lat * Math.PI / 180) * Math.cos(s.lat * Math.PI / 180)
+          * Math.cos((s.lng - lng) * Math.PI / 180)) * 180 / Math.PI;
+      s.bearing = (b + 360) % 360;
+      var dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+      s.dir = dirs[Math.round(s.bearing / 45) % 8];
+      try { if (S && S.headroomMw) s.band = S.headroomMw(s.kv); } catch (e) {}
+    });
+    rows.sort(function (a, b2) { return a.miles - b2.miles; });
+    return rows.slice(0, 8);
+  }
+
+  function findNearest(lat, lng, radMi) {
+    diag = [];
+    var tries = [radMi, radMi * 2, radMi * 4];
+
+    function arcRound(r, i) {
+      i = i || 0;
+      if (i >= MIRRORS.length) return Promise.resolve([]);
+      return queryArc(MIRRORS[i], lat, lng, r).then(function (rows) {
+        return rows.length ? rows : arcRound(r, i + 1);
+      });
+    }
+
+    function attempt(k) {
+      if (k >= tries.length) return Promise.resolve([]);
+      var r = tries[k];
+      if (k > 0) note('search', 'nothing at ' + tries[k - 1] + ' mi \u2014 widened to ' + r + ' mi');
+      return arcRound(r).then(function (rows) {
+        if (rows.length) return rows;
+        return queryOsm(lat, lng, r).then(function (osm) {
+          if (osm.length) return osm;
+          return attempt(k + 1);
+        });
+      });
+    }
+
+    return attempt(0).then(function (rows) { return decorate(rows, lat, lng); });
+  }
+
+  function why() {
+    if (!diag.length) return 'No search has run yet.';
+    return diag.map(function (d) { return d.source + ': ' + d.result; }).join(' \u00b7 ');
+  }
+
+  function install() {
+    var S = root.OmegaSubstation;
+    if (!S || S.__patched102) return false;
+    S.findNearest = findNearest;
+    S.diagnostics = function () {
+      if (root.console) console.table ? console.table(diag) : console.log(diag);
+      return diag.slice();
+    };
+    S.why = why;
+    S.endpoints = function () {
+      return MIRRORS.map(function (m) { return m.url; }).concat(OVERPASS);
+    };
+    S.addEndpoint = function (u) { if (u) MIRRORS.unshift({ url: u, name: 'custom' }); return S.endpoints(); };
+    S.__patched102 = true;
+
+    /* The panel's own message is written before any of this ran, so it
+       gets the real reason appended once a search finishes. */
+    var origSearch = S.search;
+    if (typeof origSearch === 'function' && !origSearch.__patched102) {
+      S.search = function () {
+        var r = origSearch.apply(this, arguments);
+        setTimeout(function () {
+          try {
+            var el = document.getElementById('ssl-status');
+            if (el && /No substations returned/.test(el.textContent || '')) {
+              el.innerHTML = el.innerHTML + '<div style="margin-top:6px;color:#8FA3B8;'
+                + 'font-size:9.5px;line-height:1.5">' + why()
+                + '<br>HIFLD Open was retired by DHS in August 2025, so the original layer may '
+                + 'simply no longer be served. OpenStreetMap is tried as a fallback; if it also '
+                + 'found nothing, enter the substation by hand \u2014 the drawn one is what sets '
+                + 'the ceiling anyway.</div>';
+            }
+          } catch (e) {}
+        }, 2500);
+        return r;
+      };
+      S.search.__patched102 = true;
+      try { root.openSubstationLookup = S.open; } catch (e) {}
+    }
+    if (root.console) {
+      console.info(TAG + ' lookup now tries 3 HIFLD mirrors then OpenStreetMap, '
+        + 'widens the radius twice, and reports why \u2014 OmegaSubstation.diagnostics()');
+    }
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () { if (install() || ++n > 60) clearInterval(iv); }, 500);
+  }
+
+  root.OmegaSubstationSources = { findNearest: findNearest, why: why,
+                                  mirrors: MIRRORS, overpass: OVERPASS, install: install };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaSubstationSources;
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
