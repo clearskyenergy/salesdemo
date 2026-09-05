@@ -155342,20 +155342,32 @@ if (root.console && console.info) {
     b.style.color = on ? '#C4B5FD' : '#9A9A9A';
   }
 
+  /* ── RETIRED (Patch 120) ──────────────────────────────────────────────
+     This mode rearranged the whole ribbon -- six tabs hidden, every
+     Analyze panel that was not its own hidden, tools moved between pages
+     -- to give compute its own home. The Compute TAB (Patch 114) does
+     that without taking anything away, so the mode is now a second thing
+     doing the same job, and it was the cause of the last two faults:
+     panels missing under Pro, and an empty Build group.
+
+     Nothing is deleted. The switch is gone, a session that had it
+     enabled is restored on load and the stored preference is cleared, so
+     no one is left in a curated ribbon they cannot get out of. The
+     machinery stays reachable as OmegaComputeMode.on() for anyone who
+     wants it back, and every other module's guard against it still
+     works. */
   function boot() {
-    var want = false;
-    try { want = localStorage.getItem(KEY) === '1'; } catch (e) {}
-    var n = 0, iv = setInterval(function () {
-      badge();
-      /* Other patches inject their buttons on timers, so a mode restored
-         from storage waits for them before gathering. */
-      if (want && !on && document.getElementById('rb-load-screen')) { enable(); }
-      if (++n > 40) {
-        clearInterval(iv);
-        if (want && !on) enable();     /* go without the late arrivals */
-      }
-    }, 500);
-    if (root.console) console.info(TAG + ' ready \u2014 OmegaComputeMode.on()');
+    var stale = false;
+    try { stale = localStorage.getItem(KEY) === '1'; } catch (e) {}
+    try { localStorage.removeItem(KEY); } catch (e) {}
+    var b = document.getElementById('omg-compute');
+    if (b && b.parentNode) b.parentNode.removeChild(b);
+    if (on) disable();
+    if (root.console) {
+      console.info(TAG + ' retired \u2014 the Compute tab replaces it'
+        + (stale ? '; the stored preference was cleared' : '')
+        + '. OmegaComputeMode.on() still works if you want it.');
+    }
   }
 
   root.OmegaComputeMode = {
