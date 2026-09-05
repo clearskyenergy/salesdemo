@@ -1769,17 +1769,13 @@ window.onerror = function(msg, src, line, col, err) {
       <div class="rpanel-body"></div>
       <div class="rpanel-cap">1 &middot; Site</div>
     </div>
-    <div class="rpanel" data-ct="place" data-shelf="1">
-      <div class="rpanel-body"></div>
-      <div class="rpanel-cap">2 &middot; Place</div>
-    </div>
     <div class="rpanel" data-ct="design" data-shelf="1">
       <div class="rpanel-body"></div>
-      <div class="rpanel-cap">3 &middot; Design</div>
+      <div class="rpanel-cap">2 &middot; Design</div>
     </div>
     <div class="rpanel" data-ct="size" data-shelf="1">
       <div class="rpanel-body"></div>
-      <div class="rpanel-cap">4 &middot; Size &amp; Cost</div>
+      <div class="rpanel-cap">3 &middot; Size &amp; Cost</div>
     </div>
   </div>
 
@@ -160930,10 +160926,20 @@ if (root.console && console.info) {
   'use strict';
   var TAG = '[ComputeTab]';
   /* panel -> ordered ids (or a selector for the two static buttons) */
+  /* Patch 121: two of these were taken from tabs they belong on.
+       · Data Ctr is a PLACING tool -- click a pod onto the drawing --
+         and it lives on Draw with the other placing tools. Pulling it
+         here meant a drawing action was in two different tabs depending
+         on what you were drawing.
+       · Compute Build is a guided build. Every guided build is in one
+         row on Build, and taking one out of that row breaks the only
+         place you can compare them.
+     Both stay where they are; the Place group goes with them. What is
+     left here is what has no other home: the compute-campus site work,
+     the design tools and the sizing and cost tools. */
   var PLAN = {
     site:   ['@site-setup', 'rb-trace-boundary', 'rb-trace-exclusion', 'rb-place-sub', 'rb-gas-tie', 'rb-max-fit'],
-    place:  ['@dc-cluster'],
-    design: ['rb-design-site', '@compute-build', 'rb-site-build', 'rb-sub-envelope', 'rb-buildable', 'rb-fence-tie', 'rb-feas-csv'],
+    design: ['rb-design-site', 'rb-site-build', 'rb-sub-envelope', 'rb-buildable', 'rb-fence-tie', 'rb-feas-csv'],
     size:   ['rb-elec', 'rb-max-load', 'rb-load-screen', 'rb-optimise', 'rb-compute-cost']
   };
   function panel(key) {
@@ -160947,17 +160953,6 @@ if (root.console && console.info) {
       if (!hero) return null;
       var c = hero.cloneNode(true); c.id = 'rb-compute-site-setup'; c.classList.remove('home-hero');
       return c;
-    }
-    if (id === '@compute-build') {
-      var bs = document.querySelectorAll('#ribbon .rbtn');
-      for (var i = 0; i < bs.length; i++) {
-        if ((bs[i].getAttribute('onclick') || '').indexOf("_guidedPick('compute')") > -1) return bs[i];
-      }
-      return null;
-    }
-    if (id === '@dc-cluster') {
-      var b = document.getElementById('rb-dccluster');
-      return b ? (b.closest('.rbtn-wrap') || b) : null;
     }
     var el = document.getElementById(id);
     return el ? (el.closest('.rbtn-wrap') || el) : null;
