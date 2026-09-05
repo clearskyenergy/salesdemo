@@ -132159,6 +132159,13 @@ var ARCH = {
   'solar-carport': { label:'Solar — carport canopy', group:'solar', tilt:7,  clear:14  },
 
   'bess-container':{ label:'BESS — container',       group:'storage', h:9.5  },
+
+  /* Patch 84. A modular data-centre pod was mapped to 'bess-container',
+     so 40 MW of compute drew as forty batteries, counted as STORAGE in
+     the panel and the overlay, and had no layer of its own. Same shell,
+     different machine, different layer — and its kW is LOAD, not
+     generation, which is why "kW-DC drawn" read 83 MW on a 3 MW array. */
+  'compute-pod':   { label:'Compute pod / MDC',      group:'compute', h:9.5  },
   'bess-cabinet':  { label:'BESS — cabinet',         group:'storage', h:7.2  },
   'pcs':           { label:'PCS / inverter skid',    group:'storage', h:7.5  },
   'ems':           { label:'EMS / controls cabinet', group:'storage', h:5.0  },
@@ -132184,10 +132191,7 @@ var ARCH = {
   'charger':       { label:'EV charger',             group:'ev', h:5.2 },
 
   /* Patch 79. A campus fence rectangle and a substation yard are objects
-     in their own right. Without these two words the classifier had to
-     reach for the nearest thing it knew — 'building' for the fence and
-     'switchgear' for the yard — and both readings put a solid slab where
-     an open structure belongs. */
+     in their own right. */
   'compound':      { label:'Fenced compound',        group:'civil', h:8   },
   'substation':    { label:'Utility substation yard',group:'elec',  h:0   },
   'ignore':        { label:'— not shown —',          group:'none' }
@@ -132195,6 +132199,7 @@ var ARCH = {
 
 var ARCH_GROUPS = [
   { id:'solar',   label:'Solar' },
+  { id:'compute', label:'Compute' },
   { id:'storage', label:'Storage' },
   { id:'elec',    label:'Electrical' },
   { id:'civil',   label:'Civil / site' },
@@ -132203,7 +132208,7 @@ var ARCH_GROUPS = [
 
 /* Selectable archetypes, in menu order. */
 var ARCH_ORDER = ['solar-ground','solar-tracker','solar-roof','solar-carport',
-  'bess-container','bess-cabinet','pcs','ems',
+  'compute-pod','bess-container','bess-cabinet','pcs','ems',
   'xfmr','switchgear','meter','panel','disco','jbox','genset','ups','pole',
   'building','pad','fence','compound','bollard','parking','tree','hydrant','camera',
   'substation','charger','ignore'];
@@ -132363,9 +132368,9 @@ var EQ_ARCH = {
   solar:'solar-ground', pad:'pad', bollard:'bollard', fence:'fence',
   jbox:'jbox', charger:'charger', camera:'camera', ups:'ups', pole:'pole',
   ems:'ems',
-  /* Armada modular data-center units read as containers */
-  dc_cruiser:'bess-container', dc_triton:'bess-container',
-  dc_leviathan:'bess-container'
+  /* Armada modular data-center units are compute, not storage */
+  dc_cruiser:'compute-pod', dc_triton:'compute-pod',
+  dc_leviathan:'compute-pod'
 };
 
 /* THE GUIDED BUILDS DO NOT SET eqId.
@@ -132503,19 +132508,16 @@ var SHAPE_ARCH = {
   bespad:'bess-container', assembly:'bess-container', energy:'bess-container',
   substation:'substation', utility:'xfmr',
   evl2:'charger', evcab:'charger', evpost:'charger', evunit:'charger',
-  derwind:'ignore', deralt:'genset', derdc:'bess-container',
+  derwind:'ignore', deralt:'genset', derdc:'compute-pod',
   callout:'ignore', line:'ignore', polyline:'ignore', zonebox:'ignore'
 };
 
 function classifyShape(sh, ctx){
   if(sh._visArch && ARCH[sh._visArch]) return { arch:sh._visArch, why:'explicit' };
-  /* Campus objects from Design Site. The fence rectangles are fences; as
-     unlabelled rects over 1,200 sqft they were classifying as BUILDINGS,
-     which is what put a warehouse-sized slab over each compound. */
-  if(sh.omegaCampus){
+  if(sh.omegaCampus || sh.omegaFence){
     if(sh.omegaCampus==='feeder' || sh.omegaCampus==='trunk' || sh.omegaCampus==='service')
       return { arch:'ignore', why:'authored' };
-    return { arch:'compound', why:'authored' };
+    if(sh.kind==='rect') return { arch:'compound', why:'authored' };
   }
   var k = String(sh.kind||'');
   if(k==='dersolar' || k==='solar') return classifySolar(sh, ctx);
@@ -132607,7 +132609,7 @@ function readSite(){
     /* An explicit override re-labels the context too, so overriding a
        rectangle to "Parking" immediately makes arrays on it read as
        carports without a second pass by the user. */
-    if(sh.omegaCampus) continue;      /* a fence is not ground to sit on */
+    if(sh.omegaCampus || sh.omegaFence) continue;
     if(sh._visArch==='parking') kind='parking';
     else if(sh._visArch==='building') kind='building';
     else if(sh._visArch) continue;
@@ -132738,7 +132740,10 @@ function readSite(){
       if(sh.cx!=null){ it.x = fx(sh.cx); it.z = fz(sh.cy); }
     }
     out.items.push(it);
-    out.kw += it.kw;
+    /* Compute is a LOAD. Adding its nameplate to the generation total is
+       how the overlay came to claim 83 MW-DC on a 3 MW array. */
+    if(it.arch === 'compute-pod') out.computeKw = (out.computeKw||0) + (it.kw||0);
+    else out.kw += it.kw;
     out.tables += (it.tableCount || (it.tables ? it.tables.length : 0));
     if(ARCH[it.arch] && ARCH[it.arch].group === 'solar')
       out.acres += (it.wf * it.lf) / 43560;
@@ -133837,7 +133842,8 @@ function buildContainer(it, arch){
   var g = new THREE.Group();
   var w = Math.max(8, it.wf), d = Math.max(6, it.lf), h = arch.h;
   var name = String((it.ref && (it.ref.model||it.ref.label)) || it.label || '');
-  var compute = /pod|mdc|leviathan|triton|cruiser|compute|data/i.test(name);
+  var compute = it.arch === 'compute-pod'
+    || /pod|mdc|leviathan|triton|cruiser|compute|data/i.test(name);
 
   var pad = box(w+3, 0.6, d+3, MAT.concrete);
   pad.position.y = 0.3; g.add(pad);
@@ -134999,6 +135005,7 @@ function populate(site){
         it._impliedRoof = ru.implied;
         g = buildSolarRoof(it, arch, ru.y, ru.implied); break;
       case 'bess-container': g = buildContainer(it, arch); break;
+      case 'compute-pod':    g = buildContainer(it, arch); break;
       case 'bess-cabinet':   g = buildBessCabinet(it, arch); break;
       case 'pcs':            g = buildCabinet(it, arch); break;
       case 'ems':            g = buildCabinet(it, arch); break;
@@ -135422,12 +135429,22 @@ function paintSide(){
     if(g === 'solar') nSolar++;
     if(g === 'storage') nStore++;
   });
+  var nCompute = 0;
+  s.items.forEach(function(it){
+    if(it.hidden) return;
+    if((ARCH[it.arch] && ARCH[it.arch].group) === 'compute') nCompute++;
+  });
   h += '<div class="ov-kpi">'
     +  '<div class="ov-k"><div class="ov-kv">' + (s.kw ? Math.round(s.kw).toLocaleString() : '\u2014')
     +  '</div><div class="ov-kl">kW-DC drawn</div></div>'
     +  '<div class="ov-k"><div class="ov-kv">' + nSolar + '</div><div class="ov-kl">PV arrays</div></div>'
     +  '<div class="ov-k"><div class="ov-kv">' + nStore + '</div><div class="ov-kl">Storage</div></div>'
     +  '</div>'
+    +  (nCompute ? ('<div class="ov-kpi"><div class="ov-k"><div class="ov-kv">' + nCompute
+        + '</div><div class="ov-kl">Compute pods</div></div>'
+        + '<div class="ov-k"><div class="ov-kv">'
+        + (s.computeKw ? Math.round(s.computeKw/1000).toLocaleString() : '\u2014')
+        + '</div><div class="ov-kl">MW IT drawn</div></div></div>') : '')
     +  '<div class="ov-kpi">'
     +  '<div class="ov-k"><div class="ov-kv">' + (s.tables ? s.tables.toLocaleString() : '\u2014')
     +  '</div><div class="ov-kl">Tables laid out</div></div>'
@@ -135870,15 +135887,18 @@ function drawOverlay(g, W, H, dpr){
     if(pn && pn.value.trim()) name = pn.value.trim();
   }catch(e){}
 
-  var nSolar=0, nStore=0;
+  var nSolar=0, nStore=0, nComp=0;
   s.items.forEach(function(it){
     if(it.hidden) return;
     var gp = ARCH[it.arch] && ARCH[it.arch].group;
     if(gp==='solar') nSolar++;
     if(gp==='storage') nStore++;
+    if(gp==='compute') nComp++;
   });
   var cells = [];
   if(s.kw)     cells.push(['SYSTEM SIZE', Math.round(s.kw).toLocaleString()+' kW-DC']);
+  if(nComp)    cells.push(['COMPUTE', nComp + ' pods \u00b7 '
+                            + Math.round((s.computeKw||0)/1000).toLocaleString() + ' MW IT']);
   if(nSolar)   cells.push(['PV ARRAYS', String(nSolar)]);
   if(s.tables) cells.push(['TABLES', s.tables.toLocaleString()]);
   if(s.acres)  cells.push(['PV ACRES', s.acres.toFixed(2)]);
@@ -155021,54 +155041,34 @@ if (root.console && console.info) {
     /* Site perimeter at the setback line. */
     if (plan.band) rect(plan.band, 'dashed', 'perimeter', null, null);
 
-    /* One fence per compound, standing off the equipment. The name and
-       rating ride ON the fence shape rather than in a separate overlay,
-       so they are anchored to the ground with it and survive a pan, a
-       zoom and a reprojection. */
-    ['compute', 'storage', 'generation', 'yard', 'solar'].forEach(function (k) {
-      var z = plan.zones[k];
-      if (!z) return;
-      if (k === 'solar' && !(plan.solar && plan.solar.built)) return;
-      rect({ x1: z.x1 - off, y1: z.y1 - off, x2: z.x2 + off, y2: z.y2 + off },
-           'solid', k, z.label || k.toUpperCase(), sub[k] || null);
-    });
+    /* ONE FENCING AUTHORITY.
 
-    /* The master controller: the one pad everything answers to. */
+       This used to draw a fence per PLANNED ZONE. Patch 83 then drew a
+       second set around the equipment that actually landed. Two systems
+       fencing the same site produced the empty rectangles on the plan:
+       a zone rect is the ground reserved for a block, and where the
+       block packed smaller than its reservation — or where solar was
+       priced out and never drew — the fence enclosed nothing.
+
+       Fences now come from one place, and that place measures the
+       equipment rather than the intention. Nothing is fenced that is
+       not there. */
+
+    /* The master controller sits where the engine reserved room for it;
+       the fencing pass will find it rather than placing a second one. */
     push({ id: nid('mc'), kind: 'bespad', pts: [{ x: c.ctrl.x1, y: c.ctrl.y1 }],
       style: (S_().shapeStyle || ''), lf: c.ctrlLf, wf: c.ctrlWf, model: c.label,
       scaled: true, omegaCompute: true, omegaCampus: 'controller', omegaController: true });
-    rect({ x1: c.ctrl.x1 - off, y1: c.ctrl.y1 - off, x2: c.ctrl.x2 + off, y2: c.ctrl.y2 + off },
-         'solid', 'control', null, null);
 
-    /* The spine first, then each compound's drop onto it. Separate
-       shapes on purpose: any one run can be selected and dragged
-       without moving the others. */
-    var LBL = { compute: 'MV feeder \u2014 compute', storage: 'MV feeder \u2014 storage',
-                generation: 'MV feeder \u2014 generation', yard: 'MV tie \u2014 yard',
-                solar: 'MV collection \u2014 solar' };
-    (c.feeders || []).forEach(function (f) {
-      conduit(f.pts, LBL[f.to] || ('MV feeder \u2014 ' + f.to), f.to);
-    });
-
-    /* Utility service in, from the substation, routed on the same
-       corridors and around the same compounds as everything else. */
-    try {
-      var sb = (S_().shapes || []).filter(function (x) { return x && x.kind === 'substation'; }).pop();
-      if (sb && sb.pts && sb.pts.length > 1) {
-        var sr = { x1: Math.min(sb.pts[0].x, sb.pts[1].x), y1: Math.min(sb.pts[0].y, sb.pts[1].y),
-                   x2: Math.max(sb.pts[0].x, sb.pts[1].x), y2: Math.max(sb.pts[0].y, sb.pts[1].y) };
-        var obs = [];
-        Object.keys(c.obstacles || {}).forEach(function (k) { obs.push(c.obstacles[k]); });
-        var from = exitPoint(sr, c.anchor);
-        var to = ctrlPort(c.ctrlFence, from);
-        var rt = routeOrtho(from, to, obs, c.corridors || { xs: [], ys: [] });
-        var kv = sb.voltage ? (' ' + sb.voltage) : '';
-        conduit(rt.pts.concat([{ x: c.anchor.x, y: c.anchor.y }]),
-                'SERVICE FROM ' + String(sb.label || 'SUBSTATION').toUpperCase() + kv, 'utility');
-      }
-    } catch (e) { if (root.console) console.warn(TAG + ' service tie', e && e.message); }
+    /* Ties are drawn by the fencing pass too, from the fences that end
+       up on the plan rather than from the zones that were planned. */
 
     root._omegaCampusPlan = plan;
+    /* Fences, the control yard and the ties, drawn from what is now on
+       the canvas. Runs after the equipment, never before it. */
+    try {
+      if (root.OmegaFenceTie) root.OmegaFenceTie.run({ from: 'campus' });
+    } catch (e) { if (root.console) console.warn(TAG + ' fence', e && e.message); }
     try { if (typeof root.updShapeCount === 'function') root.updShapeCount(); } catch (e) {}
     try { if (typeof root.renderLegend === 'function') root.renderLegend(); } catch (e) {}
     /* The adapter snapshots history before this runs, so without a
@@ -155125,49 +155125,114 @@ if (root.console && console.info) {
      and gensets while saying nothing about the substation, the fenced
      compounds, the control yard or the solar field — the four things a
      reviewer looks for first. */
-  function legendRows() {
-    var S = S_(); if (!S || !S.shapes) return '';
-    var P = +S.pxPerFt > 0 ? +S.pxPerFt : 0, rows = '', any = false;
-    var li = function (mark, name, note) {
-      any = true;
-      rows += '<div class="li"><div class="li-ico" style="font-size:11px">' + mark + '</div>'
-        + '<span class="li-txt">' + name
-        + (note ? '<br><span style="font-size:8px;opacity:.65">' + note + '</span>' : '')
-        + '</span></div>';
+  /* COUNTED OFF THE CANVAS, NOT OFF THE PLAN.
+
+     The legend disagreed with the drawing — 46 generators in the key
+     against 141 in the results — because the two were counting
+     different things: one walked the last design's numbers, the other
+     walked the shapes. Anything left over from an earlier run, or
+     placed by hand, appeared in one and not the other.
+
+     This walks S.shapes and nothing else. Whatever is on the map is
+     what the legend says, including the leftovers, because a legend
+     that quietly omits equipment somebody can see is worse than one
+     that shows something unexpected. */
+  function census() {
+    var S = S_(), out = { rows: [], flags: [] };
+    if (!S || !S.shapes) return out;
+    var P = +S.pxPerFt > 0 ? +S.pxPerFt : 0;
+    var g = {}, order = [];
+    var add = function (key, mark, name, kw, kwh) {
+      if (!g[key]) { g[key] = { mark: mark, name: name, n: 0, kw: 0, kwh: 0 }; order.push(key); }
+      g[key].n++; g[key].kw += (+kw || 0); g[key].kwh += (+kwh || 0);
     };
-    /* Substations, drawn or placed. */
-    S.shapes.filter(function (x) { return x && x.kind === 'substation'; }).forEach(function (sb) {
-      var cap = isFinite(+sb.capMw) ? +sb.capMw : 0;
-      li('\u26a1', sb.label || 'Utility Substation',
-         (cap > 0 ? cap.toLocaleString() + ' MW firm' : 'capacity not set')
-         + (sb.voltage ? ' \u00b7 ' + sb.voltage : ''));
-    });
-    /* Fenced compounds, with the ground each one takes. */
-    var seen = {};
+    var fences = 0, fenceAc = 0, ctrl = 0, subs = [];
+
     S.shapes.forEach(function (sh) {
-      if (!sh || !sh.omegaCampus || !sh.campusLabel || !sh.pts || sh.pts.length < 2) return;
-      if (seen[sh.campusLabel]) return;
-      seen[sh.campusLabel] = 1;
-      var w = Math.abs(sh.pts[1].x - sh.pts[0].x), h = Math.abs(sh.pts[1].y - sh.pts[0].y);
-      var ac = P > 0 ? (w / P) * (h / P) / 43560 : 0;
-      li('\u25a2', sh.campusLabel,
-         (sh.campusSub ? sh.campusSub + ' \u00b7 ' : '') + (ac > 0 ? n1(ac) + ' ac fenced' : 'fenced'));
+      if (!sh) return;
+      if (sh.omegaController) { ctrl++; return; }
+      if (sh.omegaFence || sh.omegaCampus) {
+        if (sh.kind === 'rect' && sh.pts && sh.pts.length > 1 && sh.campusLabel) {
+          fences++;
+          if (P > 0) {
+            fenceAc += Math.abs(sh.pts[1].x - sh.pts[0].x) / P
+                     * Math.abs(sh.pts[1].y - sh.pts[0].y) / P / 43560;
+          }
+        }
+        return;
+      }
+      switch (sh.kind) {
+        case 'derdc':  add('pod', '\u25a6', sh.model || 'Compute pod', sh.kw); break;
+        case 'deralt': add('gen' + (sh.model || ''), '\u2299', sh.model || 'Generator', sh.kw); break;
+        case 'derwind': add('wind', '\u2732', sh.model || 'Wind turbine', sh.kw); break;
+        case 'bespad': add('bess' + (sh.model || ''), '\u25ac', sh.model || 'BESS container',
+                           sh.kw, sh.kwh); break;
+        case 'dersolar': add('pv', '\u2600', 'Solar array', sh.kw); break;
+        case 'substation': subs.push(sh); break;
+        default:
+          if (sh.omegaYard) add('yard' + (sh.label || sh.kind), '\u25a3',
+                                sh.label || sh.model || 'Tie-in equipment');
+      }
     });
-    if (S.shapes.some(function (x) { return x && x.omegaController; })) {
-      li('\u25c9', 'Master controller', 'control house \u00b7 every compound ties here');
-    }
-    /* Feeders. These are real conduit runs, so the length is the one the
-       conduit schedule prints rather than a second measurement. */
-    var ft = 0, n = 0;
+
+    subs.forEach(function (sb) {
+      out.rows.push({ mark: '\u26a1', name: sb.label || 'Utility substation',
+        note: (isFinite(+sb.capMw) ? (+sb.capMw).toLocaleString() + ' MW firm' : 'capacity not set')
+          + (sb.voltage ? ' \u00b7 ' + sb.voltage : '') });
+    });
+    order.forEach(function (k) {
+      var G = g[k], parts = [];
+      if (G.kw) parts.push(Math.round(G.kw).toLocaleString() + ' kW');
+      if (G.kwh) parts.push(Math.round(G.kwh).toLocaleString() + ' kWh');
+      out.rows.push({ mark: G.mark, name: G.name + (G.n > 1 ? ' \u00d7' + G.n : ''),
+                      note: parts.join(' \u00b7 ') || 'counted on the drawing' });
+    });
+    if (fences) out.rows.push({ mark: '\u25a2', name: 'Fenced compounds \u00d7' + fences,
+      note: (fenceAc > 0 ? n1(fenceAc) + ' ac inside the fence lines' : 'security fence') });
+    if (ctrl) out.rows.push({ mark: '\u25c9', name: 'Master controller',
+      note: 'every compound ties here' });
+
+    var ft = 0, runs = 0;
     (S.conduits || []).forEach(function (c) {
-      if (!c || !c.omegaCampus) return;
-      n++; ft += (+c.ftLen || 0);
+      if (!c || !(c.omegaCampus || c.omegaFence)) return;
+      runs++; ft += (+c.ftLen || 0);
     });
-    if (n) li('\u2500', 'MV duct bank \u00d7' + n,
-              Math.round(ft).toLocaleString() + ' ft of route \u00b7 trenched, planning length');
-    if (!any) return '';
+    if (runs) out.rows.push({ mark: '\u2500', name: 'MV duct bank \u00d7' + runs,
+      note: Math.round(ft).toLocaleString() + ' ft trenched' });
+
+    /* If the last design and the canvas disagree, say so on the sheet
+       rather than letting two numbers argue in silence. */
+    try {
+      var pl = root._omegaPlan;
+      if (pl && pl.sizing && pl.sizing.gen) {
+        var drawn = 0;
+        S.shapes.forEach(function (sh) { if (sh && sh.kind === 'deralt' && !sh.omegaFence) drawn++; });
+        if (drawn !== pl.sizing.gen.units) {
+          out.flags.push(drawn + ' generators on the drawing against ' + pl.sizing.gen.units
+            + ' in the last design \u2014 equipment from an earlier run is still here. '
+            + 'Re-run Design Site, or delete the leftovers.');
+        }
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  function legendRows() {
+    var c = census();
+    if (!c.rows.length) return '';
+    var rows = '';
+    c.rows.forEach(function (r) {
+      rows += '<div class="li"><div class="li-ico" style="font-size:11px">' + r.mark + '</div>'
+        + '<span class="li-txt">' + r.name
+        + (r.note ? '<br><span style="font-size:8px;opacity:.65">' + r.note + '</span>' : '')
+        + '</span></div>';
+    });
+    c.flags.forEach(function (f) {
+      rows += '<div style="font-size:8.5px;color:#F59E0B;line-height:1.5;margin:4px 0">'
+        + f + '</div>';
+    });
     return '<div style="font-size:8px;font-weight:800;letter-spacing:.8px;opacity:.6;'
-      + 'margin:8px 0 4px">SITE PLAN</div>' + rows;
+      + 'margin:8px 0 4px">ON THE DRAWING</div>' + rows;
   }
 
   function wrapLegend() {
@@ -155190,6 +155255,83 @@ if (root.console && console.info) {
     root.renderLegend.__campus = true;
   }
 
+  /* ── the power mix, and why it is that mix ──────────────────────────── */
+
+  /* THE MIX IS ALREADY A DECISION. IT WAS JUST INVISIBLE.
+
+     Electing generation, storage and solar together does not mean
+     building all three at full size — it means letting the engine pick
+     between them, which it does: the utility serves up to its ceiling
+     because that is the cheapest firm power; firm generation closes
+     whatever is left, because solar is not firm and a compute load does
+     not care that the sun is up; and solar is built only where its
+     levelised cost beats whatever it would displace at the margin.
+
+     On a site with a 42 MW gas gap, the marginal energy is gas at about
+     $25/MWh, and solar at $40 does not beat it — so the engine
+     correctly declines to build solar, and the user sees an empty field
+     and assumes the tool did nothing. That is a reporting failure, not
+     a sizing one. This makes the arithmetic visible: what serves the
+     load, what each source costs, what the blend costs, and what would
+     have to change for the answer to flip. */
+  function mix(plan) {
+    plan = plan || root._omegaPlan;
+    if (!plan || !plan.sizing) return null;
+    var s = plan.sizing, cfg = plan.cfg || (root.OmegaEngine && root.OmegaEngine.DEFAULTS) || {};
+    var lf = cfg.loadFactor || 0.9;
+    var facMwh = (s.facKw / 1000) * lf * 8760;
+
+    var gridMw = Math.min(s.utilKw, s.facKw) / 1000;
+    var gasMw = s.gen ? Math.min(s.gen.kwTotal, Math.max(0, s.facKw - s.utilKw)) / 1000 : 0;
+    var solarMwh = plan.solar && plan.solar.built ? plan.solar.mwhYr : 0;
+
+    /* Energy, in merit order: solar first because it is must-take when
+       it is there, then the utility to its ceiling, then gas for the
+       remainder. */
+    var gridMwh = Math.min(gridMw * lf * 8760, Math.max(0, facMwh - solarMwh));
+    var gasMwh = Math.max(0, facMwh - solarMwh - gridMwh);
+
+    var cGrid = cfg.utilityEnergyPerMwh || 65;
+    var cGas = s.gen ? s.gen.fuelPerMwh : 0;
+    var cSolar = cfg.solarLcoePerMwh || 40;
+    var cost = gridMwh * cGrid + gasMwh * cGas + solarMwh * cSolar;
+    var blended = facMwh > 0 ? cost / facMwh : 0;
+
+    var marginal = gasMwh > 0 ? { src: 'on-site fuel', rate: cGas } : { src: 'utility energy', rate: cGrid };
+
+    return {
+      facMwh: facMwh, gridMw: gridMw, gasMw: gasMw,
+      gridMwh: gridMwh, gasMwh: gasMwh, solarMwh: solarMwh,
+      sharePct: { grid: facMwh ? gridMwh / facMwh * 100 : 0,
+                  gas: facMwh ? gasMwh / facMwh * 100 : 0,
+                  solar: facMwh ? solarMwh / facMwh * 100 : 0 },
+      costPerMwh: { grid: cGrid, gas: cGas, solar: cSolar },
+      annualEnergyCost: cost, blendedPerMwh: blended,
+      marginal: marginal,
+      solarBuilt: !!(plan.solar && plan.solar.built),
+      solarWhy: plan.solar ? plan.solar.reason : '',
+      /* What would have to be true for the other answer. */
+      flipAt: marginal.rate > 0
+        ? (plan.solar && plan.solar.built
+            ? 'solar stops paying if its levelised cost rises above $' + Math.round(marginal.rate) + '/MWh'
+            : 'solar starts paying below $' + Math.round(marginal.rate) + '/MWh, or if the '
+              + 'marginal source gets dearer than $' + Math.round(cSolar) + '/MWh')
+        : null
+    };
+  }
+
+  function mixLine(plan) {
+    var m = mix(plan);
+    if (!m) return '';
+    var pc = function (v) { return Math.round(v) + '%'; };
+    var parts = [];
+    if (m.sharePct.grid > 0.5) parts.push(pc(m.sharePct.grid) + ' utility');
+    if (m.sharePct.gas > 0.5) parts.push(pc(m.sharePct.gas) + ' on-site fuel');
+    if (m.sharePct.solar > 0.5) parts.push(pc(m.sharePct.solar) + ' solar');
+    return 'Energy mix ' + parts.join(' / ') + ' at $' + Math.round(m.blendedPerMwh)
+      + '/MWh blended. ' + (m.solarBuilt ? '' : 'No solar: ' + m.solarWhy + '.');
+  }
+
   /* ── install ────────────────────────────────────────────────────────── */
 
   function install() {
@@ -155205,6 +155347,16 @@ if (root.console && console.info) {
       A.draw = function (plan) {
         var r = orig.apply(this, arguments);
         try { drawCampus(plan); } catch (e) { if (root.console) console.warn(TAG + ' draw', e && e.message); }
+        /* The mix decision, said out loud. Without this the engine
+           declines to build solar for a good reason and the person sees
+           an empty field and assumes the tool did nothing. */
+        try {
+          var ml = mixLine(plan);
+          if (ml && root.console) console.info(TAG + ' ' + ml);
+          if (ml && typeof root.showBanner === 'function') {
+            setTimeout(function () { root.showBanner('cal', ml); }, 1200);
+          }
+        } catch (e2) {}
         return r;
       };
       A.draw.__campus = true;
@@ -155239,7 +155391,7 @@ if (root.console && console.info) {
 
   root.OmegaCampus = {
     design: design, evaluate: evaluate, draw: drawCampus, install: install,
-    legendRows: legendRows, routes: routes, clearConduit: clearConduit,
+    legendRows: legendRows, census: census, mix: mix, routes: routes, clearConduit: clearConduit,
     config: CAMPUS, clearances: clearances,
     /* Back to vertical bands, for comparison. */
     off: function () {
