@@ -1711,7 +1711,7 @@ window.onerror = function(msg, src, line, col, err) {
           <span class="rb-lbl" style="font-weight:700;color:var(--text);white-space:nowrap">Site Setup</span>
         </button>
       </div>
-      <div class="rpanel-cap">1 &middot; Prepare Site</div>
+      <div class="rpanel-cap">1 &middot; Compute Campus</div>
     </div>
     <!-- Build flows, ordered by project type. One button per destination. -->
     <div class="rpanel">
@@ -157590,6 +157590,201 @@ if (root.console && console.info) {
   else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
   if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaPrimeMover;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 86 — THE SCALE IS THERE; NOTHING WAS FINDING IT
+ *  ---------------------------------------------------------------------
+ *  Buildable Area, Fence & Tie and the results panel all refused with
+ *  "needs a drawing scale" on a site drawn to scale, with a ruler on
+ *  screen and a design already laid out on it. The scale had not gone
+ *  anywhere. S.pxPerFt was empty, and every one of those checks read
+ *  S.pxPerFt and stopped there.
+ *
+ *  There are four places the answer can come from, and the app already
+ *  uses all four somewhere:
+ *
+ *    1. S.pxPerFt            what Calibrate Scale writes
+ *    2. the live map         zoom + latitude give metres per pixel
+ *       exactly, so feet per pixel is arithmetic, not a guess
+ *    3. the remembered view  _lastCenter/_lastZoom or the saved map
+ *       state, for when the map object is not reachable — a locked
+ *       plot, a fresh reload, a frozen background
+ *    4. the drawing itself   any shape carrying BOTH pixel points and
+ *       lat/lng anchors states the ratio: the ground distance between
+ *       two anchors over the pixel distance between the same two
+ *       points. This one needs no map at all.
+ *
+ *  This resolves in that order, and CACHES the answer into S.pxPerFt so
+ *  everything downstream — including the app's own checks, which this
+ *  patch does not touch — starts working again rather than each tool
+ *  needing its own fallback chain.
+ *
+ *  It records where the number came from on S._ppfSource, and it will
+ *  not write one it had to guess: if all four fail, the tools go on
+ *  refusing, which is correct. A wrong scale is worse than no scale —
+ *  it silently mis-sizes every fence, every acre and every foot of
+ *  trench on the sheet.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Scale]';
+  var FT_PER_M = 1 / 0.3048;
+
+  function S_() { return root.S; }
+
+  /* 2 — a live map object. */
+  function fromMap() {
+    var m = root._gmap;
+    if (!m || typeof m.getZoom !== 'function' || typeof m.getCenter !== 'function') return null;
+    var z, c;
+    try { z = m.getZoom(); c = m.getCenter(); } catch (e) { return null; }
+    if (!(z > 0) || !c) return null;
+    var lat = (typeof c.lat === 'function') ? c.lat() : c.lat;
+    if (!isFinite(lat)) return null;
+    return fromZoom(lat, z);
+  }
+
+  function fromZoom(lat, z) {
+    var mPerPx = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, z);
+    if (!(mPerPx > 0)) return null;
+    return 0.3048 / mPerPx;
+  }
+
+  /* 3 — the view the app remembers, for when the map object is not
+     reachable: a locked plot, a frozen background, a reload. */
+  function fromRemembered() {
+    try {
+      if (root._lastCenter && root._lastZoom > 0) {
+        return fromZoom(+root._lastCenter.lat, +root._lastZoom);
+      }
+    } catch (e) {}
+    try {
+      var ms = root._savedMapState;
+      if (ms && ms.lat != null && ms.zoom > 0) return fromZoom(+ms.lat, +ms.zoom);
+    } catch (e) {}
+    try {
+      if (typeof root.omegaGeo === 'function') {
+        var g = root.omegaGeo();
+        if (g && isFinite(+g.lat) && +g.zoom > 0) return fromZoom(+g.lat, +g.zoom);
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  /* 4 — the drawing states its own scale wherever a shape carries both
+     pixel points and ground anchors. No map required, and it is the
+     project's own data rather than an assumption about the view. */
+  function haversineFt(a, b) {
+    var R = 6371000, toR = Math.PI / 180;
+    var dLat = (b.lat - a.lat) * toR, dLng = (b.lng - a.lng) * toR;
+    var la1 = a.lat * toR, la2 = b.lat * toR;
+    var h = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+          + Math.cos(la1) * Math.cos(la2) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(h))) * FT_PER_M;
+  }
+
+  function fromAnchors() {
+    var S = S_(); if (!S || !S.shapes) return null;
+    var best = null;
+    S.shapes.forEach(function (sh) {
+      if (!sh || !sh.pts || !sh._geoPts) return;
+      if (sh.pts.length < 2 || sh._geoPts.length < 2) return;
+      for (var i = 1; i < sh.pts.length && i < sh._geoPts.length; i++) {
+        var g0 = sh._geoPts[0], g1 = sh._geoPts[i];
+        if (!g0 || !g1 || g0.lat == null || g1.lat == null) continue;
+        var ft = haversineFt(g0, g1);
+        var px = Math.hypot(sh.pts[i].x - sh.pts[0].x, sh.pts[i].y - sh.pts[0].y);
+        if (!(ft > 5) || !(px > 5)) continue;
+        var r = px / ft;
+        /* Longest baseline wins: a two-foot span measured across a
+           rounding error is not evidence. */
+        if (!best || ft > best.ft) best = { ppf: r, ft: ft };
+      }
+    });
+    return best ? best.ppf : null;
+  }
+
+  function resolve(opts) {
+    opts = opts || {};
+    var S = S_();
+    try { if (S && +S.pxPerFt > 0) return { ppf: +S.pxPerFt, src: S._ppfSource || 'calibrated' }; } catch (e) {}
+    var v = fromMap();
+    if (v > 0) return { ppf: v, src: 'live map' };
+    v = fromRemembered();
+    if (v > 0) return { ppf: v, src: 'remembered view' };
+    v = fromAnchors();
+    if (v > 0) return { ppf: v, src: 'geo anchors on the drawing' };
+    return { ppf: 0, src: null };
+  }
+
+  /* Resolve and write it back, so every check in the app that reads
+     S.pxPerFt starts working — not just the ones this patch knows
+     about. Nothing is written unless it came from a real source. */
+  function ensure(quiet) {
+    var S = S_(); if (!S) return 0;
+    if (+S.pxPerFt > 0) return +S.pxPerFt;
+    var r = resolve();
+    if (!(r.ppf > 0)) return 0;
+    S.pxPerFt = r.ppf;
+    S._ppfSource = r.src;
+    if (!quiet && root.console) {
+      console.info(TAG + ' drawing scale recovered from the ' + r.src + ': '
+        + (1 / r.ppf).toFixed(2) + ' ft/px. Nothing was recalibrated \u2014 the value was '
+        + 'already implied by the project.');
+    }
+    try { if (typeof root.updateRuler === 'function') root.updateRuler(); } catch (e) {}
+    return r.ppf;
+  }
+
+  /* The tools that refused. Each gets the scale resolved before it runs
+     rather than carrying its own copy of this chain. */
+  function wrap(objName, key) {
+    var o = root[objName];
+    if (!o || typeof o[key] !== 'function' || o[key].__scale) return false;
+    var orig = o[key];
+    o[key] = function () { try { ensure(true); } catch (e) {} return orig.apply(this, arguments); };
+    o[key].__scale = true;
+    return true;
+  }
+
+  function hook() {
+    wrap('OmegaBuildable', 'open'); wrap('OmegaBuildable', 'measure');
+    wrap('OmegaFenceTie', 'run');
+    wrap('OmegaElectrical', 'open');
+    wrap('OmegaCampus', 'draw');
+    wrap('OmegaDesign', 'run');
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      hook();
+      ensure(true);
+      if (++n > 120) clearInterval(iv);
+    }, 500);
+    setTimeout(function () { ensure(false); }, 2500);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaPpf.status()');
+  }
+
+  root.OmegaPpf = {
+    get: function () { return ensure(true); },
+    resolve: resolve, ensure: ensure,
+    status: function () {
+      var S = S_() || {};
+      var o = { 'S.pxPerFt': +S.pxPerFt || 0, source: S._ppfSource || null,
+        fromMap: fromMap() || null, fromRemembered: fromRemembered() || null,
+        fromAnchors: fromAnchors() || null };
+      o.ftPerPx = o['S.pxPerFt'] > 0 ? +(1 / o['S.pxPerFt']).toFixed(3) : null;
+      if (root.console) console.table ? console.table(o) : console.log(o);
+      return o;
+    }
+  };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaPpf;
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
