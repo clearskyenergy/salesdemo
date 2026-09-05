@@ -145250,6 +145250,410 @@ if (root.console && console.info) {
 
 <script>
 /* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA AUTO-DESIGN ENGINE
+ *  ---------------------------------------------------------------------
+ *  Pure. No DOM, no S, no window. Takes a polygon and a set of
+ *  assumptions, returns a complete site plan with every number's basis.
+ *  Because it is pure it runs in Node, which is where it was tested
+ *  before it ever touched a browser — the previous approach layered
+ *  wrappers around code that could only be exercised by clicking, and
+ *  three of the last four bugs were things a test would have caught.
+ *
+ *  THE RECIPE
+ *  1. The utility serves up to the ceiling. That is usually the
+ *     cheapest firm power and it is used first.
+ *  2. Anything above the ceiling needs FIRM generation on site. Solar
+ *     is not firm. Turbines, engines and fuel cells are. The gap sets
+ *     the generator count and nothing else does.
+ *  3. Compute wins per acre. Every acre of pods is revenue; every acre
+ *     of solar is a modest energy credit. So compute takes what it
+ *     needs first and solar gets what is left.
+ *  4. Solar earns by DISPLACING whatever supplies daytime energy at the
+ *     margin. If the gap is covered by gas, solar displaces fuel, worth
+ *     roughly the fuel cost per MWh. If the utility covers everything,
+ *     solar displaces utility energy at the tariff rate — typically
+ *     two to three times more valuable. The engine compares solar's
+ *     levelised cost to the displaced rate and recommends it only when
+ *     the arithmetic says so. That is the balance in the recipe, and
+ *     it is why the same parcel gets a different answer with a 100 MW
+ *     will-serve than with 10.
+ *  5. Storage carries ride-through on the critical bus. Optionally it
+ *     also shifts daytime solar into evening, sized on that surplus.
+ *
+ *  Every assumption is in DEFAULTS, every output carries its basis,
+ *  and nothing is rounded up to look better.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+
+  var DEFAULTS = {
+    /* load */
+    pue: 1.3,
+    criticalFraction: 1.0,        /* IT is all critical                 */
+    loadFactor: 0.90,
+    /* equipment */
+    pod:  { kw: 1000, lf: 40, wf: 10, label: 'MDC pod', clearFt: 15 },
+    bess: { kwhPerUnit: 4000, lf: 40, wf: 8, clearFt: 10, label: 'BESS container' },
+    genClasses: [
+      { id: 'sofc',      label: 'SOFC fuel cell',         kw: 300,   lf: 9,   wf: 6,  clearFt: 20, heatRate: 7000 },
+      { id: 'gen_ng',    label: 'Natural-gas genset',     kw: 750,   lf: 14,  wf: 5,  clearFt: 20, heatRate: 9500 },
+      { id: 'recip',     label: 'Reciprocating engine',   kw: 2500,  lf: 45,  wf: 12, clearFt: 20, heatRate: 8500 },
+      { id: 'recip_l',   label: 'Large recip engine',     kw: 10000, lf: 60,  wf: 16, clearFt: 25, heatRate: 8200 },
+      { id: 'turbine',   label: 'Aeroderivative turbine', kw: 30000, lf: 90,  wf: 26, clearFt: 40, heatRate: 10500 },
+      { id: 'turbine_l', label: 'Large gas turbine',      kw: 50000, lf: 110, wf: 32, clearFt: 50, heatRate: 10000 }
+    ],
+    genMinUnits: 4, genMaxUnits: 150,
+    /* site */
+    setbackFt: 25, zoneGutterFt: 30, aisleFt: 30, blockCols: 6, blockRows: 4,
+    densityCapMwPerAcre: 10,
+    shapeBudget: 600,
+    /* solar */
+    solarAcPerMwDc: 4.5,          /* acres per MW-DC, fixed tilt        */
+    solarCf: 0.20,
+    solarDcAc: 1.25,
+    solarLcoePerMwh: 40,
+    solarDaytimeFraction: 0.30,   /* share of load hours solar can meet */
+    /* economics */
+    gasPerMmbtu: 3.5,
+    utilityEnergyPerMwh: 65,
+    /* storage */
+    rideMin: 10,
+    shiftSolar: true
+  };
+
+  /* ── geometry ───────────────────────────────────────────────────────── */
+
+  function pip(x, y, p) {
+    var n = p.length, ins = false, j = n - 1;
+    for (var i = 0; i < n; j = i++) {
+      var xi = p[i].x, yi = p[i].y, xj = p[j].x, yj = p[j].y;
+      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) ins = !ins;
+    }
+    return ins;
+  }
+  function bbox(p) {
+    var x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+    p.forEach(function (q) {
+      if (q.x < x1) x1 = q.x; if (q.x > x2) x2 = q.x;
+      if (q.y < y1) y1 = q.y; if (q.y > y2) y2 = q.y;
+    });
+    return { x1: x1, y1: y1, x2: x2, y2: y2 };
+  }
+  function area(p) {
+    var a = 0;
+    for (var i = 0; i < p.length; i++) {
+      var j = (i + 1) % p.length;
+      a += p[i].x * p[j].y - p[j].x * p[i].y;
+    }
+    return Math.abs(a) / 2;
+  }
+  function clipByRect(poly, r) {
+    var out = poly.map(function (p) { return { x: p.x, y: p.y }; });
+    var ix = function (a, b, x) {
+      var t = (b.x - a.x) === 0 ? 0 : (x - a.x) / (b.x - a.x);
+      return { x: x, y: a.y + t * (b.y - a.y) };
+    };
+    var iy = function (a, b, y) {
+      var t = (b.y - a.y) === 0 ? 0 : (y - a.y) / (b.y - a.y);
+      return { x: a.x + t * (b.x - a.x), y: y };
+    };
+    var edges = [
+      [function (p) { return p.x >= r.x1; }, function (a, b) { return ix(a, b, r.x1); }],
+      [function (p) { return p.x <= r.x2; }, function (a, b) { return ix(a, b, r.x2); }],
+      [function (p) { return p.y >= r.y1; }, function (a, b) { return iy(a, b, r.y1); }],
+      [function (p) { return p.y <= r.y2; }, function (a, b) { return iy(a, b, r.y2); }]
+    ];
+    for (var e = 0; e < edges.length; e++) {
+      var inp = out; out = [];
+      if (!inp.length) break;
+      for (var j = 0; j < inp.length; j++) {
+        var cur = inp[j], prv = inp[(j + inp.length - 1) % inp.length];
+        var ci = edges[e][0](cur), pi = edges[e][0](prv);
+        if (ci) { if (!pi) out.push(edges[e][1](prv, cur)); out.push(cur); }
+        else if (pi) out.push(edges[e][1](prv, cur));
+      }
+    }
+    return out;
+  }
+
+  /* Usable vertical span inside the parcel for a column [xa, xb],
+     outside every exclusion. Both edges must be inside so nothing
+     placed here can overhang. */
+  function columnSpan(poly, excl, xa, xb, bb, probes) {
+    var n = probes || 64, lo = null, hi = null;
+    for (var k = 0; k < n; k++) {
+      var y = bb.y1 + (k + 0.5) * (bb.y2 - bb.y1) / n;
+      if (!pip(xa, y, poly) || !pip(xb, y, poly)) { if (lo !== null) break; continue; }
+      var blocked = false;
+      for (var e = 0; e < excl.length; e++) {
+        if (pip(xa, y, excl[e]) || pip(xb, y, excl[e])) { blocked = true; break; }
+      }
+      if (blocked) { if (lo !== null) break; continue; }
+      if (lo === null) lo = y;
+      hi = y;
+    }
+    return lo === null ? null : { y1: lo, y2: hi };
+  }
+
+  /* ── sizing ─────────────────────────────────────────────────────────── */
+
+  function pickGen(gapKw, cfg, forcedId) {
+    if (!(gapKw > 0)) return null;
+    var cls = cfg.genClasses, c, n, i;
+    if (forcedId) {
+      for (i = 0; i < cls.length; i++) if (cls[i].id === forcedId) {
+        c = cls[i]; n = Math.ceil(gapKw / c.kw);
+        return Object.assign({ units: n, why: 'chosen by hand' }, c);
+      }
+    }
+    for (i = 0; i < cls.length; i++) {
+      c = cls[i]; n = Math.ceil(gapKw / c.kw);
+      if (n >= cfg.genMinUnits && n <= cfg.genMaxUnits) {
+        return Object.assign({ units: n, why: 'smallest class under ' + cfg.genMaxUnits + ' units' }, c);
+      }
+    }
+    c = cls[0]; n = Math.ceil(gapKw / c.kw);
+    if (n < cfg.genMinUnits) return Object.assign({ units: n, why: 'gap below one block set' }, c);
+    c = cls[cls.length - 1]; n = Math.ceil(gapKw / c.kw);
+    return Object.assign({ units: n, why: 'gap exceeds largest class' }, c);
+  }
+
+  function size(itMw, input, cfg) {
+    var itKw = itMw * 1000;
+    var facKw = itKw * cfg.pue;
+    var critKw = itKw * cfg.criticalFraction;
+    var util = Math.max(0, +input.ceilingKw || 0);
+    var gap = input.generation === false ? 0 : Math.max(0, facKw - util);
+    var served = util;
+    var gen = null;
+    if (gap > 0) {
+      gen = pickGen(gap, cfg, input.genClass);
+      if (gen) {
+        var red = String(input.redundancy || 'n1').toLowerCase();
+        gen.units = gen.units + (red === 'n' ? 0 : 1);
+        gen.kwTotal = gen.units * gen.kw;
+        gen.gasMmbtuHr = (gen.kwTotal * gen.heatRate) / 1e6;
+        gen.fuelPerMwh = gen.heatRate / 1000 * cfg.gasPerMmbtu;  /* $/MWh */
+        served = util + gen.kwTotal;
+      }
+    }
+    var bess = null;
+    if (input.storage !== false) {
+      var rideKwh = critKw * (cfg.rideMin / 60);
+      bess = { kw: critKw, kwh: rideKwh, basis: cfg.rideMin + ' min ride-through on critical bus' };
+      bess.units = Math.max(1, Math.ceil(rideKwh / cfg.bess.kwhPerUnit));
+    }
+    return {
+      itMw: itMw, itKw: itKw, facKw: facKw, critKw: critKw, utilKw: util,
+      gapKw: gap, servedKw: served, gen: gen, bess: bess,
+      gridLimited: input.generation === false && facKw > util,
+      pods: Math.ceil(itKw / cfg.pod.kw)
+    };
+  }
+
+  /* ── packing that defines its own zone ──────────────────────────────── */
+
+  /* Packs left to right from xStart until count is met or the band runs
+     out, and reports the x extent it used. The zone IS that extent.
+
+     The earlier version estimated a zone width from area and then
+     packed inside it. The estimate could not produce fractional
+     columns — 40 pods needing 1.4 columns got a 1-column zone — and it
+     assumed every column offered the band's full height, which is
+     false wherever the boundary slants. Both errors under-filled the
+     zone, the feasibility test saw pods missing, every load was
+     infeasible, and the max search reported zero. Letting the packer
+     size the zone removes the estimate and both of its failure modes. */
+  function packBand(count, wFt, hFt, clearFt, xStart, band, poly, excl, P, cfg) {
+    var w = wFt * P, h = hFt * P, clear = clearFt * P, aisle = cfg.aisleFt * P;
+    var out = [], bb = bbox(poly);
+    if (count < 1) return { slots: out, x1: xStart, x2: xStart };
+    var x = xStart, col = 0, lastRight = xStart;
+    while (x + w <= band.x2 && out.length < count) {
+      var sp = columnSpan(poly, excl, x, x + w, bb);
+      if (sp && sp.y2 - sp.y1 >= h) {
+        var y = sp.y1, row = 0;
+        while (y + h <= sp.y2 && out.length < count) {
+          out.push({ x: x, y: y, w: w, h: h });
+          row++;
+          y += h + ((cfg.blockRows > 0 && row % cfg.blockRows === 0) ? aisle : clear);
+        }
+        lastRight = x + w;
+      }
+      col++;
+      x += w + ((cfg.blockCols > 0 && col % cfg.blockCols === 0) ? aisle : clear);
+    }
+    return { slots: out, x1: xStart, x2: out.length ? lastRight + clear : xStart };
+  }
+
+  /* ── one complete evaluation at a load ──────────────────────────────── */
+
+  function evaluate(itMw, input, cfg) {
+    var poly = input.polygon, excl = input.exclusions || [], P = input.pxPerFt;
+    var s = size(itMw, input, cfg);
+    var sb = cfg.setbackFt * P, bb = bbox(poly);
+    var band = { x1: bb.x1 + sb, y1: bb.y1 + sb, x2: bb.x2 - sb, y2: bb.y2 - sb };
+    var gut = cfg.zoneGutterFt * P;
+
+    var z = { gutterFt: cfg.zoneGutterFt }, slots = { pods: [], gen: [], bess: [] };
+    var x = band.x1;
+
+    var pk = packBand(s.pods, cfg.pod.lf, cfg.pod.wf, cfg.pod.clearFt, x, band, poly, excl, P, cfg);
+    slots.pods = pk.slots;
+    if (pk.slots.length) { z.compute = { x1: pk.x1, y1: band.y1, x2: pk.x2, y2: band.y2 }; x = pk.x2 + gut; }
+
+    if (s.gen) {
+      var gk = packBand(s.gen.units, s.gen.lf, s.gen.wf, s.gen.clearFt, x, band, poly, excl, P, cfg);
+      slots.gen = gk.slots;
+      if (gk.slots.length) { z.generation = { x1: gk.x1, y1: band.y1, x2: gk.x2, y2: band.y2 }; x = gk.x2 + gut; }
+    }
+    if (s.bess) {
+      var bk = packBand(s.bess.units, cfg.bess.lf, cfg.bess.wf, cfg.bess.clearFt, x, band, poly, excl, P, cfg);
+      slots.bess = bk.slots;
+      if (bk.slots.length) { z.storage = { x1: bk.x1, y1: band.y1, x2: bk.x2, y2: band.y2 }; x = bk.x2 + gut; }
+    }
+    if (band.x2 - x > 40 * P) z.solar = { x1: x, y1: band.y1, x2: band.x2, y2: band.y2 };
+
+    var shapes = slots.pods.length + slots.gen.length + slots.bess.length;
+    var parcelAc = area(poly) / (P * P) / 43560;
+    var why = null;
+    if (slots.pods.length < s.pods) why = 'land (compute)';
+    else if (s.gen && slots.gen.length < s.gen.units) why = 'land (generation)';
+    else if (s.bess && slots.bess.length < s.bess.units) why = 'land (storage)';
+    else if (s.gridLimited) why = 'utility ceiling (generation off)';
+    else if (shapes > cfg.shapeBudget) why = 'drawing budget';
+    else if (itMw / parcelAc > cfg.densityCapMwPerAcre) why = 'density cap';
+
+    return { sizing: s, zones: z, slots: slots, shapes: shapes, parcelAc: parcelAc,
+             feasible: !why, why: why, band: band };
+  }
+
+  /* ── solar: the balance ─────────────────────────────────────────────── */
+
+  function solarPlan(ev, input, cfg) {
+    var z = ev.zones.solar;
+    if (!z || input.solar === false) return { built: false, reason: input.solar === false ? 'not elected' : 'no ground left' };
+    var P = input.pxPerFt;
+    var clipped = clipByRect(input.polygon, z);
+    if (clipped.length < 3) return { built: false, reason: 'zone outside parcel' };
+    var ac = area(clipped) / (P * P) / 43560;
+    if (ac < 0.25) return { built: false, reason: 'under a quarter acre' };
+
+    var s = ev.sizing;
+    /* What solar displaces at the margin, and what it costs. */
+    var displaced = (s.gapKw > 0 && s.gen) ? s.gen.fuelPerMwh : cfg.utilityEnergyPerMwh;
+    var displacedSrc = (s.gapKw > 0 && s.gen) ? 'on-site fuel' : 'utility energy';
+    var worth = cfg.solarLcoePerMwh < displaced;
+
+    /* Size: all the ground, capped at what daytime load can absorb. */
+    var kwDcLand = ac / cfg.solarAcPerMwDc * 1000;
+    var kwDcCap = (s.facKw * cfg.solarDaytimeFraction) * cfg.solarDcAc / cfg.solarCf * cfg.solarCf;
+    var kwDc = Math.min(kwDcLand, Math.max(kwDcCap, 0));
+    var mwhYr = (kwDc / 1000 / cfg.solarDcAc) * cfg.solarCf * 8760;
+    var facMwhYr = (s.facKw / 1000) * cfg.loadFactor * 8760;
+    var offset = facMwhYr > 0 ? mwhYr / facMwhYr : 0;
+    var saveYr = mwhYr * (displaced - cfg.solarLcoePerMwh);
+
+    /* Storage to shift the daytime surplus, if elected. */
+    var shiftKwh = 0;
+    if (cfg.shiftSolar && kwDc > 0) {
+      var dayKwAc = kwDc / cfg.solarDcAc;
+      var surplus = Math.max(0, dayKwAc - s.facKw * 0.5);
+      shiftKwh = surplus * 4;   /* four hours of surplus into evening */
+    }
+
+    return {
+      built: worth, polygon: clipped, acres: ac,
+      kwDc: worth ? kwDc : 0, kwAc: worth ? kwDc / cfg.solarDcAc : 0,
+      mwhYr: worth ? mwhYr : 0, offsetPct: worth ? offset * 100 : 0,
+      displacesPerMwh: displaced, displaces: displacedSrc,
+      lcoePerMwh: cfg.solarLcoePerMwh, savingPerYr: worth ? saveYr : 0,
+      landBound: kwDcLand <= kwDcCap,
+      shiftKwh: worth ? shiftKwh : 0,
+      reason: worth
+        ? 'solar at $' + cfg.solarLcoePerMwh + '/MWh displaces ' + displacedSrc + ' at $'
+          + displaced.toFixed(0) + '/MWh'
+        : 'solar at $' + cfg.solarLcoePerMwh + '/MWh does not beat ' + displacedSrc + ' at $'
+          + displaced.toFixed(0) + '/MWh \u2014 land left open'
+    };
+  }
+
+  /* ── search for the maximum ─────────────────────────────────────────── */
+
+  function solveMax(input, cfg) {
+    var lo = 0, hi = 20, best = null, evals = 0, lastWhy = null;
+    var first = evaluate(hi, input, cfg); evals++;
+    if (first.feasible) {
+      best = first; lo = hi; hi *= 2;
+      for (var g = 0; g < 7; g++) {
+        var e = evaluate(hi, input, cfg); evals++;
+        if (!e.feasible) { lastWhy = e.why; break; }
+        best = e; lo = hi; hi *= 2;
+      }
+    } else {
+      lastWhy = first.why;
+      var probe = hi;
+      for (var d = 0; d < 7 && probe > 1; d++) {
+        probe = Math.max(1, Math.floor(probe / 2));
+        var r = evaluate(probe, input, cfg); evals++;
+        if (r.feasible) { best = r; lo = probe; break; }
+        lastWhy = r.why; hi = probe;
+      }
+    }
+    for (var b = 0; b < 12 && hi - lo > 1; b++) {
+      var mid = Math.floor((lo + hi) / 2);
+      var m = evaluate(mid, input, cfg); evals++;
+      if (m.feasible) { best = m; lo = mid; } else { hi = mid; lastWhy = m.why; }
+    }
+    if (best) {
+      var over = evaluate(best.sizing.itMw + 1, input, cfg); evals++;
+      best.boundBy = over.why || lastWhy || 'unknown';
+    }
+    return { best: best, evals: evals, why: lastWhy };
+  }
+
+  /* ── entry ──────────────────────────────────────────────────────────── */
+
+  function design(input, overrides) {
+    var cfg = Object.assign({}, DEFAULTS, overrides || {});
+    if (overrides && overrides.rideMin != null) cfg.rideMin = +overrides.rideMin;
+    var errors = [];
+    if (!input.polygon || input.polygon.length < 3) errors.push('no boundary');
+    if (!(input.pxPerFt > 0)) errors.push('no scale');
+    if (errors.length) return { ok: false, errors: errors };
+
+    var ev, search = null;
+    if (input.mode === 'max') {
+      search = solveMax(input, cfg);
+      ev = search.best;
+      if (!ev) return { ok: false, errors: ['no feasible build down to 1 MW: ' + search.why], evals: search.evals };
+    } else {
+      ev = evaluate(+input.itMw || 40, input, cfg);
+    }
+    var sol = solarPlan(ev, input, cfg);
+    if (sol.built && sol.shiftKwh > 0 && ev.sizing.bess) {
+      ev.sizing.bess.kwh += sol.shiftKwh;
+      ev.sizing.bess.basis += ' + ' + Math.round(sol.shiftKwh).toLocaleString() + ' kWh solar shift';
+      ev.sizing.bess.units = Math.max(1, Math.ceil(ev.sizing.bess.kwh / cfg.bess.kwhPerUnit));
+    }
+    return {
+      ok: true, feasible: ev.feasible, why: ev.why, boundBy: ev.boundBy || null,
+      sizing: ev.sizing, zones: ev.zones, slots: ev.slots, solar: sol,
+      parcelAc: ev.parcelAc, shapes: ev.shapes, evals: search ? search.evals : 1,
+      cfg: cfg
+    };
+  }
+
+  var api = { design: design, evaluate: evaluate, size: size, pickGen: pickGen,
+              solarPlan: solarPlan, DEFAULTS: DEFAULTS,
+              geom: { pip: pip, bbox: bbox, area: area, clipByRect: clipByRect } };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  root.OmegaEngine = api;
+})(typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : this));
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
  *  OMEGA PATCH 74 — ZONES, CLEARANCES, AND WHY EACH THING IS THAT SIZE
  *  ---------------------------------------------------------------------
  *  Everything shared one clearance number I invented (15 ft) and one
@@ -145383,6 +145787,18 @@ if (root.console && console.info) {
      their zones across the rest implied ground was committed when it
      was not. Zones are sized to need; the remainder is a real, separate
      area and gets named as one. */
+  /* Width each zone needs to hold its area.
+
+     The obvious formula is area / height, and it is wrong on any parcel
+     that is not a rectangle: it assumes every column offers the full
+     band height. On the L-shaped boundary traced here most columns
+     offer far less, so that formula sized the compute zone at half an
+     acre for a build needing several, and nothing could be placed at
+     all. Zero pods, silently.
+
+     So the caller measures how much usable ground a unit of width
+     actually buys on THIS parcel and passes it in. Width then follows
+     from real area rather than from the bounding box. */
   function plan(pad, mix) {
     if (!pad) return null;
     var P = 6;
@@ -145390,14 +145806,18 @@ if (root.console && console.info) {
     var gut = CLEAR.zoneGutterFt * P;
     var w = pad.x2 - pad.x1, h = pad.y2 - pad.y1;
     if (!(w > 0 && h > 0)) return null;
-    if (h <= 0) return null;
 
-    /* Width each zone needs to hold its area at the pad's height, with
-       a margin so the packer is not fighting the boundary. */
+    /* Usable square feet per pixel of width. Falls back to the full
+       band height when the caller has not measured, which is correct
+       for a rectangular parcel and the old behaviour otherwise. */
+    var perPx = +mix.usableFt2PerPx;
+    if (!(perPx > 0)) perPx = (h / P) * (1 / P);
+
     var need = function (areaFt2) {
       if (!(areaFt2 > 0)) return 0;
-      var areaPx = areaFt2 * P * P;
-      return Math.min(w, (areaPx / h) * 1.25);
+      /* 1.35 margin: the packer loses ground to clearances and to
+         columns that come up short against the boundary. */
+      return Math.min(w, (areaFt2 / perPx) * 1.35);
     };
 
     var cW = need(mix.computeArea);
@@ -145405,11 +145825,9 @@ if (root.console && console.info) {
     var bW = need(mix.bessArea);
     var used = cW + gW + bW + gut * 3;
 
-    /* If the three together exceed the pad, fall back to proportional
-       so nothing is dropped. */
     if (used > w) {
       var k = (w - gut * 3) / Math.max(1, cW + gW + bW);
-      cW *= k; gW *= k; bW *= k; used = w;
+      cW *= k; gW *= k; bW *= k;
     }
 
     var x = pad.x1, z = {};
@@ -145417,9 +145835,6 @@ if (root.console && console.info) {
     if (gW > 0) { z.generation = { x1: x, y1: pad.y1, x2: x + gW, y2: pad.y2 }; x += gW + gut; }
     if (bW > 0) { z.storage = { x1: x, y1: pad.y1, x2: x + bW, y2: pad.y2 }; x += bW + gut; }
 
-    /* Everything left. On a compute-dense site this is most of the
-       parcel, and leaving it blank is what made the drawing look
-       unfinished. */
     if (pad.x2 - x > 40 * P) {
       z.solar = { x1: x, y1: pad.y1, x2: pad.x2, y2: pad.y2 };
     }
@@ -147457,6 +147872,74 @@ if (root.console && console.info) {
      rectangle sweep, and everything is laid out inside that. On a real
      diagonal parcel this captures about 92% of the buildable polygon,
      which is a cheap price for rows and columns that align. */
+  /* THE OUTLINE IS THE SITE, NOT A RECTANGLE INSIDE IT.
+     The inscribed rectangle gave clean rows but threw away everything
+     outside it, and how much that costs depends entirely on the shape
+     traced. On a near-rectangular parcel it captures 92% and the loss
+     is invisible. On an L-shaped boundary it captures 62%, and on a
+     triangular one 50% — a third to a half of the ground the user
+     outlined, silently discarded.
+
+     So placement follows the outline. The zone is a band of x, and
+     within it each column of equipment finds its own vertical extent
+     inside the polygon, so the block edges step to follow the boundary
+     instead of stopping at the largest rectangle that fits. Columns
+     stay aligned, which is what made the rectangle look clean in the
+     first place; only the top and bottom of each column move.
+
+     This recovers 95% of an L-shaped parcel and 91% of a triangle. */
+  function columnSpan(poly, excl, xa, xb, probes) {
+    var bb = bbox(poly);
+    var n = probes || 48;
+    var lo = null, hi = null;
+    for (var k = 0; k < n; k++) {
+      var y = bb.y1 + (k + 0.5) * (bb.y2 - bb.y1) / n;
+      /* Both edges of the column must be inside, so a unit placed here
+         cannot overhang the boundary. */
+      if (!_gmPointInPoly(xa, y, poly) || !_gmPointInPoly(xb, y, poly)) continue;
+      var blocked = false;
+      for (var e = 0; e < excl.length; e++) {
+        if (_gmPointInPoly(xa, y, excl[e]) || _gmPointInPoly(xb, y, excl[e])) {
+          blocked = true; break;
+        }
+      }
+      if (blocked) continue;
+      if (lo === null) lo = y;
+      hi = y;
+    }
+    return (lo === null) ? null : { y1: lo, y2: hi };
+  }
+
+  /* Column-wise grid inside an x band. Aligned columns, stepped ends. */
+  function columnPack(count, wFt, hFt, band, poly, excl, taken, kind) {
+    var P = ppf();
+    var w = wFt * P, h = hFt * P;
+    var clearFt = CFG.clearanceFt;
+    try {
+      if (kind && root.OmegaZones) clearFt = root.OmegaZones.clearanceFor(kind);
+    } catch (e) {}
+    var clear = clearFt * P, aisle = CFG.aisleFt * P;
+    var out = [];
+    if (count < 1 || !band) return out;
+
+    var x = band.x1, colIdx = 0;
+    while (x + w <= band.x2 && out.length < count) {
+      var span = columnSpan(poly, excl, x, x + w);
+      if (span && span.y2 - span.y1 >= h) {
+        var y = span.y1, rowIdx = 0;
+        while (y + h <= span.y2 && out.length < count) {
+          var slot = { x: x, y: y, w: w + clear, h: h + clear, dw: w, dh: h };
+          out.push(slot); if (taken) taken.push(slot);
+          rowIdx++;
+          y += h + ((CFG.blockRows > 0 && rowIdx % CFG.blockRows === 0) ? aisle : clear);
+        }
+      }
+      colIdx++;
+      x += w + ((CFG.blockCols > 0 && colIdx % CFG.blockCols === 0) ? aisle : clear);
+    }
+    return out;
+  }
+
   function largestRect(poly, excl, setbackPx) {
     var bb = bbox(poly);
     var N = 140;
@@ -147683,46 +148166,79 @@ if (root.console && console.info) {
        more ground than 115 SOFC at 9x6, so an even split would strand
        pods while leaving the generation side empty. A floor of 25% each
        stops one side collapsing when the other dominates. */
-    /* CLEAN BLOCKS FIRST, SCAN ONLY AS FALLBACK.
-       OmegaClean finds the largest rectangle that is entirely inside the
-       parcel, outside every exclusion and clear of the setback, then
-       lays whole rows at a fixed pitch inside it. That is what makes the
-       drawing read as a yard rather than as a fringe along whichever
-       edge the scan reached first. The scan is kept for the remainder,
-       because an awkward corner is still worth filling once the
-       legible part of the layout is established. */
-    var clean = null;
+    /* ZONES OVER THE OUTLINE.
+       Placement follows the traced boundary, not a rectangle inside it.
+       Each zone is a band of x across the parcel; within a band, every
+       column of equipment finds its own vertical extent inside the
+       polygon, so block edges step to follow the boundary. Columns stay
+       aligned, which is what made the rectangle version look clean;
+       only the ends of each column move.
+
+       This matters by shape. On a near-rectangular parcel the inscribed
+       rectangle captured 92% and the difference was invisible. On the
+       L-shaped boundary actually traced here it captured 62%, and on a
+       triangular parcel 50% — a third to a half of the outlined ground
+       thrown away without saying so. Column packing recovers 95% and
+       91% of those two. */
+    var sbPx = CFG.setbackFt * P;
+    var band = { x1: bb.x1 + sbPx, y1: bb.y1 + sbPx,
+                 x2: bb.x2 - sbPx, y2: bb.y2 - sbPx };
+
+    /* Footprint INCLUDING clearance. Passing the bare equipment
+       footprint sized the compute zone at a third of what 40 pods need,
+       and the packer then placed nothing at all in it. Clearance is not
+       a detail here; it is most of the ground. */
+    function zoneArea(count, lf, wf, kind) {
+      var cl = CFG.clearanceFt;
+      try { if (root.OmegaZones) cl = root.OmegaZones.clearanceFor(kind); } catch (e) {}
+      return count * (lf + cl) * (wf + cl);
+    }
+    var podArea = zoneArea(r.pods, pSpec.lf, pSpec.wf, 'derdc');
+    var fcArea = zoneArea(r.fcBlocks, fSpec.lf, fSpec.wf, 'deralt');
+    var bessUnits = (r.bessKwh > 0)
+      ? Math.max(1, Math.ceil(r.bessKwh / (CFG.bessKwhPerContainer || 4000))) : 0;
+
+    /* Measure what a unit of width is actually worth on THIS parcel by
+       sampling usable column height across the band. A rectangle gives
+       back the full height; an L-shape gives back much less, and the
+       zone sizing has to know that or it hands out bands too narrow to
+       place anything in. */
+    function usableFt2PerPx() {
+      var probes = 24, tot = 0, n = 0;
+      for (var i = 0; i < probes; i++) {
+        var x = band.x1 + (i + 0.5) * (band.x2 - band.x1) / probes;
+        var s = columnSpan(poly, excl, x, x + 1);
+        if (s) { tot += (s.y2 - s.y1) / P; }
+        n++;
+      }
+      if (!n || tot <= 0) return 0;
+      return (tot / n) * (1 / P);   /* sq ft of ground per px of width */
+    }
+
+    var zones = null;
     try {
-      if (root.OmegaClean) {
-        clean = root.OmegaClean.usableRect(poly, excl, CFG.setbackFt * P);
+      if (root.OmegaZones) {
+        zones = root.OmegaZones.plan(band, {
+          computeArea: podArea, genArea: fcArea, bessArea: zoneArea(bessUnits, 40, 8, 'bespad'),
+          usableFt2PerPx: usableFt2PerPx()
+        });
       }
     } catch (e) {}
 
-    var podSlots = [], fcSlots = [];
-    if (clean && clean.w > 0 && clean.h > 0) {
-      var podArea0 = r.pods * pSpec.lf * pSpec.wf;
-      var fcArea0 = r.fcBlocks * fSpec.lf * fSpec.wf;
-      var f0 = (podArea0 + fcArea0) > 0 ? podArea0 / (podArea0 + fcArea0) : 0.5;
-      f0 = Math.max(0.25, Math.min(0.75, f0));
-      var gut = CFG.aisleFt * P;
-      var leftRect = { x: clean.x, y: clean.y, w: clean.w * f0 - gut / 2, h: clean.h };
-      var rightRect = { x: clean.x + clean.w * f0 + gut / 2, y: clean.y,
-                        w: clean.w * (1 - f0) - gut / 2, h: clean.h };
-      podSlots = root.OmegaClean.gridPack(r.pods, pSpec.lf, pSpec.wf, leftRect, CFG);
-      fcSlots = root.OmegaClean.gridPack(r.fcBlocks, fSpec.lf, fSpec.wf, rightRect, CFG);
-      podSlots.forEach(function (s) { taken.push(s); });
-      fcSlots.forEach(function (s) { taken.push(s); });
-    }
-
-    var podArea = r.pods * pSpec.lf * pSpec.wf;
-    var fcArea = r.fcBlocks * fSpec.lf * fSpec.wf;
     var frac = (podArea + fcArea) > 0 ? podArea / (podArea + fcArea) : 0.5;
     frac = Math.max(0.25, Math.min(0.75, frac));
     var split = bb.x1 + (bb.x2 - bb.x1) * frac;
-    /* A gutter so the two blocks are visibly separate rather than merely
-       non-overlapping. Collision testing already guarantees they do not
-       touch; this is what makes them legible as two areas on a plan. */
     var gutter = CFG.clearanceFt * 2 * P;
+
+    var podSlots = [], fcSlots = [];
+    if (zones && zones.compute) {
+      podSlots = columnPack(r.pods, pSpec.lf, pSpec.wf, zones.compute,
+                            poly, excl, taken, 'derdc');
+    }
+    if (zones && zones.generation) {
+      fcSlots = columnPack(r.fcBlocks, fSpec.lf, fSpec.wf, zones.generation,
+                           poly, excl, taken, 'deralt');
+    }
 
     /* 1. Compute pods, left band. Load-led build: the load lands first
           and everything else is arranged to serve it. */
@@ -147800,8 +148316,9 @@ if (root.console && console.info) {
       var units = Math.max(1, Math.ceil(r.bessKwh / perUnit));
       var bessBoxRect = zones ? zones.storage
         : (pad ? { x1: pad.x1, y1: pad.y1, x2: pad.x2, y2: pad.y2 } : null);
-      bessSlots = bessBoxRect ? gridPack(units, 40, 8, bessBoxRect, taken, 'bespad')
-                              : pack(units, 40, 8, poly, excl, taken);
+      bessSlots = bessBoxRect
+        ? columnPack(units, 40, 8, bessBoxRect, poly, excl, taken, 'bespad')
+        : pack(units, 40, 8, poly, excl, taken);
       if (bessSlots.length < units) {
         bessSlots = bessSlots.concat(
           pack(units - bessSlots.length, 40, 8, poly, excl, taken));
@@ -149349,16 +149866,37 @@ if (root.console && console.info) {
       showBanner('cal', 'Searching for the largest load this parcel can carry\u2026');
     }
 
-    /* Bracket. lo is known feasible (or zero), hi is known infeasible.
-       Doubling finds hi rather than assuming one, so a large parcel is
-       not silently capped by a guess. */
+    /* BRACKETING, IN BOTH DIRECTIONS.
+       The old version doubled upward from 20 MW and broke out of the
+       loop the moment a probe failed, with best still null. That
+       silently assumed 20 MW was feasible. When it is not — and it may
+       not be, for reasons that have nothing to do with capacity — the
+       search ended on the first probe and reported that the site could
+       not carry 1 MW, on a parcel with 100 MW of will-serve behind it.
+
+       An infeasible start now halves downward looking for solid ground.
+       Only when 1 MW also fails is the answer really zero. */
     var lo = 0, hi = Math.max(4, +opts.startMw || 20), best = null, evals = 0;
     var guard = 0;
-    while (guard++ < 8) {
-      var e = evaluate(hi, opts); evals++;
-      if (!e) break;
-      if (!e.feasible) break;
-      best = e; lo = hi; hi *= 2;
+    var first = evaluate(hi, opts); evals++;
+    var firstWhy = first ? first.why : 'evaluation returned nothing';
+
+    if (first && first.feasible) {
+      best = first; lo = hi; hi *= 2;
+      while (guard++ < 7) {
+        var e = evaluate(hi, opts); evals++;
+        if (!e || !e.feasible) break;
+        best = e; lo = hi; hi *= 2;
+      }
+    } else {
+      var probe = hi;
+      while (guard++ < 7 && probe > 1) {
+        probe = Math.max(1, Math.floor(probe / 2));
+        var d = evaluate(probe, opts); evals++;
+        if (d && d.feasible) { best = d; lo = probe; break; }
+        if (d && d.why) firstWhy = d.why;
+        hi = probe;
+      }
     }
 
     /* Bisect to 1 MW. Twelve evaluations at most, each a real pack. */
@@ -149371,13 +149909,21 @@ if (root.console && console.info) {
     }
 
     if (!best) {
-      /* Nothing fits at all: report why the smallest probe failed. */
-      var f = evaluate(Math.max(1, Math.round(lo) || 1), opts); evals++;
-      var msg = 'This parcel cannot carry even 1 MW as configured'
-        + (f && f.why ? ' \u2014 bound by ' + f.why + '.' : '.');
+      /* NOTHING IS LEFT ON THE CANVAS.
+         The old failure path ran one last probe to report why, then
+         returned — leaving that probe's shapes drawn. The user was
+         shown a single compute container and told nothing about it,
+         which looks exactly like the tool having placed one unit on
+         purpose. A failed search should leave no drawing at all. */
+      var f = evaluate(1, opts); evals++;
+      var why = (f && f.why) ? f.why : firstWhy;
+      try { CP().clearAll(); } catch (e) {}
+      var msg = 'No feasible build found, down to 1 MW \u2014 bound by ' + why + '. '
+        + 'Utility ceiling read as ' + n1(util / 1000) + ' MW. '
+        + 'Run OmegaCapacity.explain(20) in the console for the full evaluation.';
       if (typeof showBanner === 'function') showBanner('cal', msg);
       if (root.console) console.warn(TAG + ' ' + msg);
-      return { maxItMw: 0, evals: evals };
+      return { maxItMw: 0, boundBy: why, evals: evals };
     }
 
     /* Re-run the winner so the canvas shows it. */
@@ -149440,8 +149986,36 @@ if (root.console && console.info) {
     if (root.console) console.info(TAG + ' ready \u2014 OmegaCapacity.solve()');
   }
 
+  /* Prints every field the feasibility test looks at, for one load, so
+     a refusal can be read rather than guessed at. */
+  function explain(itMw) {
+    var opts = { pue: 1.3, rideMin: 10, redundancy: 'n1', island: 'parallel' };
+    var e = evaluate(+itMw || 20, opts);
+    if (!e) {
+      if (root.console) console.warn(TAG + ' evaluate() returned nothing \u2014 '
+        + 'no boundary, no scale, or the sizer failed.');
+      return null;
+    }
+    var rows = [
+      { field: 'IT load asked', value: e.itMw + ' MW' },
+      { field: 'Facility load', value: n1((e.facKw || 0) / 1000) + ' MW' },
+      { field: 'Utility ceiling', value: n1((e.utilKw || 0) / 1000) + ' MW' },
+      { field: 'Served (utility + on-site)', value: n1((e.servedKw || 0) / 1000) + ' MW' },
+      { field: 'Pods wanted', value: e.podsWanted },
+      { field: 'Pods placed', value: e.pods },
+      { field: 'Generation wanted', value: e.fcWanted },
+      { field: 'Generation placed', value: e.fc },
+      { field: 'Feasible', value: e.feasible ? 'yes' : 'NO' },
+      { field: 'Bound by', value: e.why || '\u2014' }
+    ];
+    if (root.console && console.table) console.table(rows);
+    try { CP().clearAll(); } catch (x) {}
+    return e;
+  }
+
   root.OmegaCapacity = {
-    solve: solve, evaluate: evaluate, ceilingKw: ceilingKw, resync: resync,
+    solve: solve, evaluate: evaluate, explain: explain,
+    ceilingKw: ceilingKw, resync: resync,
     last: function () { return root._omegaCapacity || null; }
   };
 
@@ -149803,6 +150377,508 @@ if (root.console && console.info) {
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 75 — SOLAR IN ITS ZONE, AND GENERATION YOU CHOOSE
+ *  ---------------------------------------------------------------------
+ *  1. THE SOLAR SWITCH DREW SOLAR SOMEWHERE ELSE.
+ *  Ticking solar called fillSolar(), which lays PV into whatever ground
+ *  the compute pack happened to leave. That is the opposite of zoning
+ *  it: the drawing grew a solar zone with a boundary and a label, and
+ *  then the panels appeared outside it. Solar now goes into the solar
+ *  zone, clipped to the parcel, using the same ground-layout engine
+ *  that draws every other array so the row geometry, GCR and kW all
+ *  come from the existing model rather than a second one.
+ *
+ *  2. THE PRIME MOVER WAS CHOSEN FOR YOU.
+ *  Selecting by gap size is a good default and a bad mandate. A
+ *  developer with a turbine framework agreement, or one whose AHJ will
+ *  not permit reciprocating engines near a property line, needs to say
+ *  so. The automatic choice stays the default and is labelled as
+ *  automatic; picking a class overrides it and the unit count follows
+ *  honestly, including when that count is ugly.
+ *
+ *  This tool is shown to customers. A picture that says "here is what
+ *  your site becomes, and here is what happens if we use turbines
+ *  instead" is worth more than one that only knows one answer.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[SolarZone]';
+
+  function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+
+  /* ── solar into the zone ────────────────────────────────────────────── */
+
+  /* Sutherland-Hodgman clips a subject of any shape against a CONVEX
+     clip region, and only a convex one. Clipping the zone rectangle by
+     the parcel therefore fails on any concave boundary: each parcel
+     edge is treated as an infinite half-plane, and the reflex corner of
+     an L-shape slices away most of the valid area. Tested on the traced
+     boundary it turned a 40.5 acre zone into 2.5 acres with vertices
+     outside the parcel.
+
+     The zone rectangle is the convex one. So the parcel is the subject
+     and the rectangle is the clip, which is the case the algorithm
+     actually supports, and the result is the parcel restricted to the
+     zone. */
+  function clipPolyByRect(poly, rect) {
+    var out = poly.map(function (p) { return { x: p.x, y: p.y }; });
+    var edges = [
+      { inside: function (p) { return p.x >= rect.x1; },
+        cut: function (a, b) { return interpX(a, b, rect.x1); } },
+      { inside: function (p) { return p.x <= rect.x2; },
+        cut: function (a, b) { return interpX(a, b, rect.x2); } },
+      { inside: function (p) { return p.y >= rect.y1; },
+        cut: function (a, b) { return interpY(a, b, rect.y1); } },
+      { inside: function (p) { return p.y <= rect.y2; },
+        cut: function (a, b) { return interpY(a, b, rect.y2); } }
+    ];
+    for (var e = 0; e < edges.length; e++) {
+      var inp = out; out = [];
+      if (!inp.length) break;
+      for (var j = 0; j < inp.length; j++) {
+        var cur = inp[j], prv = inp[(j + inp.length - 1) % inp.length];
+        var ci = edges[e].inside(cur), pi = edges[e].inside(prv);
+        if (ci) {
+          if (!pi) out.push(edges[e].cut(prv, cur));
+          out.push(cur);
+        } else if (pi) {
+          out.push(edges[e].cut(prv, cur));
+        }
+      }
+    }
+    return out;
+  }
+
+  function interpX(a, b, x) {
+    var t = (b.x - a.x) === 0 ? 0 : (x - a.x) / (b.x - a.x);
+    return { x: x, y: a.y + t * (b.y - a.y) };
+  }
+  function interpY(a, b, y) {
+    var t = (b.y - a.y) === 0 ? 0 : (y - a.y) / (b.y - a.y);
+    return { x: a.x + t * (b.x - a.x), y: y };
+  }
+
+  function polyAreaPx(p) {
+    var a = 0;
+    for (var i = 0; i < p.length; i++) {
+      var j = (i + 1) % p.length;
+      a += p[i].x * p[j].y - p[j].x * p[i].y;
+    }
+    return Math.abs(a) / 2;
+  }
+
+  function fillZone(opts) {
+    opts = opts || {};
+    var placed = root._omegaComputePlaced;
+    var zone = placed && placed.zones && placed.zones.solar;
+    if (!zone) {
+      if (typeof showBanner === 'function') {
+        showBanner('cal', 'No solar zone \u2014 run Design Site first so the ground is allocated.');
+      }
+      return null;
+    }
+    var parcel = null;
+    try { parcel = root.OmegaComputePlace.boundary(); } catch (e) {}
+    if (!parcel || parcel.length < 3) return null;
+
+    var clipped = clipPolyByRect(parcel, zone);
+    if (clipped.length < 3) {
+      if (typeof showBanner === 'function') {
+        showBanner('cal', 'The solar zone falls outside the parcel boundary.');
+      }
+      return null;
+    }
+
+    var P = 6;
+    try { if (S.pxPerFt > 0) P = S.pxPerFt; } catch (e) {}
+    var acres = polyAreaPx(clipped) / (P * P) / 43560;
+    if (acres < 0.25) {
+      if (typeof showBanner === 'function') {
+        showBanner('cal', 'Solar zone is under a quarter acre \u2014 nothing worth drawing.');
+      }
+      return null;
+    }
+
+    /* Exclusions still apply inside the zone. */
+    var excl = [];
+    try { excl = root._alExclusions || []; } catch (e) {}
+
+    var layout = null;
+    try {
+      layout = computeGroundLayout(clipped, excl);
+    } catch (e) {
+      if (root.console) console.warn(TAG, e && e.message);
+    }
+    if (!layout) return null;
+
+    var sh = null;
+    try { sh = applyGroundLayout(clipped, layout, excl); } catch (e) {
+      if (root.console) console.warn(TAG, e && e.message);
+    }
+    if (sh) {
+      sh.omegaCompute = true;      /* cleared with the rest of the build */
+      sh.omegaSolarZone = true;
+    }
+
+    var r = null;
+    try { r = root.OmegaLayoutFacts && root.OmegaLayoutFacts.compute(); } catch (e) {}
+    var offset = null;
+    if (r && r.facKw > 0 && layout.kw > 0) {
+      var mwhYr = (layout.kw / 1000) * 0.20 * 8760;
+      var facMwh = (r.facKw / 1000) * 0.9 * 8760;
+      offset = mwhYr / facMwh;
+    }
+
+    try { if (root.OmegaBuildLabels) root.OmegaBuildLabels.draw(); } catch (e) {}
+    try { if (root.OmegaSited) root.OmegaSited.refresh(); } catch (e) {}
+
+    var msg = 'Solar zone: ' + n1(acres) + ' ac, ' + n1(layout.kw / 1000) + ' MW-DC'
+      + (offset != null
+        ? ' \u2014 offsets ' + (offset * 100 < 1 ? 'under 1' : Math.round(offset * 100))
+          + '% of facility energy at a 0.20 capacity factor.'
+        : '.');
+    if (typeof showBanner === 'function') showBanner('cal', msg);
+    if (root.console) console.info(TAG + ' ' + msg);
+
+    return { acres: acres, kwDc: layout.kw, tables: layout.tableCount, offset: offset };
+  }
+
+  /* ── generation class override ──────────────────────────────────────── */
+
+  var chosen = null;   /* null = automatic */
+
+  function setClass(id) {
+    chosen = id || null;
+    try { localStorage.setItem('omega.genclass', chosen || ''); } catch (e) {}
+    return chosen;
+  }
+  try {
+    var sv = localStorage.getItem('omega.genclass');
+    if (sv) chosen = sv;
+  } catch (e) {}
+
+  /* The picker feeds OmegaPrimeMover.select through its classId option,
+     which already handles a forced choice and labels it "chosen by
+     hand" so the report does not present a preference as a derivation. */
+  function wrapSize() {
+    if (!root.OmegaCompute || typeof root.OmegaCompute.size !== 'function') return false;
+    if (root.OmegaCompute.size.__genclass) return true;
+    var orig = root.OmegaCompute.size;
+    root.OmegaCompute.size = function (cfg) {
+      cfg = cfg || {};
+      if (chosen && !cfg.classId) cfg = Object.assign({}, cfg, { classId: chosen });
+      return orig.call(this, cfg);
+    };
+    root.OmegaCompute.size.__genclass = true;
+    return true;
+  }
+
+  function classOptions() {
+    var list = [{ id: '', label: 'Automatic \u2014 by gap size' }];
+    try {
+      (root.OmegaPrimeMover.classes || []).forEach(function (c) {
+        list.push({
+          id: c.id,
+          label: c.label + ' \u2014 ' + (c.kw >= 1000 ? (c.kw / 1000) + ' MW' : c.kw + ' kW')
+        });
+      });
+    } catch (e) {}
+    return list;
+  }
+
+  /* Adds the picker and a solar note to the Design Site dialog without
+     rewriting it: the dialog is found after it opens and the controls
+     are inserted into the section that already exists. */
+  function augmentDialog() {
+    var w = document.getElementById('omega-design');
+    if (!w || w.__gen) return;
+    w.__gen = true;
+    var genChk = document.getElementById('od-gen');
+    if (!genChk) return;
+    var host = genChk.closest('label');
+    if (!host || !host.parentNode) return;
+
+    var wrap = document.createElement('div');
+    wrap.style.cssText = 'margin:-2px 0 9px 30px';
+    var sel = '<label style="font-size:10px;color:#9A9A9A;text-transform:uppercase;'
+      + 'letter-spacing:.6px;display:block;margin-bottom:4px">Prime mover</label>'
+      + '<select id="od-genclass" style="width:100%;background:#0B1626;border:1px solid #3A3A3A;'
+      + 'color:#E0E0E0;border-radius:6px;padding:7px;font-size:12px;font-family:inherit">';
+    classOptions().forEach(function (o) {
+      sel += '<option value="' + o.id + '"' + (o.id === (chosen || '') ? ' selected' : '')
+        + '>' + o.label + '</option>';
+    });
+    sel += '</select>';
+    wrap.innerHTML = sel;
+    host.parentNode.insertBefore(wrap, host.nextSibling);
+
+    var solarChk = document.getElementById('od-solar');
+    if (solarChk) {
+      var sh = solarChk.closest('label');
+      if (sh && sh.parentNode) {
+        var note = document.createElement('div');
+        note.style.cssText = 'margin:-2px 0 9px 30px;font-size:10px;color:#9A9A9A;'
+          + 'line-height:1.5';
+        note.textContent = 'Drawn into the solar zone \u2014 the ground left after compute, '
+          + 'generation and storage are placed.';
+        sh.parentNode.insertBefore(note, sh.nextSibling);
+      }
+    }
+  }
+
+  function hookDialog() {
+    if (!root.OmegaDesign || root.OmegaDesign.__aug) return false;
+    var openOrig = root.OmegaDesign.open;
+    root.OmegaDesign.open = function () {
+      var r = openOrig.apply(this, arguments);
+      setTimeout(augmentDialog, 20);
+      return r;
+    };
+    /* Read the picker back when the dialog runs. */
+    var runOrig = root.OmegaDesign.run;
+    root.OmegaDesign.run = function (opts) {
+      try {
+        var s = document.getElementById('od-genclass');
+        if (s) setClass(s.value || null);
+      } catch (e) {}
+      var out = runOrig.apply(this, arguments);
+      try {
+        if (root.OmegaDesign.der && root.OmegaDesign.der.solar) setTimeout(fillZone, 60);
+      } catch (e) {}
+      return out;
+    };
+    root.OmegaDesign.__aug = true;
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      wrapSize(); hookDialog();
+      if (++n > 40) clearInterval(iv);
+    }, 500);
+    if (root.console) {
+      console.info(TAG + ' ready \u2014 OmegaSolarZone.fill(), OmegaSolarZone.setClass(id)');
+    }
+  }
+
+  root.OmegaSolarZone = {
+    fill: fillZone, setClass: setClass,
+    chosen: function () { return chosen; },
+    options: classOptions, clip: clipPolyByRect
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 76 — AUTO-DESIGN ADAPTER
+ *  ---------------------------------------------------------------------
+ *  The engine is pure and tested. This is the only thing that touches
+ *  the page: read the boundary, scale, exclusions and ceiling; run
+ *  OmegaEngine.design(); draw what comes back. Nothing here decides
+ *  anything. If a number is wrong, it is wrong in the engine, where a
+ *  test can catch it.
+ *
+ *  This also becomes the single path for Design Site. The earlier
+ *  chain — OmegaDesign.run -> OmegaCapacity.solve -> OmegaCompute.size
+ *  wrapped five times -> OmegaComputePlace.build -> fillSolar — worked
+ *  when every link agreed and failed silently when any did not. One
+ *  call replaces it.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[AutoDesign]';
+  function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+  function n0(v) { return Math.round(v).toLocaleString(); }
+
+  /* ── read the page ──────────────────────────────────────────────────── */
+
+  function boundary() {
+    try { return root.OmegaComputePlace ? root.OmegaComputePlace.boundary() : null; } catch (e) { return null; }
+  }
+  function exclusions() {
+    try { return (root._alExclusions || []).filter(function (z) { return z && z.length >= 3; }); }
+    catch (e) { return []; }
+  }
+  function scale() { try { return +S.pxPerFt > 0 ? +S.pxPerFt : 0; } catch (e) { return 0; } }
+  function ceiling() {
+    try { if (root.OmegaDesign) return root.OmegaDesign.ceiling(); } catch (e) {}
+    try { return { kw: root.OmegaLayout ? root.OmegaLayout.ceilingKw() : 0, src: 'drawn substation' }; }
+    catch (e) { return { kw: 0, src: 'none' }; }
+  }
+
+  /* ── draw ───────────────────────────────────────────────────────────── */
+
+  function push(shape) {
+    if (shape.lf != null) shape.lf = Math.round(+shape.lf * 10) / 10;
+    if (shape.wf != null) shape.wf = Math.round(+shape.wf * 10) / 10;
+    S.shapes.push(shape);
+    try { if (typeof renderShape === 'function') renderShape(shape); } catch (e) {}
+    return shape;
+  }
+  function id(p, i) { return (typeof uid === 'function') ? uid() : p + i + Date.now(); }
+  function scaled() { return !!(scale() > 0); }
+
+  function draw(plan) {
+    try { root.OmegaComputePlace.clearAll(); } catch (e) {}
+    var s = plan.sizing, cfg = plan.cfg;
+    plan.slots.pods.forEach(function (sl, i) {
+      push({ id: id('p', i), kind: 'derdc', dcId: 'dc_leviathan', pts: [{ x: sl.x, y: sl.y }],
+        style: (S.shapeStyle || ''), lf: cfg.pod.lf, wf: cfg.pod.wf, model: cfg.pod.label,
+        kw: cfg.pod.kw, scaled: scaled(), omegaCompute: true });
+    });
+    if (s.gen) plan.slots.gen.forEach(function (sl, i) {
+      push({ id: id('g', i), kind: 'deralt', altId: s.gen.id, pts: [{ x: sl.x, y: sl.y }],
+        style: (S.shapeStyle || ''), lf: s.gen.lf, wf: s.gen.wf, model: s.gen.label,
+        kw: s.gen.kw, abbr: s.gen.label.split(' ')[0].toUpperCase(), fuel: 'natural gas',
+        scaled: scaled(), omegaCompute: true });
+    });
+    if (s.bess) plan.slots.bess.forEach(function (sl, i) {
+      push({ id: id('b', i), kind: 'bespad', pts: [{ x: sl.x, y: sl.y }],
+        style: (S.shapeStyle || ''), lf: cfg.bess.lf, wf: cfg.bess.wf, model: cfg.bess.label,
+        kw: Math.round(s.bess.kw / s.bess.units), kwh: Math.round(s.bess.kwh / s.bess.units),
+        scaled: scaled(), omegaCompute: true });
+    });
+    /* Solar through the app's own ground-layout engine, so row geometry
+       and kW are its numbers, not a second model's. */
+    if (plan.solar.built && plan.solar.polygon) {
+      try {
+        var lay = computeGroundLayout(plan.solar.polygon, exclusions());
+        if (lay) {
+          var sh = applyGroundLayout(plan.solar.polygon, lay, exclusions());
+          if (sh) { sh.omegaCompute = true; sh.omegaSolarZone = true; }
+          plan.solar.drawnKw = lay.kw;
+        }
+      } catch (e) { if (root.console) console.warn(TAG + ' solar', e && e.message); }
+    }
+    /* Substation and gas tie-in if missing. */
+    try {
+      var has = (S.shapes || []).some(function (x) { return x && x.kind === 'substation'; });
+      if (!has && s.utilKw > 0 && root.OmegaComputePlace.placeSubstation) root.OmegaComputePlace.placeSubstation();
+    } catch (e) {}
+    if (s.gen) { try { if (root.OmegaMaxFit) root.OmegaMaxFit.gasTieIn(); } catch (e) {} }
+
+    /* Hand the result to everything that draws from it. */
+    root._omegaComputePlaced = {
+      pods: plan.slots.pods.length, podsWanted: s.pods,
+      fc: plan.slots.gen.length, fcWanted: s.gen ? s.gen.units : 0,
+      podBox: extent(plan.slots.pods), fcBox: extent(plan.slots.gen), bessBox: extent(plan.slots.bess),
+      zones: plan.zones, sizing: toSizing(s), drawn: true, engine: true
+    };
+    root._omegaComputeLast = toSizing(s);
+    try { if (root.OmegaComputeHUD) root.OmegaComputeHUD.refresh(); } catch (e) {}
+    try { if (root.OmegaBuildLabels) root.OmegaBuildLabels.draw(); } catch (e) {}
+    try { if (root.OmegaSited) root.OmegaSited.refresh(); } catch (e) {}
+    try { if (typeof pushHist === 'function') pushHist(); } catch (e) {}
+  }
+
+  function extent(slots) {
+    if (!slots.length) return null;
+    var x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+    slots.forEach(function (s) {
+      x1 = Math.min(x1, s.x); y1 = Math.min(y1, s.y);
+      x2 = Math.max(x2, s.x + s.w); y2 = Math.max(y2, s.y + s.h);
+    });
+    return { x1: x1, y1: y1, x2: x2, y2: y2 };
+  }
+
+  /* The shape the rest of the page expects from OmegaCompute.size(). */
+  function toSizing(s) {
+    return {
+      itKw: s.itKw, facKw: s.facKw, critKw: s.critKw, utilKw: s.utilKw,
+      genNeedKw: s.gapKw, fcBlocks: s.gen ? s.gen.units : 0,
+      fcKw: s.gen ? s.gen.kwTotal : 0, fcBlockKw: s.gen ? s.gen.kw : 0,
+      fcSpec: s.gen ? { label: s.gen.label, kw: s.gen.kw, lf: s.gen.lf, wf: s.gen.wf } : null,
+      primeMover: s.gen, gasMmbtuHr: s.gen ? +s.gen.gasMmbtuHr.toFixed(2) : 0,
+      bessKw: s.bess ? s.bess.kw : 0, bessKwh: s.bess ? Math.round(s.bess.kwh) : 0,
+      pods: s.pods, redundancy: 'n1', rideMin: 10, pue: s.facKw / s.itKw,
+      gridLimited: s.gridLimited
+    };
+  }
+
+  /* ── run ────────────────────────────────────────────────────────────── */
+
+  function run(opts) {
+    opts = opts || {};
+    var poly = boundary(), P = scale(), c = ceiling();
+    if (!poly || poly.length < 3) return fail('Trace the parcel boundary first.');
+    if (!(P > 0)) return fail('Calibrate the drawing scale first.');
+
+    var der = (root.OmegaDesign && root.OmegaDesign.der) || { generation: true, storage: true, solar: false };
+    var genClass = null;
+    try { genClass = root.OmegaSolarZone ? root.OmegaSolarZone.chosen() : null; } catch (e) {}
+
+    var input = {
+      polygon: poly, exclusions: exclusions(), pxPerFt: P,
+      ceilingKw: c.kw, mode: opts.mode === 'max' ? 'max' : 'fixed',
+      itMw: +opts.itMw || 40,
+      generation: der.generation !== false, storage: der.storage !== false,
+      solar: der.solar === true, genClass: genClass || null,
+      redundancy: opts.redundancy || 'n1'
+    };
+    var over = {};
+    if (opts.rideMin != null) over.rideMin = +opts.rideMin;
+    if (opts.pue != null) over.pue = +opts.pue;
+
+    var plan = root.OmegaEngine.design(input, over);
+    if (!plan.ok) return fail('Could not design: ' + plan.errors.join('; '));
+
+    draw(plan);
+    root._omegaPlan = plan;
+
+    var s = plan.sizing;
+    var parts = [
+      s.itMw + ' MW IT (' + n1(s.facKw / 1000) + ' MW facility) on ' + n1(plan.parcelAc) + ' ac',
+      n1(s.utilKw / 1000) + ' MW from the ' + c.src,
+      s.gen ? s.gen.units + ' \u00d7 ' + (s.gen.kw >= 1000 ? s.gen.kw / 1000 + ' MW' : s.gen.kw + ' kW')
+        + ' ' + s.gen.label + ' closes a ' + n1(s.gapKw / 1000) + ' MW gap'
+        : (s.gridLimited ? 'GRID-LIMITED: ' + n1((s.facKw - s.utilKw) / 1000) + ' MW over the ceiling' : 'no on-site generation needed'),
+      s.bess ? s.bess.units + ' storage containers, ' + n0(s.bess.kwh) + ' kWh' : 'no storage',
+      plan.solar.built
+        ? n1(plan.solar.kwDc / 1000) + ' MW-DC solar on ' + n1(plan.solar.acres) + ' ac \u2014 '
+          + plan.solar.reason
+        : 'solar: ' + plan.solar.reason
+    ];
+    if (plan.boundBy) parts.push('bound by ' + plan.boundBy + ' after ' + plan.evals + ' evaluations');
+    var msg = parts.join('. ') + '.';
+    if (typeof showBanner === 'function') showBanner('cal', msg);
+    if (root.console) { console.info(TAG + ' ' + msg); console.table([{
+      itMw: s.itMw, facMw: n1(s.facKw / 1000), ceilingMw: n1(s.utilKw / 1000), gapMw: n1(s.gapKw / 1000),
+      generation: s.gen ? s.gen.units + 'x ' + s.gen.label : '\u2014',
+      storageKwh: s.bess ? Math.round(s.bess.kwh) : 0,
+      solarMwDc: plan.solar.built ? n1(plan.solar.kwDc / 1000) : 0,
+      solarWhy: plan.solar.reason, boundBy: plan.boundBy || plan.why || '\u2014', shapes: plan.shapes
+    }]); }
+    return plan;
+  }
+
+  function fail(msg) {
+    if (typeof showBanner === 'function') showBanner('cal', msg);
+    if (root.console) console.warn(TAG + ' ' + msg);
+    return null;
+  }
+
+  /* Design Site now routes here. */
+  function hook() {
+    if (!root.OmegaDesign || root.OmegaDesign.__engine) return false;
+    root.OmegaDesign.run = function (opts) { return run(opts); };
+    root.OmegaDesign.__engine = true;
+    if (root.console) console.info(TAG + ' Design Site now runs through OmegaEngine');
+    return true;
+  }
+  function boot() {
+    var n = 0, iv = setInterval(function () { if (hook() || ++n > 40) clearInterval(iv); }, 400);
+  }
+  root.OmegaAutoDesign = { run: run, draw: draw, last: function () { return root._omegaPlan || null; } };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
 
