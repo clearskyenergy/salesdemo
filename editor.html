@@ -155222,6 +155222,22 @@ if (root.console && console.info) {
       }
     } catch (e) { if (root.console) console.warn(TAG + ' extra solar fields', e && e.message); }
 
+    /* A container labelled "BESS container" tells a reviewer nothing.
+       Each one carries what it holds, so the drawing answers "how big"
+       without a trip to the results panel. */
+    try {
+      (S_().shapes || []).forEach(function (sh) {
+        if (!sh || sh.kind !== 'bespad' || !sh.omegaCompute || sh.omegaController) return;
+        var bits = [];
+        if (sh.kw) bits.push(Math.round(sh.kw).toLocaleString() + ' kW');
+        if (sh.kwh) bits.push(Math.round(sh.kwh).toLocaleString() + ' kWh');
+        if (bits.length && String(sh.model || '').indexOf('kWh') < 0) {
+          sh.model = (sh.model || 'BESS') + ' \u00b7 ' + bits.join(' / ');
+          if (typeof root.renderShape === 'function') root.renderShape(sh);
+        }
+      });
+    } catch (e) {}
+
     root._omegaCampusPlan = plan;
     /* Fences, the control yard and the ties, drawn from what is now on
        the canvas. Runs after the equipment, never before it. */
@@ -156952,7 +156968,15 @@ if (root.console && console.info) {
   };
 
   function S_() { return root.S; }
-  function P() { try { return +S_().pxPerFt > 0 ? +S_().pxPerFt : 0; } catch (e) { return 0; } }
+  /* The scale lives in two places. S.pxPerFt is the canvas value;
+     OmegaScale is what the rest of the app asks when the map owns the
+     scale instead. Reading only the first is why "calibrate the drawing
+     scale first" appeared on a site that plainly had one. */
+  function P() {
+    try { if (+S_().pxPerFt > 0) return +S_().pxPerFt; } catch (e) {}
+    try { if (root.OmegaScale && root.OmegaScale.pxPerFt() > 0) return +root.OmegaScale.pxPerFt(); } catch (e) {}
+    return 0;
+  }
   function n1(v) { return (Math.round(v * 10) / 10).toFixed(1); }
 
   /* ── 1. wheel passthrough ───────────────────────────────────────────── */
@@ -157100,7 +157124,13 @@ if (root.console && console.info) {
   function clearOurs() {
     var n = 0, keep = [];
     (S_().shapes || []).forEach(function (sh) {
-      if (sh && sh.omegaFence) {
+      /* Fences from any earlier pass, including the campus fences patch 77
+         used to draw before fencing was consolidated. Those are the
+         orange rectangles round empty ground that survived in saved
+         projects: nothing cleared them, because the code that made them
+         no longer runs. */
+      if (sh && (sh.omegaFence
+        || (sh.omegaCampus && (sh.kind === 'rect' || sh.omegaController)))) {
         n++;
         try {
           var el = document.querySelector('#csvg [data-shid="' + sh.id + '"]');
@@ -157111,7 +157141,7 @@ if (root.console && console.info) {
     S_().shapes = keep;
     var ck = [];
     (S_().conduits || []).forEach(function (c) {
-      if (c && c.omegaFence) {
+      if (c && (c.omegaFence || c.omegaCampus)) {
         try {
           var e2 = document.querySelector('[data-cid="' + c.id + '"]');
           if (e2 && e2.parentNode) e2.parentNode.removeChild(e2);
@@ -157236,17 +157266,21 @@ if (root.console && console.info) {
     /* Dashed security fence per compound, plus one round the control
        yard. Dashed on the plan because a fence is a line of posts, not
        a wall; solid rectangles read as buildings. */
+    /* Colour by what is inside, so a fence is readable at a glance
+       instead of being an anonymous dashed rectangle. */
+    var IN_COLOR = { storage: '#22D3EE', compute: '#A78BFA', generation: '#F97316',
+                     solar: '#F5C871', yard: '#4ADE80', control: '#4ADE80' };
     var fence = function (r, label, sub, tag) {
       return push({ id: nid('f'), kind: 'rect', style: 'dashed',
         pts: [{ x: r.x1, y: r.y1 }, { x: r.x2, y: r.y2 }],
-        color: (typeof root.SHAPE_STROKE !== 'undefined' ? root.SHAPE_STROKE : '#E0E0E0'),
+        color: IN_COLOR[tag] || '#4ADE80',
         omegaFence: true, omegaCampus: tag, campusLabel: label, campusSub: sub || null });
     };
     comps.forEach(function (c) {
       var acres = ((c.r.x2 - c.r.x1) / p) * ((c.r.y2 - c.r.y1) / p) / 43560;
       fence(c.r, c.label, n1(acres) + ' ac fenced \u00b7 ' + CFG.standoffFt + ' ft stand-off', c.key);
     });
-    fence(ctrlFence, null, null, 'control');
+    fence(ctrlFence, CFG.ctrlLabel, 'control yard \u00b7 every compound ties here', 'control');
 
     /* Ties. Corridors are the fire lanes between compounds, so the runs
        land on a grid instead of wandering. */
@@ -157346,6 +157380,216 @@ if (root.console && console.info) {
   else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
   if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaFenceTie;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 85 — CHOOSE THE PRIME MOVER, AND ITS SIZE
+ *  ---------------------------------------------------------------------
+ *  The engine picks generation by a rule nobody asked for: the smallest
+ *  class whose unit count lands between four and a hundred and fifty.
+ *  On a 42 MW gap that is 141 SOFC modules at 300 kW each — arithmetically
+ *  correct, and not what anybody would build. A 42 MW gap in Texas is
+ *  two aeroderivative turbines, or five large recips, and which one it
+ *  is depends on gas pressure, emissions, ramp rate, O&M appetite and
+ *  who is selling — none of which an auto-picker can know.
+ *
+ *  The dialog already read a control called od-genclass and passed the
+ *  choice through OmegaSolarZone into the sizer. That control was never
+ *  built, so the field was always empty and the fallback always ran.
+ *  This builds it, adds a custom entry for a machine that is not in the
+ *  list, and shows what each choice actually means before it is made:
+ *  unit count, gas demand, and the footprint it will take.
+ *
+ *  The unit count is live because that is the number that decides the
+ *  layout. Somebody looking at "141 units" and "2 units" for the same
+ *  megawatts does not need to be told which one to think about.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[PrimeMover]';
+  var LS = 'omega.genclass';
+
+  function classes() {
+    try { return (root.OmegaEngine && root.OmegaEngine.DEFAULTS.genClasses) || []; }
+    catch (e) { return []; }
+  }
+  function saved() {
+    try { return JSON.parse(localStorage.getItem(LS) || 'null'); } catch (e) { return null; }
+  }
+  function store(v) {
+    try { v ? localStorage.setItem(LS, JSON.stringify(v)) : localStorage.removeItem(LS); } catch (e) {}
+  }
+
+  /* A machine that is not in the list. Added to the engine's own class
+     table so every downstream number — gas demand, footprint, unit
+     count — comes from the same place as the built-in classes rather
+     than from a parallel path that can disagree with them. */
+  function applyCustom(c) {
+    var list = classes();
+    if (!list) return;
+    var i = -1;
+    for (var k = 0; k < list.length; k++) if (list[k].id === 'custom') i = k;
+    if (!c) { if (i >= 0) list.splice(i, 1); return; }
+    var entry = { id: 'custom', label: c.label || 'Custom prime mover',
+      kw: +c.kw || 1000, lf: +c.lf || 40, wf: +c.wf || 12,
+      clearFt: +c.clearFt || 20, heatRate: +c.heatRate || 9000 };
+    if (i >= 0) list[i] = entry; else list.push(entry);
+  }
+
+  /* The choice, in the shape the existing chain already reads. The
+     adapter asks OmegaSolarZone.chosen(); that module may or may not
+     carry the methods, so they are filled in rather than replaced. */
+  function install() {
+    var SZ = root.OmegaSolarZone = root.OmegaSolarZone || {};
+    if (!SZ.__prime) {
+      var current = saved();
+      if (current && current.custom) applyCustom(current.custom);
+      SZ.chosen = function () { var s = saved(); return s ? s.id : null; };
+      SZ.setClass = function (id) {
+        var s = saved() || {};
+        s.id = id || null; store(s.id || s.custom ? s : null);
+        return s.id;
+      };
+      SZ.setCustom = function (c) {
+        var s = saved() || {}; s.custom = c || null; applyCustom(c);
+        store(s.id || s.custom ? s : null); return c;
+      };
+      SZ.__prime = true;
+    }
+    return true;
+  }
+
+  /* ── the picker, injected into the Design Site dialog ───────────────── */
+
+  var IN = 'width:100%;background:#0B1626;border:1px solid #3A3A3A;color:#E0E0E0;'
+    + 'border-radius:6px;padding:8px;font-size:12.5px;font-family:inherit;box-sizing:border-box';
+  var LB = 'font-size:10px;color:#9A9A9A;text-transform:uppercase;letter-spacing:.6px;'
+    + 'display:block;margin-bottom:4px';
+
+  function ceilingKw() {
+    try { return root.OmegaDesign.ceiling().kw || 0; } catch (e) { return 0; }
+  }
+
+  function summary(id) {
+    var it = 40, pue = 1.3;
+    try {
+      var e = document.getElementById('od-it');
+      if (e && e.value) it = parseFloat(e.value) || 40;
+    } catch (e) {}
+    var gap = Math.max(0, it * 1000 * pue - ceilingKw());
+    if (gap <= 0) return 'The utility covers the whole load \u2014 no on-site generation needed.';
+    var list = classes(), c = null;
+    for (var k = 0; k < list.length; k++) if (list[k].id === id) c = list[k];
+    if (!c) {
+      return 'Auto picks the smallest class that lands between 4 and 150 units \u2014 on a '
+        + (gap / 1000).toFixed(1) + ' MW gap that is usually a lot of small machines.';
+    }
+    var n = Math.ceil(gap / c.kw) + 1;                 /* +1 for N+1 */
+    var gas = (n * c.kw * c.heatRate) / 1e6;
+    var acres = n * ((c.lf + c.clearFt) * (c.wf + c.clearFt)) / 43560;
+    return n + ' \u00d7 ' + (c.kw >= 1000 ? (c.kw / 1000) + ' MW' : c.kw + ' kW')
+      + ' for a ' + (gap / 1000).toFixed(1) + ' MW gap at N+1 \u00b7 '
+      + gas.toFixed(1) + ' MMBtu/hr of gas \u00b7 about ' + acres.toFixed(1) + ' ac of pad';
+  }
+
+  function inject() {
+    var dlg = document.getElementById('omega-design');
+    if (!dlg || dlg.__prime) return;
+    dlg.__prime = true;
+    install();
+
+    /* Sits under "What to build", because which machine is part of what
+       is being built, not a setting somewhere else. */
+    var anchor = dlg.querySelector('#od-solar');
+    var host = anchor ? anchor.closest('label') : null;
+    if (!host || !host.parentNode) return;
+
+    var list = classes(), cur = (root.OmegaSolarZone.chosen && root.OmegaSolarZone.chosen()) || '';
+    var opts = '<option value=""' + (cur ? '' : ' selected') + '>Auto \u2014 let the engine choose</option>';
+    list.forEach(function (c) {
+      if (c.id === 'custom') return;
+      opts += '<option value="' + c.id + '"' + (cur === c.id ? ' selected' : '') + '>'
+        + c.label + ' \u2014 ' + (c.kw >= 1000 ? (c.kw / 1000) + ' MW' : c.kw + ' kW') + '</option>';
+    });
+    opts += '<option value="custom"' + (cur === 'custom' ? ' selected' : '')
+      + '>Custom \u2014 enter the machine</option>';
+
+    var wrap = document.createElement('div');
+    wrap.style.cssText = 'margin-top:12px';
+    wrap.innerHTML = '<label style="' + LB + '">Prime mover</label>'
+      + '<select id="od-genclass" style="' + IN + '">' + opts + '</select>'
+      + '<div id="od-genwhy" style="font-size:10.5px;color:#9A9A9A;margin-top:5px;'
+      + 'line-height:1.5"></div>'
+      + '<div id="od-gencustom" style="display:none;margin-top:8px">'
+      + '<div style="display:flex;gap:8px">'
+      + '<div style="flex:1"><label style="' + LB + '">Unit kW</label>'
+      + '<input id="od-gckw" type="number" step="50" style="' + IN + '" placeholder="e.g. 30000"></div>'
+      + '<div style="flex:1"><label style="' + LB + '">Heat rate Btu/kWh</label>'
+      + '<input id="od-gchr" type="number" step="100" style="' + IN + '" placeholder="e.g. 10500"></div>'
+      + '</div><div style="display:flex;gap:8px;margin-top:6px">'
+      + '<div style="flex:1"><label style="' + LB + '">Pad length ft</label>'
+      + '<input id="od-gclf" type="number" step="1" style="' + IN + '" placeholder="90"></div>'
+      + '<div style="flex:1"><label style="' + LB + '">Pad width ft</label>'
+      + '<input id="od-gcwf" type="number" step="1" style="' + IN + '" placeholder="26"></div>'
+      + '<div style="flex:1"><label style="' + LB + '">Clearance ft</label>'
+      + '<input id="od-gcclr" type="number" step="1" style="' + IN + '" placeholder="40"></div>'
+      + '</div>'
+      + '<div style="font-size:10px;color:#F59E0B;margin-top:5px;line-height:1.5">'
+      + 'Straight off the machine\u2019s datasheet. Nothing here is defaulted for you \u2014 '
+      + 'a made-up heat rate becomes a made-up gas bill.</div></div>';
+    host.parentNode.insertBefore(wrap, host.nextSibling);
+
+    var sel = wrap.querySelector('#od-genclass');
+    var why = wrap.querySelector('#od-genwhy');
+    var custom = wrap.querySelector('#od-gencustom');
+
+    var refresh = function () {
+      var v = sel.value;
+      custom.style.display = (v === 'custom') ? '' : 'none';
+      if (v === 'custom') {
+        var g = function (id) { var e = wrap.querySelector('#' + id); return e && e.value ? parseFloat(e.value) : null; };
+        var kw = g('od-gckw'), hr = g('od-gchr');
+        if (kw && hr) {
+          root.OmegaSolarZone.setCustom({ label: 'Custom prime mover', kw: kw, heatRate: hr,
+            lf: g('od-gclf') || 40, wf: g('od-gcwf') || 12, clearFt: g('od-gcclr') || 20 });
+          why.textContent = summary('custom');
+        } else {
+          why.textContent = 'Enter the unit rating and the heat rate \u2014 without both, the '
+            + 'unit count and the gas demand cannot be worked out.';
+        }
+      } else {
+        why.textContent = summary(v);
+      }
+      root.OmegaSolarZone.setClass(v || null);
+    };
+    wrap.addEventListener('input', refresh);
+    wrap.addEventListener('change', refresh);
+    /* The load field lives outside this block but changes the answer. */
+    var it = dlg.querySelector('#od-it');
+    if (it) it.addEventListener('input', function () { refresh(); });
+    refresh();
+  }
+
+  function boot() {
+    install();
+    /* The dialog is built on demand, so watch for it rather than trying
+       to wrap a function that may not exist yet. */
+    var n = 0, iv = setInterval(function () { install(); inject(); if (++n > 3000) clearInterval(iv); }, 250);
+    if (root.console) console.info(TAG + ' ready \u2014 prime mover picker in Design Site');
+  }
+
+  root.OmegaPrimeMover = {
+    set: function (id) { install(); return root.OmegaSolarZone.setClass(id); },
+    custom: function (c) { install(); return root.OmegaSolarZone.setCustom(c); },
+    chosen: function () { install(); return root.OmegaSolarZone.chosen(); },
+    classes: classes, summary: summary
+  };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaPrimeMover;
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
