@@ -100299,17 +100299,6 @@ button[style*="linear-gradient"][aria-disabled="true"]{
   var mode = 'pro';
 
   function set(m, quiet) {
-    /* Patch 117: Designer / Pro / Compute are one choice, not two
-       settings. Compute mode hides six tabs and every Analyze panel that
-       is not its own, so pressing Pro while it was on left a ribbon with
-       most of it missing and no obvious way back -- Pro is supposed to
-       mean the full ribbon. Choosing either of these turns Compute mode
-       off first, which restores every node it had gathered. */
-    try {
-      if (window.OmegaComputeMode && window.OmegaComputeMode.isOn && window.OmegaComputeMode.isOn()) {
-        window.OmegaComputeMode.off();
-      }
-    } catch (e) {}
     mode = (m === 'designer') ? 'designer' : 'pro';
     document.body.classList.toggle('omg-designer', mode === 'designer');
     tagAll();
@@ -155167,9 +155156,7 @@ if (root.console && console.info) {
   var TAG = '[ComputeMode]';
 
   var KEY = 'omega.ui.compute';
-  /* Patch 116: the Compute tab (Patch 114) is the compute workspace and
-     belongs in the curated set. */
-  var TABS = ['home', 'compute', 'analyze', 'estimate', 'output'];
+  var TABS = ['home', 'analyze', 'estimate', 'output'];
 
   /* label -> group caption, in the order the video lays them out. */
   var TOOLS = [
@@ -155229,9 +155216,7 @@ if (root.console && console.info) {
     if (on) return true;
     if (!document.getElementById('ribbon')) return false;
 
-    /* Designer hides Analyze, which is where this mode lives. Set the
-       mode BEFORE `on` is true, so Patch 117's guard in OmegaMode.set
-       sees this mode as off and does not immediately undo it. */
+    /* Designer hides Analyze, which is where this mode lives. */
     try { if (root.OmegaMode && root.OmegaMode.get() !== 'pro') root.OmegaMode.set('pro'); } catch (e) {}
 
     var all = Array.prototype.slice.call(document.querySelectorAll('#ribbon .rbtn'));
@@ -155244,19 +155229,6 @@ if (root.console && console.info) {
         if (labelOf(all[i]) !== t.label) continue;
         var body = panelIn('analyze', t.group);
         if (!body) continue;
-        /* Patch 117: Site Setup is the first thing every project type
-           does and it is the only button in Build's Site group. Moving
-           it left that group as a caption with nothing under it, so this
-           one is COPIED rather than moved. The clone carries the same
-           onclick and is discarded with the rest on off(). */
-        if (t.label === 'site setup') {
-          var c = all[i].cloneNode(true);
-          c.id = ''; c.classList.remove('home-hero');
-          c.onclick = all[i].onclick;
-          body.appendChild(c);
-          made.push(c);
-          break;
-        }
         remember(all[i]);
         all[i].style.display = '';
         body.appendChild(all[i]);
@@ -155308,7 +155280,6 @@ if (root.console && console.info) {
     undo = []; made = []; on = false;
     try { localStorage.removeItem(KEY); } catch (e) {}
     badge();
-    try { if (root.OmegaComputeTab && root.OmegaComputeTab.place) root.OmegaComputeTab.place(); } catch (e) {}
     if (root.console) console.info(TAG + ' off \u2014 full ribbon restored.');
     return true;
   }
@@ -155331,7 +155302,7 @@ if (root.console && console.info) {
     }
     b.textContent = 'Compute';
     b.title = on
-      ? 'Compute mode is on \u2014 a curated ribbon. Click here, or Designer / Pro, to restore the full one.'
+      ? 'Compute mode is on \u2014 four tabs, six tools. Click to restore the full ribbon.'
       : 'Compute mode \u2014 curate the ribbon for siting a large load on energised land.';
     b.style.background = on ? 'rgba(124,58,237,.22)' : 'rgba(255,255,255,.04)';
     b.style.border = '1px solid ' + (on ? '#7C3AED' : '#3A3A3A');
@@ -160948,12 +160919,6 @@ if (root.console && console.info) {
   }
   function place() {
     var moved = 0;
-    /* Patch 116: Compute MODE (Patch 59) gathers Compute Build and Load
-       Screen into its Analyze groups by label. While it is on, this
-       mover stands down -- otherwise the two fight every 500 ms and the
-       mode's Build group is left empty. When the mode turns off it puts
-       the nodes back where it found them, which is here. */
-    try { if (root.OmegaComputeMode && root.OmegaComputeMode.isOn()) return 0; } catch (e) {}
     Object.keys(PLAN).forEach(function (key) {
       var body = panel(key); if (!body) return;
       var prev = null;
