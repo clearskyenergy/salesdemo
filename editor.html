@@ -1648,7 +1648,6 @@ window.onerror = function(msg, src, line, col, err) {
     <div class="rtab"        data-page="__file"  onclick="rbAppMenu(event)">File</div>
     <div class="rtab"        data-page="modify"  onclick="rbTab('modify')">Edit</div>
     <div class="rtab active" data-page="home"    onclick="rbTab('home')">Build</div>
-    <div class="rtab"        data-page="compute" onclick="rbTab('compute')" title="Compute campus &mdash; site, design, sizing and cost tools for a data-centre campus with on-site power">Compute</div>
     <div class="rtab"        data-page="insert"  onclick="rbTab('insert')">Insert</div>
     <div class="rtab"        data-page="draw"    onclick="rbTab('draw')">Draw</div>
     <div class="rtab"        data-page="annotate" onclick="rbTab('annotate')">Annotate</div>
@@ -1666,7 +1665,6 @@ window.onerror = function(msg, src, line, col, err) {
     <button class="rtm-item" onclick="rbHamburgerPick('__file')">File</button>
     <button class="rtm-item" onclick="rbHamburgerPick('modify')">Edit</button>
     <button class="rtm-item" onclick="rbHamburgerPick('home')">Build</button>
-    <button class="rtm-item" onclick="rbHamburgerPick('compute')">Compute</button>
     <button class="rtm-item" onclick="rbHamburgerPick('insert')">Insert</button>
     <button class="rtm-item" onclick="rbHamburgerPick('draw')">Draw</button>
     <button class="rtm-item" onclick="rbHamburgerPick('annotate')">Annotate</button>
@@ -1718,7 +1716,7 @@ window.onerror = function(msg, src, line, col, err) {
           <span class="rb-lbl" style="font-weight:700;color:var(--text);white-space:nowrap">Site Setup</span>
         </button>
       </div>
-      <div class="rpanel-cap">1 &middot; Site</div>
+      <div class="rpanel-cap">1 &middot; Compute Campus</div>
     </div>
     <!-- Build flows, ordered by project type. One button per destination. -->
     <div class="rpanel">
@@ -1755,31 +1753,6 @@ window.onerror = function(msg, src, line, col, err) {
         <div style="font-size:9.5px;color:var(--sub);padding:6px 4px">Loading recent projects…</div>
       </div>
       <div class="rpanel-cap">Recent</div>
-    </div>
-  </div>
-
-  <!-- COMPUTE (Patch 114). A data-centre campus has its own sequence --
-       site, design, size, cost -- and eleven of those tools were stacked
-       into one group on Build, next to the BESS and EV tracks. They live
-       here now, in the order you use them. The buttons are the same DOM
-       nodes the patches inject; OmegaComputeTab moves them into these
-       panels as they appear, so nothing was re-implemented. -->
-  <div class="ribbon-page" data-page="compute">
-    <div class="rpanel" data-ct="site" data-shelf="1">
-      <div class="rpanel-body"></div>
-      <div class="rpanel-cap">1 &middot; Site</div>
-    </div>
-    <div class="rpanel" data-ct="place" data-shelf="1">
-      <div class="rpanel-body"></div>
-      <div class="rpanel-cap">2 &middot; Place</div>
-    </div>
-    <div class="rpanel" data-ct="design" data-shelf="1">
-      <div class="rpanel-body"></div>
-      <div class="rpanel-cap">3 &middot; Design</div>
-    </div>
-    <div class="rpanel" data-ct="size" data-shelf="1">
-      <div class="rpanel-body"></div>
-      <div class="rpanel-cap">4 &middot; Size &amp; Cost</div>
     </div>
   </div>
 
@@ -100299,17 +100272,6 @@ button[style*="linear-gradient"][aria-disabled="true"]{
   var mode = 'pro';
 
   function set(m, quiet) {
-    /* Patch 117: Designer / Pro / Compute are one choice, not two
-       settings. Compute mode hides six tabs and every Analyze panel that
-       is not its own, so pressing Pro while it was on left a ribbon with
-       most of it missing and no obvious way back -- Pro is supposed to
-       mean the full ribbon. Choosing either of these turns Compute mode
-       off first, which restores every node it had gathered. */
-    try {
-      if (window.OmegaComputeMode && window.OmegaComputeMode.isOn && window.OmegaComputeMode.isOn()) {
-        window.OmegaComputeMode.off();
-      }
-    } catch (e) {}
     mode = (m === 'designer') ? 'designer' : 'pro';
     document.body.classList.toggle('omg-designer', mode === 'designer');
     tagAll();
@@ -153675,13 +153637,7 @@ if (root.console && console.info) {
     var ov = document.getElementById('report-overlay');
     if (!ov) { if (root.console) console.warn(TAG + ' no report overlay'); return false; }
     if (typeof openReport === 'function') { try { openReport('location'); } catch (e) {} }
-    /* Patch 115: openReport shows the overlay as display:block, which is
-       what lets a tall report scroll. This set it to flex, which turned
-       the card into a flex item stretched to the viewport and its
-       overflow:hidden clipped everything below the fold -- the screen
-       ended at "Estimated fibre RTT" and would not scroll. */
-    ov.style.display = 'block';
-    ov.scrollTop = 0;
+    ov.style.display = 'flex';
     var body = document.getElementById('report-body');
     if (body) body.innerHTML = html();
     var tabs = document.querySelectorAll('.report-tab');
@@ -155034,11 +154990,7 @@ if (root.console && console.info) {
     var pages = document.querySelectorAll('#ribbon .ribbon-page');
     for (var i = 0; i < pages.length; i++) {
       var pg = pages[i], name = pg.getAttribute('data-page');
-      /* Patch 118: 'compute' is filled at runtime by OmegaComputeTab, and
-         this runs 1.2 s after load -- before the injectors it waits on.
-         Hiding it then made the tab and its four panels disappear for the
-         rest of the session, because apply() only ever runs once. */
-      if (name === 'home' || name === 'validation' || name === 'compute') continue;
+      if (name === 'home' || name === 'validation') continue;
       var live = 0;
       var bs = pg.querySelectorAll('.rbtn');
       for (var j = 0; j < bs.length; j++) {
@@ -155171,9 +155123,7 @@ if (root.console && console.info) {
   var TAG = '[ComputeMode]';
 
   var KEY = 'omega.ui.compute';
-  /* Patch 116: the Compute tab (Patch 114) is the compute workspace and
-     belongs in the curated set. */
-  var TABS = ['home', 'compute', 'analyze', 'estimate', 'output'];
+  var TABS = ['home', 'analyze', 'estimate', 'output'];
 
   /* label -> group caption, in the order the video lays them out. */
   var TOOLS = [
@@ -155233,9 +155183,7 @@ if (root.console && console.info) {
     if (on) return true;
     if (!document.getElementById('ribbon')) return false;
 
-    /* Designer hides Analyze, which is where this mode lives. Set the
-       mode BEFORE `on` is true, so Patch 117's guard in OmegaMode.set
-       sees this mode as off and does not immediately undo it. */
+    /* Designer hides Analyze, which is where this mode lives. */
     try { if (root.OmegaMode && root.OmegaMode.get() !== 'pro') root.OmegaMode.set('pro'); } catch (e) {}
 
     var all = Array.prototype.slice.call(document.querySelectorAll('#ribbon .rbtn'));
@@ -155248,19 +155196,6 @@ if (root.console && console.info) {
         if (labelOf(all[i]) !== t.label) continue;
         var body = panelIn('analyze', t.group);
         if (!body) continue;
-        /* Patch 117: Site Setup is the first thing every project type
-           does and it is the only button in Build's Site group. Moving
-           it left that group as a caption with nothing under it, so this
-           one is COPIED rather than moved. The clone carries the same
-           onclick and is discarded with the rest on off(). */
-        if (t.label === 'site setup') {
-          var c = all[i].cloneNode(true);
-          c.id = ''; c.classList.remove('home-hero');
-          c.onclick = all[i].onclick;
-          body.appendChild(c);
-          made.push(c);
-          break;
-        }
         remember(all[i]);
         all[i].style.display = '';
         body.appendChild(all[i]);
@@ -155312,7 +155247,6 @@ if (root.console && console.info) {
     undo = []; made = []; on = false;
     try { localStorage.removeItem(KEY); } catch (e) {}
     badge();
-    try { if (root.OmegaComputeTab && root.OmegaComputeTab.place) root.OmegaComputeTab.place(); } catch (e) {}
     if (root.console) console.info(TAG + ' off \u2014 full ribbon restored.');
     return true;
   }
@@ -155335,7 +155269,7 @@ if (root.console && console.info) {
     }
     b.textContent = 'Compute';
     b.title = on
-      ? 'Compute mode is on \u2014 a curated ribbon. Click here, or Designer / Pro, to restore the full one.'
+      ? 'Compute mode is on \u2014 four tabs, six tools. Click to restore the full ribbon.'
       : 'Compute mode \u2014 curate the ribbon for siting a large load on energised land.';
     b.style.background = on ? 'rgba(124,58,237,.22)' : 'rgba(255,255,255,.04)';
     b.style.border = '1px solid ' + (on ? '#7C3AED' : '#3A3A3A');
@@ -160697,8 +160631,7 @@ if (root.console && console.info) {
     { n: 94, k: 'OmegaRibbon',        what: 'empty ribbon groups hidden' },
     { n: 98, k: 'OmegaSubstationClean', what: 'substation label slab removal' },
     { n: 112, k: 'OmegaCanvasCost',   what: 'pods and generation priced off the canvas; ITC basis; pod price saves with project' },
-    { n: 113, k: 'OmegaSharpExport',  what: 'mosaic aerial at export zoom, print-resolution capture, lossless blueprint image' },
-    { n: 114, k: 'OmegaComputeTab',   what: 'Compute ribbon tab: site, place, design, size & cost' }
+    { n: 113, k: 'OmegaSharpExport',  what: 'mosaic aerial at export zoom, print-resolution capture, lossless blueprint image' }
   ];
 
   /* Source-level edits have no module to look for, so they are detected
@@ -160901,135 +160834,6 @@ if (root.console && console.info) {
     }
   };
   if (root.console) console.info('[SharpExport] ready \u2014 OmegaSharpExport.status()');
-})(typeof window !== 'undefined' ? window : globalThis);
-</script>
-<script>
-/* ══════════════════════════════════════════════════════════════════════
- *  OMEGA PATCH 114 — COMPUTE GETS ITS OWN TAB
- *  ---------------------------------------------------------------------
- *  The compute tools are injected into the Build page by a dozen patches,
- *  each inserting itself next to whichever earlier button it found. The
- *  Compute page is static HTML with four empty panels; this watches the
- *  ribbon and moves each tool, by id, into the panel it belongs in, in a
- *  fixed order. Nothing is cloned except Site Setup, which every project
- *  type starts with and stays on Build too.
- * ══════════════════════════════════════════════════════════════════════ */
-(function (root) {
-  'use strict';
-  var TAG = '[ComputeTab]';
-  /* panel -> ordered ids (or a selector for the two static buttons) */
-  var PLAN = {
-    site:   ['@site-setup', 'rb-trace-boundary', 'rb-trace-exclusion', 'rb-place-sub', 'rb-gas-tie', 'rb-max-fit'],
-    place:  ['@dc-cluster'],
-    design: ['rb-design-site', '@compute-build', 'rb-site-build', 'rb-sub-envelope', 'rb-buildable', 'rb-fence-tie', 'rb-feas-csv'],
-    size:   ['rb-elec', 'rb-max-load', 'rb-load-screen', 'rb-optimise', 'rb-compute-cost']
-  };
-  function panel(key) {
-    return document.querySelector('#ribbon .ribbon-page[data-page="compute"] .rpanel[data-ct="' + key + '"] .rpanel-body');
-  }
-  function find(id) {
-    if (id === '@site-setup') {
-      var ex = document.getElementById('rb-compute-site-setup');
-      if (ex) return ex;
-      var hero = document.querySelector('#ribbon .ribbon-page[data-page="home"] .rbtn.home-hero');
-      if (!hero) return null;
-      var c = hero.cloneNode(true); c.id = 'rb-compute-site-setup'; c.classList.remove('home-hero');
-      return c;
-    }
-    if (id === '@compute-build') {
-      var bs = document.querySelectorAll('#ribbon .rbtn');
-      for (var i = 0; i < bs.length; i++) {
-        if ((bs[i].getAttribute('onclick') || '').indexOf("_guidedPick('compute')") > -1) return bs[i];
-      }
-      return null;
-    }
-    if (id === '@dc-cluster') {
-      var b = document.getElementById('rb-dccluster');
-      return b ? (b.closest('.rbtn-wrap') || b) : null;
-    }
-    var el = document.getElementById(id);
-    return el ? (el.closest('.rbtn-wrap') || el) : null;
-  }
-  function place() {
-    var moved = 0;
-    /* Patch 116: Compute MODE (Patch 59) gathers Compute Build and Load
-       Screen into its Analyze groups by label. While it is on, this
-       mover stands down -- otherwise the two fight every 500 ms and the
-       mode's Build group is left empty. When the mode turns off it puts
-       the nodes back where it found them, which is here. */
-    try { if (root.OmegaComputeMode && root.OmegaComputeMode.isOn()) return 0; } catch (e) {}
-    Object.keys(PLAN).forEach(function (key) {
-      var body = panel(key); if (!body) return;
-      var prev = null;
-      PLAN[key].forEach(function (id) {
-        var el = find(id); if (!el) return;
-        var want = prev ? prev.nextSibling : body.firstChild;
-        if (el.parentNode !== body || el !== want) {
-          body.insertBefore(el, prev ? prev.nextSibling : body.firstChild);
-          moved++;
-        }
-        prev = el;
-      });
-    });
-    /* Patch 118: a sweep that ran while these panels were still empty may
-       have hidden them, and those sweeps only restore what they flagged
-       themselves. Anything holding a button is shown. */
-    try {
-      var pg = document.querySelector('#ribbon .ribbon-page[data-page="compute"]');
-      if (pg) {
-        var pnls = pg.querySelectorAll('.rpanel');
-        for (var i = 0; i < pnls.length; i++) {
-          if (pnls[i].querySelector('.rbtn') && pnls[i].style.display === 'none') pnls[i].style.display = '';
-        }
-        if (pg.querySelector('.rbtn')) {
-          var tab = document.querySelector('#ribbon-tabs .rtab[data-page="compute"]');
-          if (tab && tab.style.display === 'none') tab.style.display = '';
-          var mi = document.querySelector('#ribbon-tab-menu .rtm-item[onclick*="compute"]');
-          if (mi && mi.style.display === 'none') mi.style.display = '';
-        }
-      }
-    } catch (e) {}
-    return moved;
-  }
-  function keepInDesigner() {
-    try {
-      if (root.OmegaMode && root.OmegaMode.tabs) root.OmegaMode.tabs.compute = 1;
-      if (root.OmegaMode && root.OmegaMode.keep) root.OmegaMode.keep(/rb-compute-site-setup|rb-dccluster/);
-      if (root.OmegaMode && root.OmegaMode.retag) root.OmegaMode.retag();
-    } catch (e) {}
-  }
-  var pending = null;
-  function later() { clearTimeout(pending); pending = setTimeout(function () { try { place(); } catch (e) {} }, 120); }
-  function boot() {
-    var rb = document.getElementById('ribbon');
-    if (!rb || !panel('site')) { setTimeout(boot, 400); return; }
-    place(); keepInDesigner();
-    /* The injectors run on their own timers for the first minutes of a
-       session and a mode switch repopulates panels, so this watches the
-       Build page rather than running once. */
-    var home = document.querySelector('#ribbon .ribbon-page[data-page="home"]');
-    try {
-      new MutationObserver(later).observe(home || rb, { childList: true, subtree: true });
-    } catch (e) {}
-    var n = 0, iv = setInterval(function () { place(); if (++n === 6) keepInDesigner(); if (n > 240) clearInterval(iv); }, 500);
-    if (root.console) console.info(TAG + ' ready \u2014 OmegaComputeTab.status()');
-  }
-  root.OmegaComputeTab = {
-    place: place,
-    status: function () {
-      var o = {};
-      Object.keys(PLAN).forEach(function (k) {
-        var body = panel(k);
-        o[k] = body ? Array.prototype.map.call(body.querySelectorAll('.rbtn'), function (b) {
-          return (b.id || b.textContent.replace(/\s+/g, ' ').trim()) + (b.offsetParent || b.style.display !== 'none' ? '' : ' (hidden)');
-        }).join(', ') : '(no panel)';
-      });
-      if (root.console) console.table ? console.table(o) : console.log(o);
-      return o;
-    }
-  };
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
-  else boot();
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
 <script>
