@@ -154613,6 +154613,31 @@ if (root.console && console.info) {
     var anchor = { x: (ctrl.x1 + ctrl.x2) / 2, y: (ctrl.y1 + ctrl.y2) / 2 };
     ctrl.kind = 'control';
 
+    /* QUADRANTS.
+
+       Everything used to be placed by distance to the control yard, so
+       four compounds crowded the middle and the open ground came out as
+       four leftover slivers with the solar field fighting for one of
+       them. A site is laid out in quarters: one function per quadrant,
+       the switching yard in the middle where the feeders meet, and the
+       ground that is left over is contiguous instead of shredded.
+
+       Generation goes opposite compute — the 40 ft separation between
+       them is the controlling clearance, so putting them in diagonal
+       quadrants satisfies it by construction rather than by search. */
+    var qx = (band.x1 + band.x2) / 2, qy = (band.y1 + band.y2) / 2;
+    var QUAD = {
+      compute:    { x: band.x1, y: band.y1 },   /* NW */
+      storage:    { x: band.x2, y: band.y1 },   /* NE */
+      generation: { x: band.x2, y: band.y2 },   /* SE */
+      yard:       { x: band.x1, y: band.y2 }    /* SW */
+    };
+    /* Anchored on the CORNER of each quadrant rather than its centre.
+       Compounds pulled to the middle of their quarters leave four
+       leftover slivers; pulled into the corners they leave one open
+       middle, which is the difference between a fragmented solar field
+       and a contiguous one. */
+
     var taken = [ctrl], zones = {}, zonesGrid = {}, slots = { pods: [], gen: [], bess: [], yard: [] };
     var why = null;
 
@@ -154647,13 +154672,22 @@ if (root.console && console.info) {
         var base = Math.sqrt(grp.area * CAMPUS.aspect);
         for (k = 0; k < 5 && !got; k++) {
           pk = yardPack(grp.yard, base * [1, 0.7, 1.5, 0.5, 2.4][k]);
-          got = place(M, pk.w, pk.h, grp.kind, taken, P, CL, anchor);
+          got = place(M, pk.w, pk.h, grp.kind, taken, P, CL, QUAD[grp.key] || anchor);
         }
       } else {
         var opts = colOptions(grp.n, grp.w, grp.h, grp.gap);
         for (k = 0; k < opts.length && !got; k++) {
           pk = gridPack(grp.n, grp.w, grp.h, grp.gap, opts[k], grp.skind, grp.slabel);
-          got = place(M, pk.w, pk.h, grp.kind, taken, P, CL, anchor);
+          got = place(M, pk.w, pk.h, grp.kind, taken, P, CL, QUAD[grp.key] || anchor);
+        }
+        /* A quadrant is a preference, not a rule. If a compound will not
+           fit in its quarter of a lopsided parcel, it takes the nearest
+           free ground to the control yard rather than failing. */
+        if (!got) {
+          for (k = 0; k < opts.length && !got; k++) {
+            pk = gridPack(grp.n, grp.w, grp.h, grp.gap, opts[k], grp.skind, grp.slabel);
+            got = place(M, pk.w, pk.h, grp.kind, taken, P, CL, anchor);
+          }
         }
       }
       if (!got) { why = 'land (' + grp.key + ')'; return; }
@@ -156323,6 +156357,78 @@ if (root.console && console.info) {
     return n.n;
   }
 
+  /* ── the other way a save fails: size ───────────────────────────────── */
+
+  /* Firestore stops at 1 MiB per document, and a campus site walks into
+     that ceiling carrying three copies of the same geometry. A solar
+     array holds `tables` in pixels, `_ftTables` in feet and `_geoTables`
+     in lat/lng; two of those three are caches rebuilt on load from the
+     third. Writing all three spends the budget on nothing.
+
+     So the payload copy — never the live model — drops the caches that
+     can be rebuilt, and if the document is still over the limit the
+     failure names the biggest contributors instead of blaming the
+     connection. */
+  var LIMIT = 1048576;
+  var REBUILDABLE = ['tables', '_geoTables'];
+
+  function prune(v) {
+    if (Array.isArray(v)) return v.map(prune);
+    if (plain(v)) {
+      var o = {};
+      for (var k in v) {
+        if (!Object.prototype.hasOwnProperty.call(v, k)) continue;
+        /* Only where the source of truth is present to rebuild from. */
+        if (k === 'tables' && v._ftTables && v._ftTables.length) continue;
+        if (k === '_geoTables' && v._ftTables && v._ftTables.length) continue;
+        o[k] = prune(v[k]);
+      }
+      return o;
+    }
+    return v;
+  }
+
+  function bytes(v) {
+    try { return JSON.stringify(v).length; } catch (e) { return -1; }
+  }
+
+  function sizeReport(data) {
+    var rows = [];
+    for (var k in data) {
+      if (!Object.prototype.hasOwnProperty.call(data, k)) continue;
+      var b = bytes(data[k]);
+      if (b > 1024) rows.push({ field: k, kb: Math.round(b / 1024) });
+    }
+    rows.sort(function (a, b2) { return b2.kb - a.kb; });
+    return rows;
+  }
+
+  function shrink(data) {
+    var before = bytes(data);
+    var out = prune(data);
+    var after = bytes(out);
+    if (before > 0 && after < before && root.console) {
+      console.info(TAG + ' dropped ' + Math.round((before - after) / 1024)
+        + ' KB of rebuildable geometry caches from the write');
+    }
+    if (after > LIMIT && root.console) {
+      console.error(TAG + ' the document is ' + (after / 1048576).toFixed(2)
+        + ' MB, over Firestore\u2019s 1 MB limit by '
+        + Math.round((after - LIMIT) / 1024) + ' KB. This save will be rejected and it is '
+        + 'not your connection. Biggest fields:');
+      if (console.table) console.table(sizeReport(out).slice(0, 6));
+      else console.log(sizeReport(out).slice(0, 6));
+      if (typeof root.showBanner === 'function') {
+        try {
+          root.showBanner('wiz', 'Save refused: the project is '
+            + (after / 1048576).toFixed(2) + ' MB, over the 1 MB document limit. '
+            + 'See the console for what is taking the room.');
+        } catch (e) {}
+      }
+    }
+    return out;
+  }
+
   /* ── the boundary ───────────────────────────────────────────────────── */
 
   function wrapDoc(ref) {
@@ -156334,7 +156440,8 @@ if (root.console && console.info) {
             if (hits && root.console) {
               console.info(TAG + ' encoded ' + hits + ' nested array(s) for Firestore');
             }
-            return opts === undefined ? t[p](encode(data)) : t[p](encode(data), opts);
+            var body = encode(shrink(data));
+            return opts === undefined ? t[p](body) : t[p](body, opts);
           };
         }
         if (p === 'get') {
@@ -156373,7 +156480,7 @@ if (root.console && console.info) {
             if (hits && root.console) {
               console.info(TAG + ' encoded ' + hits + ' nested array(s) for Firestore');
             }
-            return t.add(encode(data));
+            return t.add(encode(shrink(data)));
           };
         }
         if (p === 'doc') return function (id) { return wrapDoc(id === undefined ? t.doc() : t.doc(id)); };
@@ -156429,7 +156536,10 @@ if (root.console && console.info) {
     var after = countNested(enc);
     var back = decode(enc);
     var same = JSON.stringify(back) === JSON.stringify(payload);
+    var raw = bytes(payload), lean = bytes(prune(payload));
     var out = { nestedBefore: before, nestedAfterEncode: after, roundTripIdentical: same,
+                approxKB: Math.round(raw / 1024), afterPruneKB: Math.round(lean / 1024),
+                percentOfLimit: +(lean / LIMIT * 100).toFixed(1),
                 installed: !!(root._db && root._db.collection && root._db.collection.__codec) };
     if (root.console) console.table ? console.table(out) : console.log(out);
     return out;
