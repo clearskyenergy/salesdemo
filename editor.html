@@ -33979,8 +33979,85 @@ function buildBOM() {
             'Coordinate service capacity with utility');
   }
 
-  return { items: items, wireGauge: wg, systemKw: kw,
-           kwh: S.bessList.reduce(function(s,x){return s+(+(x.kwh||0))*(+(x.qty||1));},0),
+  /* ── WHAT DESIGN SITE PLACED ─────────────────────────────────────────
+     Patch 106. The BOM was built from the BESS config list, the guided
+     build's elements and the conduit runs. A campus laid out by Design
+     Site places compute pods, prime movers, battery containers, fences
+     and a duct bank as SHAPES, and none of them reached the takeoff — a
+     40 MW campus produced a bill of materials with nothing on it but
+     conduit. Counted straight off the drawing, so the BOM cannot
+     disagree with the plan. */
+  var _cs = { pods:0, podKw:0, gen:0, genKw:0, genModel:'', bess:0, bessKw:0, bessKwh:0,
+              pv:0, pvKw:0, fences:0, fenceFt:0, ctrl:0, mvFt:0, yard:{} };
+  try{
+    var _ppfB = (S.pxPerFt>0)?S.pxPerFt:0;
+    (S.shapes||[]).forEach(function(sh){
+      if(!sh) return;
+      if(sh.omegaController){ _cs.ctrl++; return; }
+      if(sh.omegaFence || sh.omegaCampus){
+        if(sh.kind==='rect' && sh.campusLabel && sh.pts && sh.pts.length>1 && _ppfB){
+          _cs.fences++;
+          var _fw=Math.abs(sh.pts[1].x-sh.pts[0].x)/_ppfB, _fh=Math.abs(sh.pts[1].y-sh.pts[0].y)/_ppfB;
+          _cs.fenceFt += 2*(_fw+_fh);
+        }
+        return;
+      }
+      if(sh.kind==='derdc'){ _cs.pods++; _cs.podKw += +sh.kw||0; }
+      else if(sh.kind==='deralt'){ _cs.gen++; _cs.genKw += +sh.kw||0; _cs.genModel=sh.model||_cs.genModel; }
+      else if(sh.kind==='bespad'){ _cs.bess++; _cs.bessKw += +sh.kw||0; _cs.bessKwh += +sh.kwh||0; }
+      else if(sh.kind==='dersolar'){ _cs.pv++; _cs.pvKw += +sh.kw||0; }
+      else if(sh.omegaYard){
+        var _k=(sh.label||sh.model||'Tie-in equipment');
+        _cs.yard[_k]=(_cs.yard[_k]||0)+1;
+      }
+    });
+    (S.conduits||[]).forEach(function(c){
+      if(c && (c.omegaCampus||c.omegaFence)) _cs.mvFt += +c.ftLen||0;
+    });
+  }catch(e){}
+
+  if(_cs.pods){
+    addItem('Compute', 'Modular compute pod', Math.round(_cs.podKw/_cs.pods)+' kW IT each',
+            _cs.pods, 'ea', 'Load, not generation \u2014 '+Math.round(_cs.podKw).toLocaleString()+' kW IT total');
+    addItem('Compute', 'Pod foundation / pad + anchoring', '', _cs.pods, 'ea', 'Per pod, on compacted base');
+  }
+  if(_cs.gen){
+    addItem('Generation', (_cs.genModel||'Prime mover'), Math.round(_cs.genKw/_cs.gen)+' kW each',
+            _cs.gen, 'ea', Math.round(_cs.genKw).toLocaleString()+' kW total \u2014 confirm gas supply');
+    addItem('Generation', 'Generator pad + gas train + exhaust', '', _cs.gen, 'ea',
+            'Per unit; fuel piping by others until the gas letter is in hand');
+  }
+  if(_cs.bess){
+    addItem('Energy Storage', 'Outdoor battery enclosure',
+            (_cs.bessKwh?Math.round(_cs.bessKwh/_cs.bess)+' kWh each':''),
+            _cs.bess, 'ea', Math.round(_cs.bessKwh).toLocaleString()+' kWh total');
+  }
+  if(_cs.pv){
+    addItem('Solar', 'Ground-mount PV array', Math.round(_cs.pvKw).toLocaleString()+' kW-DC',
+            _cs.pv, 'lot', 'Modules, racking and DC BOS \u2014 see the PV layout for table count');
+  }
+  Object.keys(_cs.yard).forEach(function(k){
+    addItem('Interconnection Yard', k, '', _cs.yard[k], 'ea', 'Placed by Design Site');
+  });
+  if(_cs.ctrl){
+    addItem('Controls', 'Master controller / control house', '', _cs.ctrl, 'ea',
+            'Site EMS and microgrid control; every compound ties here');
+  }
+  if(_cs.fenceFt){
+    addItem('Civil', 'Security fence, 8 ft chain-link with barbed arms', '',
+            Math.round(_cs.fenceFt), 'ft', _cs.fences+' fenced compound(s), measured from the drawing');
+    addItem('Civil', 'Fence gate, double swing', '', _cs.fences, 'ea', 'One per compound');
+  }
+  if(_cs.mvFt){
+    addItem('Conduit', 'MV duct bank, trenched', '4\" PVC (MV)', Math.round(_cs.mvFt*(1+BOM_CONTINGENCY)), 'ft',
+            'Compound feeders to the control yard, +'+Math.round(BOM_CONTINGENCY*100)+'% contingency');
+  }
+
+  return { items: items, wireGauge: wg,
+           systemKw: kw || _cs.bessKw,
+           computePods: _cs.pods, computeKw: _cs.podKw,
+           genUnits: _cs.gen, genKw: _cs.genKw,
+           kwh: S.bessList.reduce(function(s,x){return s+(+(x.kwh||0))*(+(x.qty||1));},0) || _cs.bessKwh,
            trenchFt: (function(){ var f=0; (S._trenches||[]).forEach(function(t){ if(t.pts&&t.pts.length>1&&S.pxPerFt) f+=_polyLen(t.pts)/S.pxPerFt; }); return Math.round(f); })() };
 }
 
@@ -63495,6 +63572,34 @@ function _substationCount(){
   var n=0; try{ (S.shapes||[]).forEach(function(s){ if(s&&s.kind==='substation')n++; }); }catch(e){} return n;
 }
 function _renderSubstation(g, sh){
+  /* ── THE YARD IS A SIZE IN FEET, NOT TWO PIXELS ──────────────────────
+     Patch 106. The substation is stored as two corner points. Each is
+     re-anchored to lat/lng independently, so if one corner's anchor is
+     missing or stale — which happens on any shape created before the
+     anchor pass, or when a reprojection is interrupted — the corners
+     move by different amounts and the yard changes SHAPE as you zoom
+     instead of just changing size.
+
+     A substation is 120 x 90 ft whatever the zoom. So the footprint is
+     captured in feet once, and the far corner is re-derived from the
+     near one at the current scale on every render. The origin still
+     tracks the ground through its own anchor; the shape can no longer
+     drift, because it is no longer stored as two independent points. */
+  try{
+    var _ppf0=(typeof S!=='undefined' && +S.pxPerFt>0)?+S.pxPerFt:0;
+    if(_ppf0>0 && sh.pts && sh.pts.length>1){
+      if(!(+sh.subLf>0) || !(+sh.subWf>0)){
+        var _w0=Math.abs(sh.pts[1].x-sh.pts[0].x), _h0=Math.abs(sh.pts[1].y-sh.pts[0].y);
+        if(_w0>2 && _h0>2){ sh.subLf=+(_w0/_ppf0).toFixed(2); sh.subWf=+(_h0/_ppf0).toFixed(2); }
+      }
+      if(+sh.subLf>0 && +sh.subWf>0){
+        var _x0=Math.min(sh.pts[0].x, sh.pts[1].x), _y0=Math.min(sh.pts[0].y, sh.pts[1].y);
+        sh.pts[0]={x:_x0, y:_y0};
+        sh.pts[1]={x:_x0 + sh.subLf*_ppf0, y:_y0 + sh.subWf*_ppf0};
+      }
+    }
+  }catch(e){}
+
   var a=sh.pts[0], b=sh.pts[1];
   var x=Math.min(a.x,b.x), y=Math.min(a.y,b.y);
   var w=Math.abs(b.x-a.x), h=Math.abs(b.y-a.y);
