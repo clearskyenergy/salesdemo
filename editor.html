@@ -155385,6 +155385,7 @@ if (root.console && console.info) {
       }
       switch (sh.kind) {
         case 'derdc':  add('pod', '\u25a6', sh.model || 'Compute pod', sh.kw); break;
+        case 'compute': add('pod', '\u25a6', sh.model || 'Compute pod', sh.kw); break;
         case 'deralt': add('gen' + (sh.model || ''), '\u2299', sh.model || 'Generator', sh.kw); break;
         case 'derwind': add('wind', '\u2732', sh.model || 'Wind turbine', sh.kw); break;
         case 'bespad': add('bess' + (sh.model || ''), '\u25ac', sh.model || 'BESS container',
@@ -155412,7 +155413,8 @@ if (root.console && console.info) {
     if (fences) out.rows.push({ mark: '\u25a2', name: 'Fenced compounds \u00d7' + fences,
       note: (fenceAc > 0 ? n1(fenceAc) + ' ac inside the fence lines' : 'security fence') });
     if (ctrl) out.rows.push({ mark: '\u25c9', name: 'Master controller',
-      note: 'every compound ties here' });
+      note: 'the 40\u2032 \u00d7 30\u2032 pad in the middle, inside its own fence \u2014 '
+        + 'every compound ties here' });
 
     var ft = 0, runs = 0;
     (S.conduits || []).forEach(function (c) {
@@ -155560,6 +155562,18 @@ if (root.console && console.info) {
   /* ── install ────────────────────────────────────────────────────────── */
 
   function install() {
+    /* THE LEGEND AND THE LABELS DO NOT DEPEND ON THE ENGINE.
+
+       Both used to be wired at the end of install(), which returns early
+       when the auto-design adapter is not loaded yet. If that early
+       return ever wins the race, the legend never gains its census and
+       no fence or compound ever gets a name drawn on it — which is
+       exactly "the master controller is not in the legend and I cannot
+       tell which thing on the map it is". They are wired first now, and
+       from their own loop, because they are useful on a drawing the
+       engine never touched. */
+    wrapRender();
+    wrapLegend();
     var E = root.OmegaEngine, A = root.OmegaAutoDesign;
     if (!E || !A || !E.design) return false;
     if (!E.design.__campus) {
@@ -155603,6 +155617,12 @@ if (root.console && console.info) {
   }
 
   function boot() {
+    /* Its own loop, so a slow or missing engine cannot cost the drawing
+       its labels. */
+    var m = 0, lv = setInterval(function () {
+      wrapRender(); wrapLegend();
+      if (++m > 60) clearInterval(lv);
+    }, 400);
     var n = 0, iv = setInterval(function () {
       if (install() || ++n > 40) {
         clearInterval(iv);
@@ -157924,6 +157944,639 @@ if (root.console && console.info) {
   else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
   if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaPpf;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 88 — WHAT THE COMPUTE COSTS
+ *  ---------------------------------------------------------------------
+ *  The estimate prices pads, conduit, switchgear and batteries, and says
+ *  nothing about the thing the whole site exists to hold. On a 40 MW
+ *  campus the compute is not a line item, it is the budget — everything
+ *  else on the drawing is a rounding error against it.
+ *
+ *  ONE NUMBER, TWO VERY DIFFERENT THINGS, AND THIS REFUSES TO BLUR THEM
+ *  "$25–30M for a 1 MW container" is the right order of magnitude for a
+ *  populated AI pod, and almost all of that money is ACCELERATORS. The
+ *  enclosure, cooling, busway and switchgear inside a 1 MW module are a
+ *  small fraction of it. Adding them together gives a number that is
+ *  useless to everybody who has to act on it:
+ *
+ *    · the enclosure is real property on a 20–30 year life, and it is
+ *      what the site, the interconnection and the permit are sized for;
+ *    · the accelerators are equipment on a 3–5 year life, they are what
+ *      the tenant or the GPU financier pays for, and they are usually
+ *      not in the developer's capex at all.
+ *
+ *  So the two are entered separately and reported separately, and the
+ *  panel says which one belongs in a site pro-forma. A single blended
+ *  $/MW is exactly the kind of confident-looking figure that gets
+ *  copied into a model and never questioned.
+ *
+ *  NOTHING IS DEFAULTED. There is no market price for these; they are
+ *  negotiated, they move quarterly, and a placeholder here would be
+ *  quoted at a landowner within a week. The panel stays blank and says
+ *  what to go and get.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[ComputeCost]';
+  var LS = 'omega.computecost';
+
+  function cfg() {
+    var c = { shellPerPod: null, itPerPod: null, podKw: 1000, note: '', at: null };
+    try {
+      var s = JSON.parse(localStorage.getItem(LS) || 'null');
+      if (s) for (var k in s) if (k in c) c[k] = s[k];
+    } catch (e) {}
+    return c;
+  }
+  function save(c) { try { localStorage.setItem(LS, JSON.stringify(c)); } catch (e) {} }
+
+  function money(v) {
+    if (!(v > 0)) return '\u2014';
+    if (v >= 1e9) return '$' + (v / 1e9).toFixed(2) + 'B';
+    if (v >= 1e6) return '$' + (v / 1e6).toFixed(1) + 'M';
+    return '$' + Math.round(v).toLocaleString();
+  }
+
+  /* Counted off the drawing, like everything else that has to agree
+     with the plan. */
+  function pods() {
+    var n = 0, kw = 0;
+    try {
+      (root.S.shapes || []).forEach(function (sh) {
+        if (!sh || sh.kind !== 'derdc') return;
+        n++; kw += (+sh.kw || 0);
+      });
+    } catch (e) {}
+    return { n: n, kw: kw };
+  }
+
+  function figures() {
+    var c = cfg(), p = pods();
+    var shell = c.shellPerPod > 0 ? c.shellPerPod * p.n : 0;
+    var it = c.itPerPod > 0 ? c.itPerPod * p.n : 0;
+    var mw = p.kw / 1000;
+    return {
+      pods: p.n, mw: mw, cfg: c,
+      shellTotal: shell, itTotal: it,
+      shellPerMw: mw > 0 && shell > 0 ? shell / mw : 0,
+      itPerMw: mw > 0 && it > 0 ? it / mw : 0,
+      siteCapex: shell,                 /* what belongs in a site pro-forma */
+      allIn: shell + it
+    };
+  }
+
+  var IN = 'width:100%;background:#0B1626;border:1px solid #3A3A3A;color:#E0E0E0;'
+    + 'border-radius:6px;padding:8px;font-size:12.5px;font-family:inherit;box-sizing:border-box';
+  var LB = 'font-size:10px;color:#9A9A9A;text-transform:uppercase;letter-spacing:.6px;'
+    + 'display:block;margin-bottom:4px';
+
+  function open() {
+    var f = figures(), c = f.cfg;
+    var old = document.getElementById('omega-computecost');
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    var w = document.createElement('div');
+    w.id = 'omega-computecost';
+    w.style.cssText = 'position:fixed;inset:0;z-index:9200;background:rgba(0,0,0,.6);'
+      + 'display:flex;align-items:center;justify-content:center;padding:20px';
+
+    w.innerHTML = '<div style="background:#1E1E1E;border:1px solid #3A3A3A;border-radius:12px;'
+      + 'padding:22px;max-width:560px;width:100%;max-height:88vh;overflow:auto;font-family:inherit">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center">'
+      + '<div style="font-size:17px;font-weight:700;color:#E0E0E0">Compute cost</div>'
+      + '<button data-a="x" style="background:none;border:none;color:#9A9A9A;font-size:20px;'
+      + 'cursor:pointer;line-height:1">\u00d7</button></div>'
+      + '<div style="font-size:11px;color:#9A9A9A;margin:4px 0 14px;line-height:1.5">'
+      + 'Counted from the pods on the drawing. Enclosure and accelerators are entered '
+      + 'separately because they are different money on different lives.</div>'
+      + '<div id="cc-out"></div>'
+      + '<div style="display:flex;gap:8px;margin-top:14px">'
+      + '<div style="flex:1"><label style="' + LB + '">Enclosure per pod</label>'
+      + '<input id="cc-shell" type="number" step="10000" style="' + IN + '" value="'
+      + (c.shellPerPod || '') + '" placeholder="pod, cooling, busway"></div>'
+      + '<div style="flex:1"><label style="' + LB + '">Accelerators per pod</label>'
+      + '<input id="cc-it" type="number" step="100000" style="' + IN + '" value="'
+      + (c.itPerPod || '') + '" placeholder="GPUs, servers, network"></div>'
+      + '</div>'
+      + '<div style="margin-top:8px"><label style="' + LB + '">Where these came from</label>'
+      + '<input id="cc-note" type="text" style="' + IN + '" value="'
+      + String(c.note || '').replace(/"/g, '&quot;')
+      + '" placeholder="vendor quote, date, whose"></div>'
+      + '<div style="font-size:10.5px;color:#F59E0B;margin-top:10px;line-height:1.6">'
+      + 'Nothing is pre-filled. There is no market price for these \u2014 they are '
+      + 'negotiated and they move quarterly, and a placeholder here would be quoted at a '
+      + 'landowner inside a week. A commonly heard figure of $25\u201330M for a populated '
+      + '1 MW pod is almost entirely accelerators; put that in the right box, or the site '
+      + 'pro-forma inherits a number that does not belong to the developer.</div>'
+      + '<div style="display:flex;gap:8px;margin-top:18px">'
+      + '<button data-a="copy" style="flex:1;padding:11px;background:rgba(255,255,255,.05);'
+      + 'border:1px solid #3A3A3A;color:#E0E0E0;border-radius:8px;cursor:pointer;'
+      + 'font-family:inherit;font-size:12px">Copy</button>'
+      + '<button data-a="x" style="padding:11px 18px;background:#2FB54A;color:#0A1628;'
+      + 'border:none;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;'
+      + 'font-size:12px">Done</button></div></div>';
+
+    var lastText = '';
+    function row(k, v, basis) {
+      return '<div style="display:flex;justify-content:space-between;align-items:baseline;'
+        + 'gap:12px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05)">'
+        + '<div style="flex:1"><div style="font-size:12.5px;color:#E0E0E0">' + k + '</div>'
+        + '<div style="font-size:10px;color:#9A9A9A;margin-top:1px">' + basis + '</div></div>'
+        + '<div style="font-size:13px;font-weight:700;color:#4ADE80;white-space:nowrap">'
+        + v + '</div></div>';
+    }
+    function run() {
+      var g = function (id) {
+        var e = document.getElementById(id);
+        if (!e || e.value === '') return null;
+        var v = parseFloat(e.value); return isFinite(v) ? v : null;
+      };
+      var c2 = cfg();
+      c2.shellPerPod = g('cc-shell'); c2.itPerPod = g('cc-it');
+      var ne = document.getElementById('cc-note');
+      c2.note = ne ? ne.value : ''; c2.at = Date.now();
+      save(c2);
+      var f2 = figures(), h = '', lines = [];
+      if (!f2.pods) {
+        h = '<div style="font-size:12px;color:#F59E0B;line-height:1.6">No compute pods on '
+          + 'the drawing yet. Run Design Site, or place them by hand, and this counts them.</div>';
+      } else {
+        h += row('Compute on the drawing', f2.pods + ' pods \u00b7 ' + f2.mw.toFixed(1) + ' MW',
+                 'counted from the plan, not from the last design');
+        lines.push(f2.pods + ' pods, ' + f2.mw.toFixed(1) + ' MW');
+        if (f2.shellTotal > 0) {
+          h += row('Enclosures', money(f2.shellTotal),
+                   money(f2.shellPerMw) + '/MW \u00b7 real property, 20\u201330 year life \u2014 '
+                   + 'this is the site pro-forma number');
+          lines.push('Enclosures: ' + money(f2.shellTotal) + ' (' + money(f2.shellPerMw) + '/MW)');
+        } else {
+          h += row('Enclosures', '\u2014', 'enter a per-pod price to see this');
+        }
+        if (f2.itTotal > 0) {
+          h += row('Accelerators', money(f2.itTotal),
+                   money(f2.itPerMw) + '/MW \u00b7 3\u20135 year life, usually the tenant\u2019s '
+                   + 'or the GPU financier\u2019s money, not the developer\u2019s');
+          lines.push('Accelerators: ' + money(f2.itTotal) + ' (' + money(f2.itPerMw) + '/MW)');
+        } else {
+          h += row('Accelerators', '\u2014', 'enter a per-pod price to see this');
+        }
+        if (f2.allIn > 0) {
+          h += row('All-in', money(f2.allIn),
+                   'shown for completeness \u2014 do not put this in a site pro-forma, '
+                   + 'two different owners and two different lives are added together here');
+          lines.push('All-in: ' + money(f2.allIn));
+        }
+        if (c2.note) lines.push('Basis: ' + c2.note);
+        if (!c2.note && (f2.shellTotal || f2.itTotal)) {
+          h += '<div style="font-size:10.5px;color:#F59E0B;margin-top:8px;line-height:1.5">'
+            + 'No source recorded. A price with no quote behind it is a guess with a '
+            + 'dollar sign on it \u2014 note where it came from.</div>';
+        }
+      }
+      document.getElementById('cc-out').innerHTML = h;
+      lastText = 'COMPUTE COST\n\n' + lines.join('\n');
+    }
+
+    var t = null;
+    w.addEventListener('input', function () { clearTimeout(t); t = setTimeout(run, 200); });
+    w.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-a]') : null;
+      if (!b) { if (e.target === w) w.remove(); return; }
+      if (b.getAttribute('data-a') === 'copy') {
+        try { navigator.clipboard.writeText(lastText); b.textContent = 'Copied'; } catch (er) {}
+        return;
+      }
+      w.remove();
+    });
+    document.body.appendChild(w);
+    run();
+    return true;
+  }
+
+  function inject() {
+    var host = document.getElementById('rb-elec') || document.getElementById('rb-buildable');
+    if (!host || !host.parentNode) return false;
+    if (document.getElementById('rb-compute-cost')) return true;
+    var b = document.createElement('button');
+    b.className = 'rbtn'; b.id = 'rb-compute-cost';
+    b.title = 'Compute Cost \u2014 prices the pods on the drawing. Enclosure and accelerators '
+      + 'are kept apart because they are different money on different lives.';
+    b.onclick = open;
+    b.innerHTML = '<span class="rb-ico" style="color:#8B7BD8">\u25a6</span>'
+      + '<span class="rb-lbl">Compute<br>Cost</span>';
+    host.parentNode.insertBefore(b, host.nextSibling);
+    try { if (root.OmegaMode && root.OmegaMode.keep) root.OmegaMode.keep(/rb-compute-cost/); } catch (e) {}
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () { if (inject() || ++n > 40) clearInterval(iv); }, 500);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaComputeCost.open()');
+  }
+
+  root.OmegaComputeCost = { open: open, figures: figures, pods: pods, config: cfg };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaComputeCost;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 89 — THE OVERVIEW A PARTNER ACTUALLY READS
+ *  ---------------------------------------------------------------------
+ *  The report opened on an interconnection score. A score is a summary
+ *  of an argument, and the person you send this to at 9pm wants the
+ *  argument: how big, on what land, served by what, and — the question
+ *  that decides whether any of it is real — which of these numbers is
+ *  COMMITTED and which is still somebody's estimate.
+ *
+ *  THE LEDGER IS THE POINT
+ *  A site with 10 MW of will-serve letter and a site with 10 MW of
+ *  screening estimate look identical on every sheet this app has ever
+ *  printed, and they are not the same site. One has a reference number
+ *  and a date from the utility; the other has a guess from a hosting
+ *  capacity map. So every headline figure carries its status, and the
+ *  report closes with two columns: what is confirmed, and what has to
+ *  be confirmed before anybody spends money. Readiness is the count of
+ *  the first over the total — a number that can be explained in one
+ *  sentence, not a weighted index nobody can reproduce.
+ *
+ *  IT ALSO HAS TO KNOW WHAT IT IS LOOKING AT
+ *  Not every project is a compute campus. A BESS-only site has no PUE
+ *  and no pods; an EV site has no interconnection gap worth the name.
+ *  The report reads the drawing, decides which of those it is, and
+ *  prints the sections that apply — an empty "Compute" block on a solar
+ *  and storage project is noise, and noise is what makes people stop
+ *  reading a report.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Overview]';
+
+  function S_() { return root.S; }
+  function n0(v) { return Math.round(v || 0).toLocaleString(); }
+  function n1(v) { return (Math.round((v || 0) * 10) / 10).toFixed(1); }
+  function n2(v) { return (Math.round((v || 0) * 100) / 100).toFixed(2); }
+  function money(v) {
+    if (!(v > 0)) return '\u2014';
+    if (v >= 1e9) return '$' + (v / 1e9).toFixed(2) + 'B';
+    if (v >= 1e6) return '$' + (v / 1e6).toFixed(1) + 'M';
+    return '$' + n0(v);
+  }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
+  /* ── what is this project ───────────────────────────────────────────── */
+
+  function census() {
+    var c = { pods: 0, podKw: 0, gen: 0, genKw: 0, genModel: '', bess: 0, bessKw: 0, bessKwh: 0,
+              pv: 0, pvKw: 0, ev: 0, sub: null, fences: 0, ctrl: 0, feederFt: 0 };
+    try {
+      (S_().shapes || []).forEach(function (sh) {
+        if (!sh) return;
+        if (sh.omegaController) { c.ctrl++; return; }
+        if (sh.omegaFence || sh.omegaCampus) { if (sh.kind === 'rect' && sh.campusLabel) c.fences++; return; }
+        if (sh.kind === 'derdc') { c.pods++; c.podKw += +sh.kw || 0; }
+        else if (sh.kind === 'deralt' || sh.kind === 'derwind') {
+          c.gen++; c.genKw += +sh.kw || 0; c.genModel = sh.model || c.genModel;
+        } else if (sh.kind === 'bespad' || sh.kind === 'assembly') {
+          c.bess++; c.bessKw += +sh.kw || 0; c.bessKwh += +sh.kwh || 0;
+        } else if (sh.kind === 'dersolar') { c.pv++; c.pvKw += +sh.kw || 0; }
+        else if (/^ev(post|cab|unit|l2)$/.test(sh.kind || '')) c.ev++;
+        else if (sh.kind === 'substation') c.sub = sh;
+      });
+      (S_().conduits || []).forEach(function (x) {
+        if (x && (x.omegaCampus || x.omegaFence)) c.feederFt += +x.ftLen || 0;
+      });
+    } catch (e) {}
+    return c;
+  }
+
+  function archetype(c) {
+    if (c.pods) return { key: 'compute', label: 'Compute campus' };
+    if (c.ev) return { key: 'ev', label: 'EV charging site' };
+    if (c.pv && c.bess) return { key: 'solarbess', label: 'Solar + storage' };
+    if (c.pv) return { key: 'solar', label: 'Solar' };
+    if (c.bess) return { key: 'bess', label: 'Standalone storage' };
+    if (c.gen) return { key: 'gen', label: 'On-site generation' };
+    return { key: 'site', label: 'Site' };
+  }
+
+  /* ── the capacity, and what backs it ────────────────────────────────── */
+
+  function ceiling() {
+    try { return root.OmegaDesign.ceiling(); } catch (e) { return { kw: 0, src: 'none', firm: false }; }
+  }
+  function willServe() {
+    try { return root.OmegaDesign.willServe(); } catch (e) { return null; }
+  }
+
+  /* ── the ledger ─────────────────────────────────────────────────────── */
+
+  /* Each entry is a claim the report makes, with what backs it. Only a
+     document or a measurement counts as confirmed; a drawn figure and a
+     screening estimate do not, however reasonable they are. */
+  function ledger(c, a) {
+    var out = [], ws = willServe(), cl = ceiling();
+    var add = function (ok, item, basis, todo) {
+      out.push({ ok: !!ok, item: item, basis: basis, todo: todo || '' });
+    };
+
+    if (ws && ws.mw > 0) {
+      add(true, 'Utility capacity \u2014 ' + n1(ws.mw) + ' MW',
+        'will-serve letter' + (ws.ref ? ' ' + ws.ref : '') + (ws.dated ? ', ' + ws.dated : ''),
+        ws.ref ? '' : 'record the letter reference and date on the project');
+    } else if (cl.kw > 0) {
+      add(false, 'Utility capacity \u2014 ' + n1(cl.kw / 1000) + ' MW',
+        cl.src + ' \u2014 not a commitment',
+        'request a will-serve letter; until it exists this number carries no weight with a lender');
+    } else {
+      add(false, 'Utility capacity', 'nothing on record',
+        'run the substation lookup, then request a will-serve letter');
+    }
+
+    /* Land */
+    var land = null;
+    try { land = root.OmegaBuildable.measure(); } catch (e) {}
+    if (land && land.ok) {
+      add(false, 'Buildable area \u2014 ' + n1(land.buildableAc) + ' ac',
+        'measured off the drawing at a ' + n1(land.cellFt) + ' ft raster',
+        'confirm the boundary against the deed or a survey, and the setback with the AHJ');
+      add(land.exclZones > 0, 'Exclusions \u2014 ' + n1(land.exclAc) + ' ac',
+        land.exclZones ? land.exclZones + ' zone(s) drawn' : 'none drawn',
+        land.exclZones ? 'confirm wetlands, easements and floodplain against a title report and NWI'
+                       : 'no exclusions are drawn \u2014 that is a claim, not an absence of constraints');
+    } else {
+      add(false, 'Buildable area', 'not measured', 'trace the parcel and set the drawing scale');
+    }
+
+    /* Interconnection distance */
+    if (c.sub) {
+      add(false, 'Interconnection point \u2014 ' + (c.sub.label || 'substation'),
+        (isFinite(+c.sub.capMw) ? n1(+c.sub.capMw) + ' MW entered on the drawn substation' : 'no capacity entered')
+        + (c.sub.voltage ? ' \u00b7 ' + c.sub.voltage : ''),
+        'confirm the point of interconnection, the voltage and the available capacity with the utility');
+    } else {
+      add(false, 'Interconnection point', 'no substation on the drawing',
+        'place the substation and confirm the tie point');
+    }
+
+    /* Gas, only where something burns it */
+    if (c.gen) {
+      var mmbtu = 0;
+      try { mmbtu = root._omegaPlan.sizing.gasMmbtuHr || 0; } catch (e) {}
+      add(false, 'Gas supply' + (mmbtu ? ' \u2014 ' + n1(mmbtu) + ' MMBtu/hr' : ''),
+        'derived from the chosen prime mover\u2019s heat rate',
+        'confirm line pressure and available volume with the gas utility \u2014 this is the '
+        + 'number that decides whether on-site generation is possible at all');
+    }
+
+    if (a.key === 'compute') {
+      add(false, 'Compute load \u2014 ' + n1(c.podKw / 1000) + ' MW IT in ' + c.pods + ' pods',
+        'counted on the drawing',
+        'confirm the pod rating and the PUE with the operator');
+      var cc = null;
+      try { cc = root.OmegaComputeCost.figures(); } catch (e) {}
+      if (cc && cc.cfg && (cc.cfg.shellPerPod || cc.cfg.itPerPod)) {
+        add(!!(cc.cfg.note), 'Compute capex \u2014 ' + money(cc.siteCapex) + ' site, '
+          + money(cc.itTotal) + ' accelerators',
+          cc.cfg.note ? esc(cc.cfg.note) : 'no source recorded',
+          cc.cfg.note ? '' : 'record the quote and its date');
+      } else {
+        add(false, 'Compute capex', 'not entered', 'get an enclosure quote and a rack quote \u2014 '
+          + 'they are two vendors and two different numbers');
+      }
+    }
+
+    /* Electrical */
+    var el = null;
+    try { el = root._omegaElec; } catch (e) {}
+    if (c.pv) {
+      if (el && el.n) {
+        add(false, 'String design \u2014 ' + el.n + ' modules/string, ' + n0(el.inverters) + ' inverters',
+          'NEC 690.7 at the entered record low; 690.8(A) on current',
+          'confirm the module and inverter datasheets and the site temperatures');
+      } else {
+        add(false, 'String design', 'not run', 'run Electrical Sizing with the real datasheets');
+      }
+    }
+
+    add(false, 'Permitting', 'not confirmed here',
+      'confirm zoning, setbacks, height, noise and the fire code path with the AHJ');
+    return out;
+  }
+
+  /* ── the page ───────────────────────────────────────────────────────── */
+
+  function kpi(v, unit, label, tone) {
+    return '<div style="flex:1;min-width:120px">'
+      + '<div style="font-size:26px;font-weight:800;color:' + (tone || '#E0E0E0')
+      + ';font-family:\'IBM Plex Mono\',monospace;line-height:1.1">' + v
+      + (unit ? '<span style="font-size:12px;font-weight:600;color:#9A9A9A;margin-left:4px">'
+        + unit + '</span>' : '') + '</div>'
+      + '<div style="font-size:10.5px;color:#9A9A9A;margin-top:3px">' + label + '</div></div>';
+  }
+  function row(k, v, basis) {
+    return '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:14px;'
+      + 'padding:7px 0;border-bottom:1px solid rgba(255,255,255,.06)">'
+      + '<div style="flex:1"><div style="font-size:12.5px;color:var(--text,#E0E0E0)">' + k + '</div>'
+      + (basis ? '<div style="font-size:10px;color:#9A9A9A;margin-top:2px">' + basis + '</div>' : '')
+      + '</div><div style="font-size:13px;font-weight:700;font-family:\'IBM Plex Mono\',monospace;'
+      + 'color:#4ADE80;white-space:nowrap">' + v + '</div></div>';
+  }
+  function head(t) {
+    return '<div style="font-size:10px;letter-spacing:1.2px;text-transform:uppercase;'
+      + 'color:#8B7BD8;margin:20px 0 6px">' + t + '</div>';
+  }
+
+  function html() {
+    var c = census(), a = archetype(c), cl = ceiling(), ws = willServe();
+    var led = ledger(c, a);
+    var okN = led.filter(function (x) { return x.ok; }).length;
+
+    var plan = null, mix = null;
+    try { plan = root._omegaPlan; } catch (e) {}
+    try { mix = root.OmegaCampus.mix(plan); } catch (e) {}
+    var land = null;
+    try { land = root.OmegaBuildable.measure(); } catch (e) {}
+
+    var h = '';
+
+    /* Hero: what it is, and the two or three numbers that decide it. */
+    h += '<div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;'
+      + 'padding-bottom:14px;border-bottom:1px solid rgba(255,255,255,.08)">'
+      + '<div style="flex:1;min-width:200px">'
+      + '<div style="font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:#8B7BD8">'
+      + esc(a.label) + '</div>'
+      + '<div style="font-size:11px;color:#9A9A9A;margin-top:4px">'
+      + (land && land.ok ? n1(land.grossAc) + ' ac parcel \u00b7 ' + n1(land.buildableAc) + ' ac buildable'
+                         : 'parcel not measured') + '</div></div>'
+      + kpi(cl.kw > 0 ? n1(cl.kw / 1000) : '\u2014', 'MW', 'Utility capacity \u00b7 '
+          + (ws && ws.mw > 0 ? 'will-serve' : cl.src), ws && ws.mw > 0 ? '#4ADE80' : '#F59E0B');
+    if (a.key === 'compute') h += kpi(n1(c.podKw / 1000), 'MW', 'IT load \u00b7 ' + c.pods + ' pods');
+    if (c.pvKw) h += kpi(n1(c.pvKw / 1000), 'MW-DC', 'Solar');
+    if (c.bessKwh) h += kpi(n0(c.bessKwh / 1000), 'MWh', 'Storage \u00b7 ' + c.bess + ' units');
+    h += kpi(okN + ' / ' + led.length, '', 'Confirmed items', okN === led.length ? '#4ADE80' : '#F59E0B');
+    h += '</div>';
+
+    /* Power */
+    h += head('Power');
+    h += row('Utility capacity', n1(cl.kw / 1000) + ' MW',
+      ws && ws.mw > 0
+        ? 'will-serve letter' + (ws.ref ? ' ' + esc(ws.ref) : '') + ' \u2014 a commitment'
+        : cl.src + ' \u2014 <span style="color:#F59E0B">not a commitment</span>');
+    if (c.gen) {
+      h += row('On-site generation', n1(c.genKw / 1000) + ' MW',
+        c.gen + ' \u00d7 ' + esc(c.genModel || 'unit')
+        + (plan && plan.sizing && plan.sizing.gasMmbtuHr
+            ? ' \u00b7 ' + n1(plan.sizing.gasMmbtuHr) + ' MMBtu/hr of gas' : ''));
+    }
+    if (c.pvKw) h += row('Solar', n1(c.pvKw / 1000) + ' MW-DC',
+      plan && plan.solar && plan.solar.built ? esc(plan.solar.reason) : 'drawn on the plan');
+    if (c.bessKwh) h += row('Storage', n0(c.bessKw) + ' kW / ' + n0(c.bessKwh) + ' kWh',
+      plan && plan.sizing && plan.sizing.bess ? esc(plan.sizing.bess.basis) : 'drawn on the plan');
+    if (mix) {
+      h += row('Energy mix', Math.round(mix.sharePct.grid) + '% utility / '
+        + Math.round(mix.sharePct.gas) + '% fuel / ' + Math.round(mix.sharePct.solar) + '% solar',
+        'merit order at the modelled rates');
+      h += row('Blended energy cost', '$' + n0(mix.blendedPerMwh) + '/MWh',
+        'utility $' + n0(mix.costPerMwh.grid) + ' \u00b7 fuel $' + n0(mix.costPerMwh.gas)
+        + ' \u00b7 solar $' + n0(mix.costPerMwh.solar) + ' per MWh \u2014 planning rates, not contracts');
+    }
+
+    /* Land */
+    if (land && land.ok) {
+      h += head('Land');
+      h += row('Gross parcel', n1(land.grossAc) + ' ac', 'inside the traced boundary');
+      h += row('Out: exclusions and setback',
+        '\u2212 ' + n1(land.exclAc + land.setbackAc) + ' ac',
+        n1(land.exclAc) + ' ac excluded \u00b7 ' + n1(land.setbackAc) + ' ac in the '
+        + land.setbackFt + ' ft setback');
+      h += row('Net buildable', n1(land.buildableAc) + ' ac',
+        n1(land.compoundAc + land.pvAc) + ' ac spent \u00b7 ' + n1(land.openAc) + ' ac open');
+      if (land.subFt != null) h += row('To the substation',
+        n0(land.subFt) + ' ft (' + n2(land.subFt / 5280) + ' mi)', 'straight line, not a route');
+      if (land.routeFt) h += row('MV route on site', n0(land.routeFt) + ' ft',
+        'trenched, from the drawn geometry');
+    }
+
+    /* Compute, only where there is any */
+    if (a.key === 'compute') {
+      h += head('Compute');
+      h += row('IT load', n1(c.podKw / 1000) + ' MW', c.pods + ' pods on the drawing');
+      if (plan && plan.sizing) {
+        h += row('Facility load', n1(plan.sizing.facKw / 1000) + ' MW',
+          'at PUE ' + n2(plan.sizing.pue || (plan.sizing.facKw / plan.sizing.itKw)));
+      }
+      var cc = null;
+      try { cc = root.OmegaComputeCost.figures(); } catch (e) {}
+      if (cc && cc.siteCapex > 0) {
+        h += row('Enclosure capex', money(cc.siteCapex),
+          money(cc.shellPerMw) + '/MW \u2014 the site pro-forma number');
+      }
+      if (cc && cc.itTotal > 0) {
+        h += row('Accelerator capex', money(cc.itTotal),
+          money(cc.itPerMw) + '/MW \u2014 3\u20135 year life, usually not the developer\u2019s money');
+      }
+    }
+
+    /* Site works */
+    h += head('On the drawing');
+    h += row('Fenced compounds', String(c.fences), c.ctrl ? 'plus a master controller' : 'no control yard placed');
+    if (c.feederFt) h += row('MV duct bank', n0(c.feederFt) + ' ft', 'trenched between compounds');
+
+    /* The ledger */
+    h += head('Confirmed');
+    var conf = led.filter(function (x) { return x.ok; });
+    h += conf.length
+      ? conf.map(function (x) {
+          return '<div style="display:flex;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06)">'
+            + '<span style="color:#4ADE80;font-weight:800">\u2713</span><div>'
+            + '<div style="font-size:12.5px;color:var(--text,#E0E0E0)">' + x.item + '</div>'
+            + '<div style="font-size:10px;color:#9A9A9A;margin-top:2px">' + x.basis + '</div></div></div>';
+        }).join('')
+      : '<div style="font-size:11.5px;color:#F59E0B;line-height:1.6">Nothing on this project is '
+        + 'confirmed yet. Everything below is an estimate or a drawing, which is a normal place '
+        + 'to be at this stage \u2014 it is only a problem if somebody thinks otherwise.</div>';
+
+    h += head('To confirm before anybody spends money');
+    h += led.filter(function (x) { return !x.ok; }).map(function (x) {
+      return '<div style="display:flex;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06)">'
+        + '<span style="color:#F59E0B;font-weight:800">\u25cb</span><div>'
+        + '<div style="font-size:12.5px;color:var(--text,#E0E0E0)">' + x.item + '</div>'
+        + '<div style="font-size:10px;color:#9A9A9A;margin-top:2px">' + x.basis
+        + (x.todo ? ' \u2014 <span style="color:#F5C871">' + x.todo + '</span>' : '') + '</div></div></div>';
+    }).join('');
+
+    h += '<div style="font-size:10px;color:#9A9A9A;margin-top:16px;line-height:1.6">'
+      + 'Every figure here is measured off this drawing or entered on this project. Nothing is '
+      + 'filled in from a default. Planning rates are labelled as such and are not quotes; '
+      + 'code references are the sizing basis, not a compliance statement.</div>';
+
+    return h;
+  }
+
+  /* ── wire it into the report ────────────────────────────────────────── */
+
+  function inject() {
+    var bar = document.querySelector('[data-rtab="location"]');
+    if (!bar || !bar.parentNode) return false;
+    if (!document.querySelector('[data-rtab="overview"]')) {
+      var b = document.createElement('button');
+      b.className = 'report-tab'; b.setAttribute('data-rtab', 'overview');
+      b.textContent = 'Overview';
+      b.onclick = function () { root.reportTab('overview'); };
+      bar.parentNode.insertBefore(b, bar);
+    }
+    if (typeof root.reportTab === 'function' && !root.reportTab.__overview) {
+      var orig = root.reportTab;
+      root.reportTab = function (tab) {
+        if (tab === 'overview') {
+          try {
+            Array.prototype.forEach.call(document.querySelectorAll('.report-tab'), function (x) {
+              x.classList.toggle('active', x.getAttribute('data-rtab') === 'overview');
+            });
+            var body = document.getElementById('report-body');
+            if (body) body.innerHTML = html();
+            if (root._reportState) root._reportState.tab = 'overview';
+          } catch (e) {
+            if (root.console) console.warn(TAG, e && e.message);
+            return orig('location');
+          }
+          return;
+        }
+        return orig.apply(this, arguments);
+      };
+      root.reportTab.__overview = true;
+    }
+    /* Open on the overview, because it is the page somebody sends. */
+    if (typeof root.openReport === 'function' && !root.openReport.__overview) {
+      var oo = root.openReport;
+      root.openReport = function (tab) { return oo.call(this, tab || 'overview'); };
+      root.openReport.__overview = true;
+    }
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () { if (inject() || ++n > 60) clearInterval(iv); }, 500);
+    if (root.console) console.info(TAG + ' ready \u2014 Output \u203a Interactive Report \u203a Overview');
+  }
+
+  root.OmegaOverview = { html: html, census: census, archetype: function () { return archetype(census()); },
+                         ledger: function () { var c = census(); return ledger(c, archetype(c)); } };
+  if (typeof document === 'undefined') { /* node */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaOverview;
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
