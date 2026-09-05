@@ -153929,5 +153929,782 @@ if (root.console && console.info) {
   }
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 77 — CAMPUS LAYOUT
+ *  ---------------------------------------------------------------------
+ *  The engine packed the parcel as four vertical stripes, each the full
+ *  height of the setback band: compute, then generation, then storage,
+ *  then the yard, then whatever was left went to solar. That is a
+ *  packing result, not a site. Nothing was fenced, nothing was
+ *  separated as a discrete facility, and nothing said how the parts
+ *  connect to each other.
+ *
+ *  A real campus is blocks. Batteries in their own fenced compound,
+ *  compute in its own compound, solar in its own field, the switching
+ *  and control yard in the middle, and every compound tied back to one
+ *  point of control. That arrangement is not decoration — the fence
+ *  line is a permit object, the separation between the storage
+ *  compound and the compute compound is IFC 1207.8.3, and the tie
+ *  lines are what makes the drawing answer "and how does this work"
+ *  without a second sheet.
+ *
+ *  WHAT THIS REPLACES
+ *  OmegaEngine.design() only. Sizing, the solar economics, the max
+ *  search bounds and every clearance figure stay exactly where they
+ *  were; this changes where the blocks land and adds the fences, the
+ *  control yard and the feeders. The band packer is kept as
+ *  OmegaEngine.bandDesign() so the old behaviour is one call away.
+ *
+ *  HOW A BLOCK IS PLACED
+ *  A parcel mask is rasterised once — inside the boundary, outside
+ *  every exclusion — and turned into a summed-area table. After that a
+ *  rectangle can be tested against the whole parcel in constant time,
+ *  which is what makes it affordable to scan every candidate position
+ *  for every block on every one of the ~25 evaluations the max search
+ *  runs. Blocks are placed in order of how much they want to be near
+ *  the control yard, each taking the free position closest to it.
+ *  Solar takes the largest rectangle still free afterwards, found
+ *  properly rather than assumed to be "the rest of the band".
+ *
+ *  A block that cannot be placed makes the evaluation infeasible with
+ *  a named reason, so the max search still narrows honestly instead of
+ *  quietly dropping equipment on the floor.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Campus]';
+
+  /* Separation between compounds. The zone gutter is a fire lane;
+     storage-to-exposure and generation-to-compute come from
+     OmegaZones and are read live so there is one source for them. */
+  function clearances() {
+    var C = null;
+    try { C = root.OmegaZones && root.OmegaZones.clearances; } catch (e) {}
+    return {
+      gutterFt: (C && C.zoneGutterFt) || 30,
+      storageFt: (C && C.storageExposureFt) || 25,
+      genComputeFt: (C && C.generationToComputeFt) || 40
+    };
+  }
+
+  var CAMPUS = {
+    ctrlLf: 40, ctrlWf: 30,          /* control house + switch yard pad   */
+    ctrlLabel: 'MASTER CONTROLLER',
+    fenceStandoffFt: 12,             /* security fence outside each block */
+    minSolarFt: 120,                 /* below this a solar field is noise */
+    grid: 130                        /* mask cells across the long side   */
+  };
+
+  /* ── parcel mask ────────────────────────────────────────────────────── */
+
+  /* Rasterised once per (polygon, exclusions, band). Cached on the input
+     object because the max search calls evaluate with the same input
+     twenty-odd times and the mask cannot change between them. */
+  function maskFor(input, band) {
+    var c = input.__campusMask;
+    if (c && c.band.x1 === band.x1 && c.band.y1 === band.y1
+          && c.band.x2 === band.x2 && c.band.y2 === band.y2) return c;
+
+    var pip = root.OmegaEngine.geom.pip;
+    var w = band.x2 - band.x1, h = band.y2 - band.y1;
+    if (!(w > 0 && h > 0)) return null;
+    var cs = Math.max(w, h) / CAMPUS.grid;
+    var nx = Math.max(1, Math.floor(w / cs)), ny = Math.max(1, Math.floor(h / cs));
+    var poly = input.polygon, excl = input.exclusions || [];
+    var ok = new Uint8Array(nx * ny);
+    var sat = new Int32Array((nx + 1) * (ny + 1));
+    for (var j = 0; j < ny; j++) {
+      var y = band.y1 + (j + 0.5) * cs;
+      for (var i = 0; i < nx; i++) {
+        var x = band.x1 + (i + 0.5) * cs, good = pip(x, y, poly) ? 1 : 0;
+        if (good) {
+          for (var e = 0; e < excl.length; e++) {
+            if (pip(x, y, excl[e])) { good = 0; break; }
+          }
+        }
+        ok[j * nx + i] = good;
+        sat[(j + 1) * (nx + 1) + (i + 1)] =
+          good + sat[j * (nx + 1) + (i + 1)] + sat[(j + 1) * (nx + 1) + i]
+          - sat[j * (nx + 1) + i];
+      }
+    }
+    c = { band: band, cs: cs, nx: nx, ny: ny, ok: ok, sat: sat };
+    try { input.__campusMask = c; } catch (e) {}
+    return c;
+  }
+
+  /* Every cell a rectangle covers must be usable. Cells are clipped to
+     the rectangle's INSIDE, so the answer is conservative by up to one
+     cell — a block never overhangs the parcel, it can only sit a
+     fraction under-sized against a slanted boundary. */
+  function clearRect(M, x, y, w, h) {
+    var i1 = Math.floor((x - M.band.x1) / M.cs), i2 = Math.ceil((x + w - M.band.x1) / M.cs) - 1;
+    var j1 = Math.floor((y - M.band.y1) / M.cs), j2 = Math.ceil((y + h - M.band.y1) / M.cs) - 1;
+    if (i1 < 0 || j1 < 0 || i2 >= M.nx || j2 >= M.ny || i2 < i1 || j2 < j1) return false;
+    var n = M.nx + 1;
+    var sum = M.sat[(j2 + 1) * n + (i2 + 1)] - M.sat[j1 * n + (i2 + 1)]
+            - M.sat[(j2 + 1) * n + i1] + M.sat[j1 * n + i1];
+    return sum === (i2 - i1 + 1) * (j2 - j1 + 1);
+  }
+
+  function apart(a, b, gap) {
+    return a.x2 + gap <= b.x1 || b.x2 + gap <= a.x1
+        || a.y2 + gap <= b.y1 || b.y2 + gap <= a.y1;
+  }
+
+  /* Gap between two compounds. Generation next to compute is the
+     controlling case; storage-to-exposure is below the fire lane so
+     the fire lane governs there. */
+  function gapFt(a, b, CL) {
+    if ((a === 'compute' && b === 'generation') || (a === 'generation' && b === 'compute')) {
+      return CL.genComputeFt;
+    }
+    if (a === 'storage' || b === 'storage') return Math.max(CL.gutterFt, CL.storageFt);
+    return CL.gutterFt;
+  }
+
+  /* The free position whose centre is nearest the control yard. */
+  function place(M, w, h, kind, taken, P, CL, anchor) {
+    var best = null;
+    for (var j = 0; j < M.ny; j++) {
+      var y = M.band.y1 + j * M.cs;
+      if (y + h > M.band.y2) break;
+      for (var i = 0; i < M.nx; i++) {
+        var x = M.band.x1 + i * M.cs;
+        if (x + w > M.band.x2) break;
+        if (!clearRect(M, x, y, w, h)) continue;
+        var r = { x1: x, y1: y, x2: x + w, y2: y + h }, hit = false;
+        for (var t = 0; t < taken.length; t++) {
+          if (!apart(r, taken[t], gapFt(kind, taken[t].kind, CL) * P)) { hit = true; break; }
+        }
+        if (hit) continue;
+        var d = Math.hypot((x + w / 2) - anchor.x, (y + h / 2) - anchor.y);
+        if (!best || d < best.d) { best = { d: d, x1: r.x1, y1: r.y1, x2: r.x2, y2: r.y2 }; }
+      }
+    }
+    return best;
+  }
+
+  /* ── shelf packer ───────────────────────────────────────────────────── */
+
+  /* One packer for every compound. Items are laid left to right and
+     wrapped, each carrying its own clearance, so a battery row and a
+     transformer row are spaced by their own rules rather than by one
+     invented number. Returns the block size and slots relative to its
+     origin. */
+  function shelf(items, maxW) {
+    var x = 0, y = 0, shelfH = 0, usedW = 0, out = [];
+    items.forEach(function (it) {
+      if (x > 0 && x + it.w > maxW) { y += shelfH + it.gap; x = 0; shelfH = 0; }
+      out.push({ x: x, y: y, w: it.w, h: it.h, kind: it.kind, label: it.label, ref: it.ref });
+      x += it.w + it.gap;
+      if (x - it.gap > usedW) usedW = x - it.gap;
+      if (it.h > shelfH) shelfH = it.h;
+    });
+    return { w: usedW, h: y + shelfH, slots: out };
+  }
+
+  /* Candidate block widths, squarest first. A compound that will not
+     fit as a square often fits as a long thin one against a boundary,
+     and trying is cheaper than declaring the load infeasible. */
+  function widths(items) {
+    var area = 0, wide = 0;
+    items.forEach(function (it) { area += (it.w + it.gap) * (it.h + it.gap); if (it.w > wide) wide = it.w; });
+    var base = Math.sqrt(area * 1.4);
+    return [1, 0.7, 1.5, 0.45, 2.2, 3.5].map(function (k) { return Math.max(wide, base * k); });
+  }
+
+  function fill(count, wPx, hPx, gapPx, kind, label) {
+    var out = [];
+    for (var i = 0; i < count; i++) out.push({ w: wPx, h: hPx, gap: gapPx, kind: kind, label: label });
+    return out;
+  }
+
+  /* ── one evaluation ─────────────────────────────────────────────────── */
+
+  function evaluate(itMw, input, cfg) {
+    var E = root.OmegaEngine, P = input.pxPerFt, CL = clearances();
+    var s = E.size(itMw, input, cfg);
+    var bb = E.geom.bbox(input.polygon), sb = cfg.setbackFt * P;
+    var band = { x1: bb.x1 + sb, y1: bb.y1 + sb, x2: bb.x2 - sb, y2: bb.y2 - sb };
+    var M = maskFor(input, band);
+    var parcelAc = E.geom.area(input.polygon) / (P * P) / 43560;
+    if (!M) return { sizing: s, zones: {}, slots: { pods: [], gen: [], bess: [], yard: [] },
+                     shapes: 0, parcelAc: parcelAc, feasible: false, why: 'no usable band', band: band };
+
+    /* The control yard goes as near the middle of the usable ground as
+       it can, because everything else is placed by its distance to it. */
+    var mid = { x: (band.x1 + band.x2) / 2, y: (band.y1 + band.y2) / 2 };
+    var cw = CAMPUS.ctrlLf * P, ch = CAMPUS.ctrlWf * P;
+    var ctrl = place(M, cw, ch, 'yard', [], P, CL, mid);
+    if (!ctrl) return { sizing: s, zones: {}, slots: { pods: [], gen: [], bess: [], yard: [] },
+                        shapes: 0, parcelAc: parcelAc, feasible: false,
+                        why: 'land (no room for a control yard)', band: band };
+    var anchor = { x: (ctrl.x1 + ctrl.x2) / 2, y: (ctrl.y1 + ctrl.y2) / 2 };
+    ctrl.kind = 'control';
+
+    var taken = [ctrl], zones = {}, slots = { pods: [], gen: [], bess: [], yard: [] };
+    var why = null;
+
+    /* Yard equipment, less the control house, which IS the control
+       yard and is drawn as the master controller. */
+    var yardEq = (s.yard || []).filter(function (eq) { return eq.kind !== 'panel'; });
+
+    var groups = [
+      { key: 'compute', kind: 'compute', into: 'pods', label: 'COMPUTE CAMPUS',
+        items: fill(s.pods, cfg.pod.lf * P, cfg.pod.wf * P, cfg.pod.clearFt * P,
+                    'derdc', cfg.pod.label) },
+      { key: 'yard', kind: 'yard', into: 'yard', label: 'INTERCONNECTION YARD',
+        items: yardEq.reduce(function (a, eq) {
+          return a.concat(fill(eq.n, eq.lf * P, eq.wf * P, eq.clearFt * P, eq.kind, eq.label));
+        }, []) },
+      { key: 'storage', kind: 'storage', into: 'bess', label: 'ENERGY STORAGE',
+        items: s.bess ? fill(s.bess.units, cfg.bess.lf * P, cfg.bess.wf * P,
+                             cfg.bess.clearFt * P, 'bespad', cfg.bess.label) : [] },
+      { key: 'generation', kind: 'generation', into: 'gen', label: 'ON-SITE GENERATION',
+        items: s.gen ? fill(s.gen.units, s.gen.lf * P, s.gen.wf * P, s.gen.clearFt * P,
+                            'deralt', s.gen.label) : [] }
+    ];
+
+    groups.forEach(function (grp) {
+      if (why || !grp.items.length) return;
+      var opts = widths(grp.items), got = null, pk = null;
+      for (var k = 0; k < opts.length && !got; k++) {
+        pk = shelf(grp.items, opts[k]);
+        got = place(M, pk.w, pk.h, grp.kind, taken, P, CL, anchor);
+      }
+      if (!got) { why = 'land (' + grp.key + ')'; return; }
+      zones[grp.key] = { x1: got.x1, y1: got.y1, x2: got.x2, y2: got.y2,
+                         label: grp.label, kind: grp.kind };
+      got.kind = grp.kind;
+      taken.push(got);
+      pk.slots.forEach(function (sl) {
+        slots[grp.into].push({ x: got.x1 + sl.x, y: got.y1 + sl.y, w: sl.w, h: sl.h,
+                               kind: sl.kind, label: sl.label });
+      });
+    });
+
+    /* Solar takes the largest rectangle still free, found for real. */
+    if (!why) {
+      var free = freeRect(M, taken, CL.gutterFt * P);
+      if (free && (free.x2 - free.x1) > CAMPUS.minSolarFt * P
+               && (free.y2 - free.y1) > CAMPUS.minSolarFt * P) {
+        free.label = 'SOLAR FIELD'; free.kind = 'solar';
+        zones.solar = free;
+      }
+    }
+
+    var shapes = slots.pods.length + slots.gen.length + slots.bess.length + slots.yard.length;
+    if (!why && s.gridLimited) why = 'utility ceiling (generation off)';
+    if (!why && shapes > cfg.shapeBudget) why = 'drawing budget';
+    if (!why && itMw / parcelAc > cfg.densityCapMwPerAcre) why = 'density cap';
+
+    return { sizing: s, zones: zones, slots: slots, shapes: shapes, parcelAc: parcelAc,
+             feasible: !why, why: why, band: band,
+             campus: { ctrl: ctrl, anchor: anchor, blocks: taken, gutterFt: CL.gutterFt } };
+  }
+
+  /* Largest free axis-aligned rectangle in the mask, excluding the
+     compounds already placed and their fire lane. Standard largest
+     rectangle in a histogram, run row by row. */
+  function freeRect(M, taken, gapPx) {
+    var nx = M.nx, ny = M.ny, cs = M.cs;
+    var heights = new Int32Array(nx), best = null;
+    for (var j = 0; j < ny; j++) {
+      var y = M.band.y1 + (j + 0.5) * cs;
+      for (var i = 0; i < nx; i++) {
+        var x = M.band.x1 + (i + 0.5) * cs, ok = M.ok[j * nx + i] === 1;
+        if (ok) {
+          for (var t = 0; t < taken.length; t++) {
+            var r = taken[t];
+            if (x >= r.x1 - gapPx && x <= r.x2 + gapPx && y >= r.y1 - gapPx && y <= r.y2 + gapPx) {
+              ok = false; break;
+            }
+          }
+        }
+        heights[i] = ok ? heights[i] + 1 : 0;
+      }
+      /* histogram sweep for this row */
+      var stack = [], k;
+      for (k = 0; k <= nx; k++) {
+        var hh = k < nx ? heights[k] : 0;
+        while (stack.length && heights[stack[stack.length - 1]] >= hh) {
+          var top = stack.pop();
+          var left = stack.length ? stack[stack.length - 1] + 1 : 0;
+          var wCells = k - left, hCells = heights[top];
+          var a = wCells * hCells;
+          if (a > 0 && (!best || a > best.a)) {
+            best = { a: a,
+              x1: M.band.x1 + left * cs, x2: M.band.x1 + k * cs,
+              y1: M.band.y1 + (j + 1 - hCells) * cs, y2: M.band.y1 + (j + 1) * cs };
+          }
+        }
+        stack.push(k);
+      }
+    }
+    return best;
+  }
+
+  /* ── max search ─────────────────────────────────────────────────────── */
+
+  function solveMax(input, cfg) {
+    var lo = 0, hi = 20, best = null, evals = 0, lastWhy = null, e, i;
+    var first = evaluate(hi, input, cfg); evals++;
+    if (first.feasible) {
+      best = first; lo = hi; hi *= 2;
+      for (i = 0; i < 7; i++) {
+        e = evaluate(hi, input, cfg); evals++;
+        if (!e.feasible) { lastWhy = e.why; break; }
+        best = e; lo = hi; hi *= 2;
+      }
+    } else {
+      lastWhy = first.why;
+      var probe = hi;
+      for (i = 0; i < 7 && probe > 1; i++) {
+        probe = Math.max(1, Math.floor(probe / 2));
+        var r = evaluate(probe, input, cfg); evals++;
+        if (r.feasible) { best = r; lo = probe; break; }
+        lastWhy = r.why; hi = probe;
+      }
+    }
+    for (i = 0; i < 12 && hi - lo > 1; i++) {
+      var mid = Math.floor((lo + hi) / 2);
+      var m = evaluate(mid, input, cfg); evals++;
+      if (m.feasible) { best = m; lo = mid; } else { hi = mid; lastWhy = m.why; }
+    }
+    if (best) {
+      var over = evaluate(best.sizing.itMw + 1, input, cfg); evals++;
+      best.boundBy = over.why || lastWhy || 'unknown';
+    }
+    return { best: best, evals: evals, why: lastWhy };
+  }
+
+  /* ── feeders ────────────────────────────────────────────────────────── */
+
+  /* Every compound ties back to the control yard, in two orthogonal
+     runs like a real cable route rather than a diagonal. The route
+     leaves the compound at the edge facing the yard. */
+  function feeder(zone, ctrl) {
+    var c = { x: (ctrl.x1 + ctrl.x2) / 2, y: (ctrl.y1 + ctrl.y2) / 2 };
+    var z = { x: (zone.x1 + zone.x2) / 2, y: (zone.y1 + zone.y2) / 2 };
+    var start;
+    if (Math.abs(c.x - z.x) > Math.abs(c.y - z.y)) {
+      start = { x: c.x > z.x ? zone.x2 : zone.x1, y: z.y };
+      return [start, { x: start.x + (c.x - start.x) / 2, y: start.y },
+              { x: start.x + (c.x - start.x) / 2, y: c.y },
+              { x: c.x > z.x ? ctrl.x1 : ctrl.x2, y: c.y }];
+    }
+    start = { x: z.x, y: c.y > z.y ? zone.y2 : zone.y1 };
+    return [start, { x: start.x, y: start.y + (c.y - start.y) / 2 },
+            { x: c.x, y: start.y + (c.y - start.y) / 2 },
+            { x: c.x, y: c.y > z.y ? ctrl.y1 : ctrl.y2 }];
+  }
+
+  /* ── entry ──────────────────────────────────────────────────────────── */
+
+  function design(input, overrides) {
+    var E = root.OmegaEngine;
+    var cfg = Object.assign({}, E.DEFAULTS, overrides || {});
+    if (overrides && overrides.rideMin != null) cfg.rideMin = +overrides.rideMin;
+    var errors = [];
+    if (!input.polygon || input.polygon.length < 3) errors.push('no boundary');
+    if (!(input.pxPerFt > 0)) errors.push('no scale');
+    if (errors.length) return { ok: false, errors: errors };
+
+    var ev, search = null;
+    if (input.mode === 'max') {
+      search = solveMax(input, cfg);
+      ev = search.best;
+      if (!ev) return { ok: false, errors: ['no feasible build down to 1 MW: ' + search.why],
+                        evals: search.evals };
+    } else {
+      ev = evaluate(+input.itMw || 40, input, cfg);
+    }
+
+    var sol = E.solarPlan(ev, input, cfg);
+    if (sol.built && sol.shiftKwh > 0 && ev.sizing.bess) {
+      ev.sizing.bess.kwh += sol.shiftKwh;
+      ev.sizing.bess.basis += ' + ' + Math.round(sol.shiftKwh).toLocaleString() + ' kWh solar shift';
+      ev.sizing.bess.units = Math.max(1, Math.ceil(ev.sizing.bess.kwh / cfg.bess.kwhPerUnit));
+    }
+
+    /* Feeders last, once solar is known, so the array is on the loop
+       like everything else. */
+    var campus = ev.campus || null, feeders = [];
+    if (campus) {
+      ['compute', 'storage', 'generation', 'yard'].forEach(function (k) {
+        if (ev.zones[k]) feeders.push({ to: k, pts: feeder(ev.zones[k], campus.ctrl) });
+      });
+      if (sol.built && ev.zones.solar) {
+        feeders.push({ to: 'solar', pts: feeder(ev.zones.solar, campus.ctrl) });
+      }
+      campus.feeders = feeders;
+      campus.label = CAMPUS.ctrlLabel;
+      campus.ctrlLf = CAMPUS.ctrlLf; campus.ctrlWf = CAMPUS.ctrlWf;
+      campus.standoffFt = CAMPUS.fenceStandoffFt;
+    }
+
+    return {
+      ok: true, feasible: ev.feasible, why: ev.why, boundBy: ev.boundBy || null,
+      sizing: ev.sizing, zones: ev.zones, slots: ev.slots, solar: sol,
+      parcelAc: ev.parcelAc, shapes: ev.shapes, evals: search ? search.evals : 1,
+      band: ev.band, campus: campus, layout: 'campus', cfg: cfg
+    };
+  }
+
+  /* ── drawing the campus ─────────────────────────────────────────────── */
+
+  var S_ = function () { return root.S; };
+
+  function push(sh) {
+    S_().shapes.push(sh);
+    try { if (typeof root.renderShape === 'function') root.renderShape(sh); } catch (e) {}
+    return sh;
+  }
+  function nid(p) { return (typeof root.uid === 'function') ? root.uid() : p + Date.now() + Math.random(); }
+
+  function rect(r, style, tag) {
+    return push({ id: nid('z'), kind: 'rect', style: style || 'dashed',
+      pts: [{ x: r.x1, y: r.y1 }, { x: r.x2, y: r.y2 }],
+      color: (typeof root.SHAPE_STROKE !== 'undefined' ? root.SHAPE_STROKE : '#E0E0E0'),
+      omegaCompute: true, omegaCampus: tag || 'fence' });
+  }
+
+  function drawCampus(plan) {
+    if (!plan || !plan.campus) return false;
+    var P = 0;
+    try { P = +S_().pxPerFt || 0; } catch (e) {}
+    if (!(P > 0)) return false;
+    var c = plan.campus, off = c.standoffFt * P;
+
+    /* Site perimeter at the setback line. */
+    if (plan.band) rect(plan.band, 'dashed', 'perimeter');
+
+    /* One fence per compound, standing off the equipment. */
+    ['compute', 'storage', 'generation', 'yard', 'solar'].forEach(function (k) {
+      var z = plan.zones[k];
+      if (!z) return;
+      if (k === 'solar' && !(plan.solar && plan.solar.built)) return;
+      rect({ x1: z.x1 - off, y1: z.y1 - off, x2: z.x2 + off, y2: z.y2 + off }, 'solid', k);
+    });
+
+    /* The master controller: the one pad everything answers to. */
+    push({ id: nid('mc'), kind: 'bespad', pts: [{ x: c.ctrl.x1, y: c.ctrl.y1 }],
+      style: (S_().shapeStyle || ''), lf: c.ctrlLf, wf: c.ctrlWf, model: c.label,
+      scaled: true, omegaCompute: true, omegaCampus: 'controller', omegaController: true });
+    rect({ x1: c.ctrl.x1 - off, y1: c.ctrl.y1 - off, x2: c.ctrl.x2 + off, y2: c.ctrl.y2 + off },
+         'solid', 'control');
+
+    /* Feeders. */
+    (c.feeders || []).forEach(function (f) {
+      push({ id: nid('fd'), kind: 'polyline', pts: f.pts.map(function (p) { return { x: p.x, y: p.y }; }),
+        style: '', color: '#F59E0B', omegaCompute: true, omegaCampus: 'feeder', tieTo: f.to });
+    });
+
+    /* Utility service in, from the substation if one is drawn. */
+    try {
+      var sub = (S_().shapes || []).filter(function (x) { return x && x.kind === 'substation'; }).pop();
+      if (sub && sub.pts && sub.pts.length > 1) {
+        var sx = (sub.pts[0].x + sub.pts[1].x) / 2, sy = (sub.pts[0].y + sub.pts[1].y) / 2;
+        push({ id: nid('pw'), kind: 'polyline', style: '', color: '#F59E0B',
+          pts: [{ x: sx, y: sy }, { x: c.anchor.x, y: sy }, { x: c.anchor.x, y: c.anchor.y }],
+          omegaCompute: true, omegaCampus: 'service', tieTo: 'utility' });
+      }
+    } catch (e) {}
+
+    labels(plan);
+    try { if (typeof root.updShapeCount === 'function') root.updShapeCount(); } catch (e) {}
+    /* The adapter snapshots history before this runs, so without a
+       second snapshot the fences and feeders are outside undo and
+       outside the next save. */
+    try { if (typeof root.pushHist === 'function') root.pushHist(); } catch (e) {}
+    return true;
+  }
+
+  /* Compound names, as an overlay rather than as shapes: they are a
+     reading aid on the canvas, not objects on the plan, and putting
+     them in S.shapes would put five undeletable text blocks into every
+     export and count them in the takeoff. */
+  var GID = 'omega-campus-labels';
+  function labels(plan) {
+    clearLabels();
+    var svg = document.getElementById('csvg');
+    if (!svg) return;
+    var P = +S_().pxPerFt || 6, fs = Math.max(11, P * 1.6);
+    var g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('id', GID); g.setAttribute('pointer-events', 'none');
+    var n1 = function (v) { return (Math.round(v * 10) / 10).toFixed(1); };
+    var s = plan.sizing;
+    var sub = {
+      compute: s.itMw + ' MW IT \u00b7 ' + s.pods + ' pods',
+      storage: s.bess ? n1(s.bess.kw / 1000) + ' MW / ' + Math.round(s.bess.kwh).toLocaleString() + ' kWh' : '',
+      generation: s.gen ? s.gen.units + ' \u00d7 ' + s.gen.label : '',
+      yard: n1(Math.max(s.utilKw, s.servedKw) / 1000) + ' MW tie-in',
+      solar: plan.solar && plan.solar.built ? n1(plan.solar.kwDc / 1000) + ' MW-DC \u00b7 '
+        + n1(plan.solar.acres) + ' ac' : ''
+    };
+    var text = function (x, y, t, size, fill, weight) {
+      var e = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      e.setAttribute('x', x); e.setAttribute('y', y);
+      e.setAttribute('fill', fill); e.setAttribute('font-size', size);
+      e.setAttribute('font-weight', weight || '700');
+      e.setAttribute('font-family', 'Arial,Helvetica,sans-serif');
+      e.textContent = t; g.appendChild(e);
+    };
+    ['compute', 'storage', 'generation', 'yard', 'solar'].forEach(function (k) {
+      var z = plan.zones[k];
+      if (!z || (k === 'solar' && !(plan.solar && plan.solar.built))) return;
+      var off = plan.campus.standoffFt * P;
+      text(z.x1 - off, z.y1 - off - fs * 0.5, z.label || k.toUpperCase(), fs, '#4ADE80');
+      if (sub[k]) text(z.x1 - off, z.y1 - off + fs * 0.7, sub[k], fs * 0.8, '#9AE6B4', '600');
+    });
+    var c = plan.campus.ctrl;
+    text((c.x1 + c.x2) / 2, c.y1 - plan.campus.standoffFt * P - fs * 0.4, plan.campus.label, fs, '#F59E0B');
+    g.querySelector('text:last-child').setAttribute('text-anchor', 'middle');
+    svg.appendChild(g);
+  }
+  function clearLabels() {
+    var g = document.getElementById(GID);
+    if (g && g.parentNode) g.parentNode.removeChild(g);
+  }
+
+  /* ── install ────────────────────────────────────────────────────────── */
+
+  function install() {
+    var E = root.OmegaEngine, A = root.OmegaAutoDesign;
+    if (!E || !A || !E.design) return false;
+    if (!E.design.__campus) {
+      E.bandDesign = E.design;
+      E.design = design; E.design.__campus = true;
+      E.campusEvaluate = evaluate;
+    }
+    if (A.draw && !A.draw.__campus) {
+      var orig = A.draw;
+      A.draw = function (plan) {
+        var r = orig.apply(this, arguments);
+        try { drawCampus(plan); } catch (e) { if (root.console) console.warn(TAG + ' draw', e && e.message); }
+        return r;
+      };
+      A.draw.__campus = true;
+    }
+    if (A.clearAll && !A.clearAll.__campus) {
+      var oc = A.clearAll;
+      A.clearAll = function () { clearLabels(); return oc.apply(this, arguments); };
+      A.clearAll.__campus = true;
+    }
+    return !!(root.OmegaEngine.design.__campus && root.OmegaAutoDesign.draw.__campus);
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () {
+      if (install() || ++n > 40) {
+        clearInterval(iv);
+        if (root.console && n <= 40) {
+          console.info(TAG + ' campus layout active \u2014 fenced compounds, '
+            + 'central control yard, feeders. OmegaEngine.bandDesign() is the old packer.');
+        }
+      }
+    }, 400);
+  }
+
+  root.OmegaCampus = {
+    design: design, evaluate: evaluate, draw: drawCampus, install: install,
+    config: CAMPUS, clearances: clearances,
+    /* Back to vertical bands, for comparison. */
+    off: function () {
+      if (root.OmegaEngine && root.OmegaEngine.bandDesign) {
+        root.OmegaEngine.design = root.OmegaEngine.bandDesign;
+        delete root.OmegaEngine.design.__campus;
+      }
+      return true;
+    }
+  };
+
+  if (typeof document === 'undefined') { /* node: pure use only */ }
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.OmegaCampus;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 78 — THE SUBSTATION READS AS A SUBSTATION
+ *  ---------------------------------------------------------------------
+ *  The old symbol put its label inside an opaque dark chip sized to
+ *  nearly the full width of the yard. Two things follow from that, and
+ *  both are visible on the plan.
+ *
+ *  First, the chip covers the thing it is labelling. A substation yard
+ *  is 120 x 90 ft of drawing that a reviewer is meant to read — the
+ *  fence line, the gantry, where the bus enters — and a filled box over
+ *  the middle of it hides all of that.
+ *
+ *  Second, and this is why the box was black with nothing in it: the
+ *  chip is a rect and the label is text, and Labels off (patch 32)
+ *  hides "#csvg text" without hiding the rect behind it. So the label
+ *  disappears and its backing box stays, which is exactly the artefact
+ *  in the screenshot. A backing box that can outlive its text is the
+ *  bug; removing it is the fix, not resizing it.
+ *
+ *  So: no chip. The label sits ABOVE the yard, outside the fence, in
+ *  haloed text — stroke behind fill via paint-order, which keeps it
+ *  legible over a dark aerial without painting anything opaque. It is
+ *  tagged .omega-utillabel, the class patch 32 already treats as
+ *  structural, so it survives "dims only" and vanishes cleanly on a
+ *  full label-off with nothing left behind.
+ *
+ *  The yard itself now draws what a substation actually contains:
+ *  incoming gantry, HV bus, transformer bank, breaker row. Detail
+ *  drops out as the box gets smaller rather than piling up into a
+ *  smudge — below about 90 px it is fence and glyph only, below 26 px
+ *  it is a fence.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Substation]';
+  var NS = 'http://www.w3.org/2000/svg';
+
+  function mk(t) { return document.createElementNS(NS, t); }
+  function line(g, x1, y1, x2, y2, ink, sw, dash) {
+    var e = mk('line');
+    e.setAttribute('x1', x1); e.setAttribute('y1', y1);
+    e.setAttribute('x2', x2); e.setAttribute('y2', y2);
+    e.setAttribute('stroke', ink); e.setAttribute('stroke-width', sw);
+    e.setAttribute('stroke-linecap', 'round');
+    if (dash) e.setAttribute('stroke-dasharray', dash);
+    g.appendChild(e); return e;
+  }
+  function box(g, x, y, w, h, fill, ink, sw, dash) {
+    var e = mk('rect');
+    e.setAttribute('x', x); e.setAttribute('y', y);
+    e.setAttribute('width', Math.max(0, w)); e.setAttribute('height', Math.max(0, h));
+    e.setAttribute('fill', fill || 'none');
+    if (ink) { e.setAttribute('stroke', ink); e.setAttribute('stroke-width', sw || 1); }
+    if (dash) e.setAttribute('stroke-dasharray', dash);
+    g.appendChild(e); return e;
+  }
+  function circle(g, cx, cy, r, ink, sw) {
+    var e = mk('circle');
+    e.setAttribute('cx', cx); e.setAttribute('cy', cy); e.setAttribute('r', r);
+    e.setAttribute('fill', 'none'); e.setAttribute('stroke', ink);
+    e.setAttribute('stroke-width', sw); g.appendChild(e); return e;
+  }
+  /* Haloed text: a dark stroke painted BEHIND the fill. Nothing opaque,
+     so it can never survive its own label being hidden. */
+  function text(g, x, y, s, size, fill, anchor, weight) {
+    var t = mk('text');
+    t.setAttribute('x', x); t.setAttribute('y', y);
+    t.setAttribute('font-size', size); t.setAttribute('fill', fill);
+    t.setAttribute('text-anchor', anchor || 'start');
+    t.setAttribute('font-family', 'Arial,Helvetica,sans-serif');
+    t.setAttribute('font-weight', weight || '700');
+    t.setAttribute('stroke', 'rgba(6,10,18,0.92)');
+    t.setAttribute('stroke-width', Math.max(2, size * 0.28));
+    t.setAttribute('stroke-linejoin', 'round');
+    t.setAttribute('paint-order', 'stroke fill');
+    t.setAttribute('class', 'omega-utillabel');
+    t.setAttribute('pointer-events', 'none');
+    t.textContent = s; g.appendChild(t); return t;
+  }
+
+  function render(g, sh) {
+    var a = sh.pts[0], b = sh.pts[1];
+    var x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+    var w = Math.abs(b.x - a.x), h = Math.abs(b.y - a.y);
+    var ink = sh.color || '#F59E0B', m = Math.min(w, h);
+    var ppf = 0;
+    try { ppf = (root.S && +root.S.pxPerFt > 0) ? +root.S.pxPerFt : 0; } catch (e) {}
+    var ft = ppf > 0 ? ppf : (w / 120);          /* px per foot, or implied */
+    var sw = Math.max(1.2, Math.min(3, m * 0.02));
+
+    /* Yard: a light wash so it reads as a defined area without hiding
+       the imagery under it, plus the security fence inside it. */
+    box(g, x, y, w, h, 'rgba(245,158,11,' + (sh.fillOpacity != null ? sh.fillOpacity : 0.07) + ')',
+        ink, sw);
+    var inset = Math.min(m * 0.06, Math.max(2, 4 * ft));
+    if (m > 26) box(g, x + inset, y + inset, w - inset * 2, h - inset * 2, 'none', ink,
+                    Math.max(0.8, sw * 0.5), '6 4');
+
+    /* Equipment, in the order power moves through it: gantry, bus,
+       transformer bank, breaker row. Laid out in fractions of the yard
+       so it holds its proportions at any drawn size. */
+    if (m > 90) {
+      var ix = x + inset * 2, iw = w - inset * 4;
+      var midY = y + h * 0.52;
+      var gx = ix + iw * 0.10;
+      /* incoming gantry: two lattice poles and three crossarms */
+      var poleTop = y + h * 0.20, poleBot = y + h * 0.80, spread = Math.max(6, iw * 0.055);
+      line(g, gx - spread, poleTop, gx - spread, poleBot, ink, sw * 0.8);
+      line(g, gx + spread, poleTop, gx + spread, poleBot, ink, sw * 0.8);
+      for (var k = 0; k < 3; k++) {
+        var cy = poleTop + (poleBot - poleTop) * (0.15 + k * 0.35);
+        line(g, gx - spread, cy, gx + spread, cy, ink, sw * 0.6);
+      }
+      /* three-phase bus running across the yard */
+      var busX2 = ix + iw * 0.92;
+      for (var p = -1; p <= 1; p++) {
+        line(g, gx + spread, midY + p * Math.max(3, h * 0.055), busX2,
+             midY + p * Math.max(3, h * 0.055), ink, sw * 0.55);
+      }
+      /* transformer bank */
+      var r = Math.max(5, Math.min(h * 0.13, iw * 0.06));
+      var tx = ix + iw * 0.46;
+      circle(g, tx - r * 0.5, midY, r, ink, sw * 0.8);
+      circle(g, tx + r * 0.5, midY, r, ink, sw * 0.8);
+      /* breaker row on the load side */
+      var bw = Math.max(5, iw * 0.045);
+      for (var q = 0; q < 3; q++) {
+        box(g, ix + iw * (0.70 + q * 0.075) - bw / 2, midY - bw / 2, bw, bw, 'none', ink, sw * 0.6);
+      }
+    } else if (m > 26) {
+      /* Too small for a yard drawing: one transformer glyph, centred. */
+      var rr = Math.max(3, m * 0.16), cx = x + w / 2, cyy = y + h / 2;
+      circle(g, cx - rr * 0.5, cyy, rr, ink, Math.max(1, sw * 0.7));
+      circle(g, cx + rr * 0.5, cyy, rr, ink, Math.max(1, sw * 0.7));
+    }
+
+    /* Label, outside the fence and above it, so it never sits on the
+       yard. If the yard is near the top of the drawing, it goes below
+       instead rather than off the sheet. */
+    if (m > 26) {
+      var fs = Math.max(9, Math.min(22, ppf > 0 ? ppf * 2.0 : m * 0.13));
+      var cap = isFinite(+sh.capMw) ? +sh.capMw : 0;
+      var l1 = (sh.label || 'Utility Substation').toUpperCase();
+      var l2 = (cap > 0 ? cap.toLocaleString() + ' MW firm' : 'capacity not set')
+        + (sh.voltage ? ' \u00b7 ' + sh.voltage : '')
+        + (sh.firm === false ? ' \u00b7 interruptible' : '');
+      var above = y > fs * 2.8;
+      var ly = above ? y - fs * 1.5 : y + h + fs * 1.4;
+      text(g, x, ly, l1, fs, '#F5C871', 'start', '800');
+      text(g, x, ly + fs * 1.12, l2, fs * 0.82, cap > 0 ? '#E2EEF9' : '#F87171', 'start', '600');
+    }
+  }
+
+  function install() {
+    if (typeof root._renderSubstation !== 'function') return false;
+    if (root._renderSubstation.__omega78) return true;
+    root._renderSubstation = render;
+    root._renderSubstation.__omega78 = true;
+    /* Redraw anything already on the canvas. */
+    try {
+      (root.S && root.S.shapes || []).forEach(function (sh) {
+        if (sh && sh.kind === 'substation' && typeof root.renderShape === 'function') root.renderShape(sh);
+      });
+    } catch (e) {}
+    if (root.console) console.info(TAG + ' symbol replaced \u2014 label outside the yard, no backing box');
+    return true;
+  }
+
+  function boot() {
+    var n = 0, iv = setInterval(function () { if (install() || ++n > 40) clearInterval(iv); }, 300);
+  }
+  root.OmegaSubstationSymbol = { render: render, install: install };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
 </body>
 </html>
