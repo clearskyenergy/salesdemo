@@ -1648,6 +1648,7 @@ window.onerror = function(msg, src, line, col, err) {
     <div class="rtab"        data-page="__file"  onclick="rbAppMenu(event)">File</div>
     <div class="rtab"        data-page="modify"  onclick="rbTab('modify')">Edit</div>
     <div class="rtab active" data-page="home"    onclick="rbTab('home')">Build</div>
+    <div class="rtab"        data-page="compute" onclick="rbTab('compute')" title="Compute campus &mdash; site, design, sizing and cost tools for a data-centre campus with on-site power">Compute</div>
     <div class="rtab"        data-page="insert"  onclick="rbTab('insert')">Insert</div>
     <div class="rtab"        data-page="draw"    onclick="rbTab('draw')">Draw</div>
     <div class="rtab"        data-page="annotate" onclick="rbTab('annotate')">Annotate</div>
@@ -1665,6 +1666,7 @@ window.onerror = function(msg, src, line, col, err) {
     <button class="rtm-item" onclick="rbHamburgerPick('__file')">File</button>
     <button class="rtm-item" onclick="rbHamburgerPick('modify')">Edit</button>
     <button class="rtm-item" onclick="rbHamburgerPick('home')">Build</button>
+    <button class="rtm-item" onclick="rbHamburgerPick('compute')">Compute</button>
     <button class="rtm-item" onclick="rbHamburgerPick('insert')">Insert</button>
     <button class="rtm-item" onclick="rbHamburgerPick('draw')">Draw</button>
     <button class="rtm-item" onclick="rbHamburgerPick('annotate')">Annotate</button>
@@ -1716,7 +1718,7 @@ window.onerror = function(msg, src, line, col, err) {
           <span class="rb-lbl" style="font-weight:700;color:var(--text);white-space:nowrap">Site Setup</span>
         </button>
       </div>
-      <div class="rpanel-cap">1 &middot; Compute Campus</div>
+      <div class="rpanel-cap">1 &middot; Site</div>
     </div>
     <!-- Build flows, ordered by project type. One button per destination. -->
     <div class="rpanel">
@@ -1753,6 +1755,31 @@ window.onerror = function(msg, src, line, col, err) {
         <div style="font-size:9.5px;color:var(--sub);padding:6px 4px">Loading recent projects…</div>
       </div>
       <div class="rpanel-cap">Recent</div>
+    </div>
+  </div>
+
+  <!-- COMPUTE (Patch 114). A data-centre campus has its own sequence --
+       site, design, size, cost -- and eleven of those tools were stacked
+       into one group on Build, next to the BESS and EV tracks. They live
+       here now, in the order you use them. The buttons are the same DOM
+       nodes the patches inject; OmegaComputeTab moves them into these
+       panels as they appear, so nothing was re-implemented. -->
+  <div class="ribbon-page" data-page="compute">
+    <div class="rpanel" data-ct="site">
+      <div class="rpanel-body"></div>
+      <div class="rpanel-cap">1 &middot; Site</div>
+    </div>
+    <div class="rpanel" data-ct="place">
+      <div class="rpanel-body"></div>
+      <div class="rpanel-cap">2 &middot; Place</div>
+    </div>
+    <div class="rpanel" data-ct="design">
+      <div class="rpanel-body"></div>
+      <div class="rpanel-cap">3 &middot; Design</div>
+    </div>
+    <div class="rpanel" data-ct="size">
+      <div class="rpanel-body"></div>
+      <div class="rpanel-cap">4 &middot; Size &amp; Cost</div>
     </div>
   </div>
 
@@ -6552,6 +6579,8 @@ function _serializeCanvas(){
     shapes:    JSON.parse(JSON.stringify(S.shapes||[])),
     bessList:  JSON.parse(JSON.stringify(S.bessList||[])),
     vendorOverride: JSON.parse(JSON.stringify(S.vendorOverride||{})),
+    computeCost: S.computeCost ? JSON.parse(JSON.stringify(S.computeCost)) : null,
+    costOverrides: S.costOverrides ? JSON.parse(JSON.stringify(S.costOverrides)) : null,
     trenches:  JSON.parse(JSON.stringify(S._trenches||[])),
     pxPerFt:   S.pxPerFt || null,
     unitLabel: S.unitLabel || 'ft',
@@ -6581,6 +6610,8 @@ function _restoreCanvas(snap){
   try{ S.vendorOverride = JSON.parse(JSON.stringify(snap.vendorOverride||{})); }
   catch(e){ S.vendorOverride = {}; }
   window._ceVendorOverride = S.vendorOverride;
+  try{ S.computeCost = snap.computeCost ? JSON.parse(JSON.stringify(snap.computeCost)) : null; }catch(e){ S.computeCost = null; }
+  try{ S.costOverrides = snap.costOverrides ? JSON.parse(JSON.stringify(snap.costOverrides)) : null; }catch(e){ S.costOverrides = null; }
   S.pxPerFt = snap.pxPerFt || null;
   S.unitLabel = snap.unitLabel || 'ft';
   if(snap.bg && typeof BG!=='undefined'){ BG.scale=snap.bg.scale; BG.tx=snap.bg.tx; BG.ty=snap.bg.ty; BG.rot=snap.bg.rot; }
@@ -23882,6 +23913,14 @@ async function saveProject(){
       /* Entered equipment prices are project data. Without this the cost
          sheet reverted to the $/kWh benchmark on every reload. */
       vendorOverride: S.vendorOverride || null,
+      /* Patch 112: pod pricing is project data (it was in localStorage), and
+         the compute sizing Patch 91 writes to S.omegaSizing never reached
+         this payload, so "survives a reload" was only ever true in the tab
+         that made it. Both save here and restore on load. */
+      computeCost:   S.computeCost   || null,
+      costOverrides: S.costOverrides || null,
+      omegaSizing:   S.omegaSizing   || null,
+      omegaSizingAt: S.omegaSizingAt || null,
       /* Price decks are project data. An 8760 x 7 products is large, so
          only the metadata and series descriptors are guaranteed here --
          see _pdStripForSave for what is dropped when it will not fit. */
@@ -24021,6 +24060,14 @@ async function _loadProject(id){
     S.vendorOverride = (d.vendorOverride && typeof d.vendorOverride==='object')
                          ? d.vendorOverride : {};
     window._ceVendorOverride = S.vendorOverride;
+    /* Patch 112: restore pod pricing and compute sizing; reset both when
+       the project has none so they cannot leak from the previous project. */
+    S.computeCost   = (d.computeCost   && typeof d.computeCost==='object')   ? d.computeCost   : null;
+    S.costOverrides = (d.costOverrides && typeof d.costOverrides==='object') ? d.costOverrides : null;
+    S.omegaSizing   = (d.omegaSizing   && typeof d.omegaSizing==='object')   ? d.omegaSizing   : null;
+    S.omegaSizingAt = d.omegaSizingAt || null;
+    try{ window._omegaComputeLast = (S.omegaSizing && S.omegaSizing.facKw > 0) ? S.omegaSizing : null; }catch(e){}
+    try{ if(window.OmegaRecord && OmegaRecord.restore) setTimeout(function(){ try{ OmegaRecord.restore(); }catch(e){} }, 0); }catch(e){}
     /* Same reasoning as vendorOverride: reset to {} when the project has
        none, so decks cannot leak from the previously open project. */
     S.priceDecks = (d.priceDecks && typeof d.priceDecks==='object') ? d.priceDecks : {};
@@ -25814,6 +25861,16 @@ async function _captureCanvasWithSVG(el, opts) {
       if (!opts.windowHeight) opts.windowHeight = document.documentElement.clientHeight;
       if (opts.scrollX == null) opts.scrollX = 0;
       if (opts.scrollY == null) opts.scrollY = 0;
+      /* Patch 113: PRINT RESOLUTION. Every exporter asked for scale 1.5
+         or 2 -- a 1,440 px canvas became ~2,200 px, then went 17 inches
+         wide on a sheet: ~130 dpi, and the equipment symbols smear. Aim
+         for ~4,800 px across (280 dpi on a D-size sheet), never below what
+         the caller asked for, capped at 4x and 32 MP so a 4K monitor does
+         not exhaust the canvas. */
+      var _want = Math.min(4, Math.max(+opts.scale || 1, 4800 / liveW));
+      if (liveW * liveH * _want * _want > 32e6) _want = Math.sqrt(32e6 / (liveW * liveH));
+      if (_want > (+opts.scale || 1)) opts.scale = +_want.toFixed(2);
+      window._lastCaptureScale = opts.scale;
     }
     cvs = await html2canvas(el, opts);
   } finally {
@@ -25881,7 +25938,17 @@ function calcProposalCosts() {
     bessInstall: bessInstOnly,
     bessTotal,
     solarCost, solarKwDc,
-    benchmarked: !!(window._BESS_IS_BENCHMARK || window._SOLAR_IS_BENCHMARK),
+    /* Patch 112: the lines the total is made of, so the summary sums to it. */
+    computeCost: +(window._COMPUTE_TOTAL||0), computePods: +(window._COMPUTE_PODS||0),
+    computeMw: +(window._COMPUTE_MW||0), computeBench: !!window._COMPUTE_IS_BENCHMARK,
+    computeExclIt: !!(window._COMPUTE_DETAIL && window._COMPUTE_DETAIL.excludeIt),
+    genCost: +(window._GEN_TOTAL||0),
+    genKw: (window._GEN_DETAIL && +window._GEN_DETAIL.kw) || 0,
+    genUnits: (window._GEN_DETAIL && +window._GEN_DETAIL.units) || 0,
+    dcCost: +(window._DC_TOTAL||0), evCost: +(window._EV_TOTAL||0), bnzCost: +(window._BNZ_TOTAL||0),
+    totalLow: +(window._COST_LOW||0), totalHigh: +(window._COST_HIGH||0),
+    itcBasis: (typeof omegaItcBasis==='function') ? omegaItcBasis() : +(window._COST_TOTAL||0),
+    benchmarked: !!(window._BESS_IS_BENCHMARK || window._SOLAR_IS_BENCHMARK || window._COMPUTE_IS_BENCHMARK || window._GEN_IS_BENCHMARK),
     benchSource: (window.OMEGA_BENCH && window.OMEGA_BENCH.source) || '',
     siteEq,
     condCost: condTotal,
@@ -25919,6 +25986,9 @@ function openProposalExport() {
       <span style="color:#E2EEF9;font-family:'IBM Plex Mono',monospace;font-weight:700">${c.fmt(val)}</span>
     </div>`;
   document.getElementById('prop-cost-lines').innerHTML = [
+    (c.computeCost > 0 ? row(`  Compute pods \u00d7${c.computePods} (${c.computeMw.toFixed(1)} MW IT${c.computeBench ? ', benchmark' : ''})`, c.computeCost, '#8B7BD8') : ''),
+    (c.genCost > 0 ? row(`  On-site generation \u00d7${c.genUnits} (${Math.round(c.genKw).toLocaleString()} kW, benchmark)`, c.genCost, '#F472B6') : ''),
+    (c.dcCost > 0 ? row('  Data-centre electrical (ROM)', c.dcCost, '#38BDF8') : ''),
     (c.solarCost > 0 ? row(`  Solar PV (${Math.round(c.solarKwDc).toLocaleString()} kW-DC)`, c.solarCost, '#FBBF24') : ''),
     row(`  BESS Equipment (${Math.round(c.totalKwh)}kWh)`, c.bessEqCost, '#60A5FA'),
     row('   BESS Installation Labor', c.bessInstall),
@@ -25926,11 +25996,16 @@ function openProposalExport() {
     c.condCost > 0 ? row(' Conduit & Wiring (mat+labor)', c.condCost, '#F87171') : '',
     c.indirect > 0 ? row('  Engineering / Permitting / Commissioning', c.indirect) : '',
     c.emsOn && c.emsCost > 0 ? row('  EMS Software (setup)', c.emsCost, '#A78BFA') : '',
+    c.evCost > 0 ? row('  EV charging', c.evCost, '#22D3EE') : '',
+    c.bnzCost > 0 ? row('  Building envelope', c.bnzCost, '#A78BFA') : '',
     row(`  Contingency (${c.contPct}%)`, c.cont),
     `<div style="display:flex;justify-content:space-between;padding:6px 0;margin-top:4px;border-top:2px solid rgba(255,255,255,.2)">
       <span style="font-weight:700;color:#fff">ESTIMATED TOTAL</span>
       <span style="font-weight:700;color:#1DB95A;font-family:'IBM Plex Mono',monospace;font-size:15px">${c.fmt(c.total)}</span>
     </div>`,
+    (c.computeBench && c.totalHigh > c.totalLow
+      ? `<div style="font-size:10px;color:#F59E0B;padding:2px 0;line-height:1.5">Range ${c.fmt(c.totalLow)} \u2013 ${c.fmt(c.totalHigh)} \u00b7 pods at the $20\u201340M/MW benchmark until a quote is entered in Compute Cost</div>`
+      : ''),
   ].filter(Boolean).join('');
 
   // Brand header (tenant name) -- resolved by brandName()/auto-brand resolver.
@@ -26288,13 +26363,22 @@ p.body{font-size:12px;color:#3A5068;line-height:1.7;margin-bottom:12px}
     <h3 class="sub">Project Cost Summary</h3>
     <table class="tbl">
       <tbody>
+        ${c.computeCost > 0 ? `<tr><td>Compute pods \u00d7${c.computePods} \u2014 ${c.computeMw.toFixed(1)} MW IT${c.computeExclIt ? ' (enclosures only)' : ', all-in'}${c.computeBench ? ' <em>(benchmark)</em>' : ''}</td><td style="text-align:right">${c.fmt(c.computeCost)}</td></tr>` : ''}
+        ${c.genCost > 0 ? `<tr><td>On-site generation \u00d7${c.genUnits} \u2014 ${Math.round(c.genKw).toLocaleString()} kW <em>(benchmark)</em></td><td style="text-align:right">${c.fmt(c.genCost)}</td></tr>` : ''}
+        ${c.dcCost > 0 ? `<tr><td>Data-centre electrical package (ROM)</td><td style="text-align:right">${c.fmt(c.dcCost)}</td></tr>` : ''}
+        ${c.solarCost > 0 ? `<tr><td>Solar PV \u2014 ${Math.round(c.solarKwDc).toLocaleString()} kW-DC</td><td style="text-align:right">${c.fmt(c.solarCost)}</td></tr>` : ''}
         <tr><td>Equipment (${_pt.equipLabel||'Equipment'})</td><td style="text-align:right">${c.fmt(c.bessEqCost)}</td></tr>
         <tr><td>Conduit & Trenching</td><td style="text-align:right">${c.fmt(c.condCost)}</td></tr>
         <tr><td>Installation Labor</td><td style="text-align:right">${c.fmt(c.labor)}</td></tr>
+        ${c.siteEq > 0 ? `<tr><td>Site Equipment</td><td style="text-align:right">${c.fmt(c.siteEq)}</td></tr>` : ''}
+        ${c.evCost > 0 ? `<tr><td>EV Charging</td><td style="text-align:right">${c.fmt(c.evCost)}</td></tr>` : ''}
+        ${c.bnzCost > 0 ? `<tr><td>Building Envelope</td><td style="text-align:right">${c.fmt(c.bnzCost)}</td></tr>` : ''}
         <tr><td>Engineering & Inspection</td><td style="text-align:right">${c.fmt(c.indirect)}</td></tr>
         <tr><td>EMS Software (yr1)${c.emsOn ? '' : ' -- OFF'}</td><td style="text-align:right">${c.emsOn ? c.fmt(c.emsCost) : '$--'}</td></tr>
         <tr><td>Contingency (${c.contPct}%)</td><td style="text-align:right">${c.fmt(c.cont)}</td></tr>
         <tr class="total"><td><strong>TOTAL PROJECT COST</strong></td><td style="text-align:right"><strong>${c.fmt(c.total)}</strong></td></tr>
+        ${c.computeBench && c.totalHigh > c.totalLow ? `<tr><td colspan="2" style="font-size:10px;color:#92400E">Range ${c.fmt(c.totalLow)} \u2013 ${c.fmt(c.totalHigh)}. Compute pods carry the operator benchmark of $20\u201340M per MW (all-in) until a vendor quote replaces it. On-site generation is at the EIA class benchmark; balance of plant excluded.</td></tr>` : ''}
+        ${c.itcBasis > 0 && c.itcBasis < c.total ? `<tr><td colspan="2" style="font-size:10px;color:#475569">Federal ITC basis (energy property only): ${c.fmt(c.itcBasis)}. Compute, gas generation, DC electrical and buildings are not eligible.</td></tr>` : ''}
       </tbody>
     </table>
     <div class="pg">2</div>
@@ -26341,10 +26425,10 @@ ${sitemapDataUrl ? `
       <div class="fin-card fin-blue"><div class="fin-val">${payback ? payback+' yrs' : '&mdash;'}</div><div class="fin-lbl">${payback ? 'Est. Simple Payback' : 'Payback &mdash; run the Value Stack'}</div></div>
       <div class="fin-card fin-amber"><div class="fin-val">${irr ? irr+'%' : '&mdash;'}</div><div class="fin-lbl">${irr ? 'Projected IRR (20 yr)' : 'IRR &mdash; run the Value Stack'}</div></div>
       ${(()=>{
-        const kwh_kpi = S.bessList.reduce((s,b)=>(s+(+(b.kwh||0))*(+(b.qty||1))),0)||760;
+        const kwh_kpi = omegaIncentiveKwh();
         let inc = 0;
         (_incentives||[]).filter(i=>i.enabled).forEach(i=>{
-          if(i.type==='pct-project') inc+=c.total*i.rate/100;
+          if(i.type==='pct-project') inc+=omegaItcBasis()*i.rate/100;
           else if(i.type==='per-kwh') inc+=kwh_kpi*i.rate;
           else inc+=i.customValue||0;
         });
@@ -26375,8 +26459,8 @@ ${sitemapDataUrl ? `
               customValue: 0, notes: ''
             }));
           }
-          const kwh_calc = S.bessList.reduce((s,b)=>(s+(+(b.kwh||0))*(+(b.qty||1))),0) || 760;
-          const grossCost_calc = c.total || 0;
+          const kwh_calc = omegaIncentiveKwh();
+          const grossCost_calc = omegaItcBasis() || c.total || 0;
           const enabled = _incentives.filter(i => i.enabled);
           if (!enabled.length) return `<tr><td colspan="4" style="text-align:center;color:#8BA0B4;padding:14px">No incentives selected -- enable incentives in the Cost Estimator tab</td></tr>`;
           return enabled.map(inc => {
@@ -26397,8 +26481,8 @@ ${sitemapDataUrl ? `
         })()}
         ${(()=>{
           // Total row
-          const kwh_calc = S.bessList.reduce((s,b)=>(s+(+(b.kwh||0))*(+(b.qty||1))),0) || 760;
-          const grossCost_calc = c.total || 0;
+          const kwh_calc = omegaIncentiveKwh();
+          const grossCost_calc = omegaItcBasis() || c.total || 0;
           let incTotal = 0;
           (_incentives||[]).filter(i=>i.enabled).forEach(inc=>{
             if(inc.type==='pct-project') incTotal += grossCost_calc*inc.rate/100;
@@ -27085,22 +27169,43 @@ function updateCostEst() {
   window._BNZ_DETAIL = _bnz;
   window._BNZ_TOTAL = bnzTotal;
 
-  /* Patch 93: the enclosures themselves. Never estimated — only what has
-     been entered in Compute Cost, so a proposal cannot carry a made-up
-     pod price. Accelerators are deliberately NOT here: different owner,
-     different life, and they do not belong in a site capex total. */
-  var _computeTotal = 0, _computePods = 0;
+  /* Patch 112: THE PODS ARE THE BUDGET. Patch 93 priced them at $0 until a
+     quote was typed in, so a 40-pod campus totalled $58M -- the batteries,
+     the PV and the switchgear -- while the one line that is ~95% of the
+     job was missing and nothing on the panel said the number was short.
+     Pods are now priced like solar and storage: off the canvas, at a
+     stated benchmark ($30M +/- $10M per 1 MW pod, operator figure), all-in,
+     flagged as a benchmark wherever it prints, replaced by whatever is
+     entered in Compute Cost. Enclosures-only is still available there as
+     an explicit choice. */
+  var _computeTotal = 0, _computePods = 0, _computeLo = 0, _computeHi = 0, _computeBench = false;
   try{
     if(window.OmegaComputeCost){
       var _cc = OmegaComputeCost.figures();
       _computePods = _cc.pods || 0;
-      _computeTotal = _cc.siteCapex || 0;
+      _computeTotal = _cc.projectCapex || 0;
+      _computeLo = (_cc.projectLo > 0) ? _cc.projectLo : _computeTotal;
+      _computeHi = (_cc.projectHi > 0) ? _cc.projectHi : _computeTotal;
+      _computeBench = !!_cc.isBenchmark;
       window._COMPUTE_IT_TOTAL = _cc.itTotal || 0;
       window._COMPUTE_MW = _cc.mw || 0;
+      window._COMPUTE_DETAIL = _cc;
     }
   }catch(e){}
   window._COMPUTE_TOTAL = _computeTotal;
   window._COMPUTE_PODS = _computePods;
+  window._COMPUTE_IS_BENCHMARK = _computeBench;
+
+  /* Patch 112: ON-SITE GENERATION. Three 30 MW turbines on the drawing
+     reached the legend, the BOM and the power balance, and never the
+     estimate: no line read the deralt/derwind shapes. Priced at the EIA
+     class benchmark until a quote replaces it. */
+  var _gen = { total:0, kw:0, units:0, lines:[], gasKw:0, gasTotal:0 };
+  try{ if(typeof omegaGenBenchCost==='function') _gen = omegaGenBenchCost(); }catch(e){}
+  var genTotal = _gen.total || 0;
+  window._GEN_TOTAL = genTotal;
+  window._GEN_DETAIL = _gen;
+  window._GEN_IS_BENCHMARK = genTotal > 0;
 
   var _dcRom = { active:false, total:0, lines:[] };
   try{ if(typeof omegaDataCenterROM==='function') _dcRom = omegaDataCenterROM(); }catch(e){}
@@ -27116,15 +27221,30 @@ function updateCostEst() {
   window._BESS_IS_BENCHMARK = _benchBess > 0;
   window._SOLAR_IS_BENCHMARK = solarTotal > 0;
 
-  const inScope = (bessTotal > 0) || (evTotal > 0) || (_placedKw > 0) || (solarTotal > 0) || (dcTotal > 0) || (bnzTotal > 0) || (_computeTotal > 0) || (_computePods > 0);
+  const inScope = (bessTotal > 0) || (evTotal > 0) || (_placedKw > 0) || (solarTotal > 0) || (dcTotal > 0) || (bnzTotal > 0) || (_computeTotal > 0) || (_computePods > 0) || (genTotal > 0);
 
-  const sub = inScope ? (bessTotal + solarTotal + siteEq + indirect + evTotal + dcTotal + bnzTotal + _computeTotal) : 0;
+  const sub = inScope ? (bessTotal + solarTotal + siteEq + indirect + evTotal + dcTotal + bnzTotal + _computeTotal + genTotal) : 0;
   const contPct = +($v('ce-cont')||10)/100;
   const cont = sub * contPct;
   let TOTAL = sub + cont;
 
-  // $/kW metric
-  const totalKW = S.bessList.reduce((s,b)=>s+(+(b.kw||0))*(+(b.qty||1)),0);
+  /* Patch 112: the range. Only the pods carry a stated band; every other
+     line is a point benchmark or an entered price. */
+  var _subLo = sub - _computeTotal + _computeLo, _subHi = sub - _computeTotal + _computeHi;
+  var _costLow = inScope ? _subLo * (1 + contPct) : 0, _costHigh = inScope ? _subHi * (1 + contPct) : 0;
+
+  /* Patch 112: what a federal ITC can be claimed on. The credit is on
+     energy property -- storage, PV, wind, fuel cells and their share of
+     the site works -- not on GPU pods, gas turbines, the compute
+     electrical package or a building shell. 30% of a $1.3B total would
+     have printed a $400M tax credit on a proposal. */
+  var _itcExcluded = _computeTotal + dcTotal + bnzTotal + (_gen.gasTotal || 0);
+  var _itcSub = Math.max(0, sub - _itcExcluded);
+  var _itcBasis = _itcSub * (1 + contPct);
+
+  // $/kW metric -- over everything placed that has a rating, not just the batteries
+  const _bessKW = S.bessList.reduce((s,b)=>s+(+(b.kw||0))*(+(b.qty||1)),0);
+  const totalKW = _bessKW + Math.round((window._COMPUTE_MW || 0) * 1000) + Math.round(_gen.kw || 0);
   const costPerKW = totalKW > 0 ? Math.round(TOTAL / totalKW) : 0;
   window._COST_PER_KW = costPerKW;
   // Update total display
@@ -27149,13 +27269,14 @@ function updateCostEst() {
     bd.innerHTML =
       (solarTotal > 0 ? row('  Solar PV (equip + install)', solarTotal, '#FBBF24') : '') +
       (_computeTotal > 0
-        ? row('  Compute enclosures \u00d7' + _computePods, _computeTotal, '#8B7BD8')
+        ? row('  Compute pods \u00d7' + _computePods + (_computeBench ? ' (benchmark, all-in)' : (window._COMPUTE_DETAIL && window._COMPUTE_DETAIL.excludeIt ? ' (enclosures only)' : ' (entered, all-in)')), _computeTotal, '#8B7BD8')
         : (_computePods > 0
           ? `<div style="display:flex;justify-content:space-between;padding:6px 0">
-              <span style="color:var(--sub);font-size:10.5px">Compute enclosures \u00d7${_computePods}
-                <span style="opacity:.75">\u2014 no price entered</span></span>
+              <span style="color:var(--sub);font-size:10.5px">Compute pods \u00d7${_computePods}
+                <span style="opacity:.75">\u2014 enclosures-only is on with no enclosure price</span></span>
               <span style="color:var(--amber);font-size:10.5px;font-family:'IBM Plex Mono',monospace">set in Compute Cost</span>
             </div>` : '')) +
+      (genTotal > 0 ? row('  On-site generation \u00d7' + _gen.units + ' (' + Math.round(_gen.kw).toLocaleString() + ' kW, benchmark)', genTotal, '#F472B6') : '') +
       (dcTotal > 0 ? row('  Data Centre Electrical (ROM)', dcTotal, '#38BDF8') : '') +
       (bnzTotal > 0 ? row('  Building Envelope', bnzTotal, '#A78BFA') : '') +
       row('  BESS Equipment + Install', bessTotal, 'var(--accent)') +
@@ -27170,7 +27291,10 @@ function updateCostEst() {
         <span style="color:var(--green);font-weight:700;font-size:14px;font-family:'IBM Plex Mono',monospace">${fmt(TOTAL)}</span>
       </div>` +
       (costPerKW > 0 ? `<div style="text-align:right;font-size:10px;color:var(--sub);margin-top:2px">
-        <span style="color:var(--accent);font-weight:700;font-family:'IBM Plex Mono',monospace">$${costPerKW.toLocaleString()}/kW</span> installed . ${totalKW} kW total
+        <span style="color:var(--accent);font-weight:700;font-family:'IBM Plex Mono',monospace">$${costPerKW.toLocaleString()}/kW</span> installed . ${totalKW.toLocaleString()} kW placed
+      </div>` : '') +
+      (_computeBench && _costHigh > _costLow ? `<div style="text-align:right;font-size:10px;color:var(--amber);margin-top:2px;line-height:1.5">
+        Range ${fmt(_costLow)} \u2013 ${fmt(_costHigh)} \u00b7 pods at the $20\u201340M/MW operator benchmark until a quote is entered in Compute Cost
       </div>` : '') +
       // Informational — conduit/wiring materials are already inside install cost.
       (condTotal > 0 ? `<div style="display:flex;justify-content:space-between;padding:6px 0 2px;margin-top:6px;border-top:1px dashed rgba(255,255,255,.12)">
@@ -27193,6 +27317,15 @@ function updateCostEst() {
   if(_actual > 0){ TOTAL = _actual; }
   window._COST_IS_CONTRACTED = _actual > 0;
   window._COST_BENCHMARK = sub + cont;   /* keep the build-up for comparison */
+  /* Patch 112: range and ITC basis follow the contracted number when there is one. */
+  if(_actual > 0){
+    _costLow = _actual; _costHigh = _actual;
+    _itcBasis = (sub > 0) ? _actual * (_itcSub / sub) : _actual;
+  }
+  window._COST_LOW = _costLow;
+  window._COST_HIGH = _costHigh;
+  window._COST_ITC_BASIS = _itcBasis;
+  window._COST_ITC_EXCLUDED = _itcExcluded * (1 + contPct);
 
   window._IN_SCOPE = inScope;
   window._COST_TOTAL = TOTAL;
@@ -27277,10 +27410,10 @@ function renderIncentivesPanel() {
     _updateComedCalc();
   }
   list.innerHTML = _incentives.map((inc, i) => {
-    const kwh = S.bessList.reduce((s,b)=>(s+(+(b.kwh||0))*(+(b.qty||1))),0)||760;
+    const kwh = omegaIncentiveKwh();
     let calcVal = 0;
     if(inc.enabled) {
-      if(inc.type==='pct-project') calcVal = (window._COST_TOTAL||0) * inc.rate/100;
+      if(inc.type==='pct-project') calcVal = omegaItcBasis() * inc.rate/100;
       else if(inc.type==='per-kwh') calcVal = kwh * inc.rate;
       else calcVal = inc.customValue||0;
     }
@@ -27296,7 +27429,7 @@ function renderIncentivesPanel() {
       </div>
       <div style="font-size:9px;color:var(--sub);margin-bottom:5px">${inc.desc}</div>
       ${inc.type==='per-kwh' ? `<div class="ce-row"><span class="ce-lbl">Rate ($/kWh)</span><input class="ce-inp" type="number" value="${inc.rate}" step="5" oninput="_incentives[${i}].rate=+this.value;renderIncentivesPanel()"><span class="ce-unit">x ${Math.round(kwh)} kWh = <strong style="color:var(--green)">$${Math.round(kwh*inc.rate).toLocaleString()}</strong></span></div>` : ''}
-      ${inc.type==='pct-project' ? `<div class="ce-row"><span class="ce-lbl">Rate (%)</span><input class="ce-inp" type="number" value="${inc.rate}" step="1" oninput="_incentives[${i}].rate=+this.value;renderIncentivesPanel()"><span class="ce-unit">of $${Math.round(window._COST_TOTAL||0).toLocaleString()} = <strong style="color:var(--green)">$${Math.round(calcVal).toLocaleString()}</strong></span></div>` : ''}
+      ${inc.type==='pct-project' ? `<div class="ce-row"><span class="ce-lbl">Rate (%)</span><input class="ce-inp" type="number" value="${inc.rate}" step="1" oninput="_incentives[${i}].rate=+this.value;renderIncentivesPanel()"><span class="ce-unit">of $${Math.round(omegaItcBasis()).toLocaleString()} eligible${(window._COST_ITC_EXCLUDED>0)?' (compute, gas generation, DC electrical and buildings excluded)':''} = <strong style="color:var(--green)">$${Math.round(calcVal).toLocaleString()}</strong></span></div>` : ''}
       ${inc.type==='fixed' ? `<div class="ce-row"><span class="ce-lbl">Value ($)</span><input class="ce-inp" type="number" value="${inc.customValue||0}" oninput="_incentives[${i}].customValue=+this.value;renderIncentivesPanel()"></div>` : ''}
       <div><input type="text" value="${inc.notes||''}" placeholder="Notes..." oninput="_incentives[${i}].notes=this.value" style="width:100%;background:rgba(0,0,0,.2);border:1px solid var(--border);color:var(--sub);border-radius:4px;padding:3px 7px;font-size:9px;font-family:inherit;box-sizing:border-box"></div>
     </div>`;
@@ -27309,14 +27442,43 @@ function addCustomIncentive() {
   renderIncentivesPanel();
 }
 
+/* Patch 112: the base a percentage-of-project incentive applies to. The
+   cost engine publishes the energy-property share of the total; before it
+   has run this falls back to the total so nothing divides by nothing. */
+function omegaItcBasis(){
+  var b = +window._COST_ITC_BASIS;
+  return (b > 0) ? b : (+window._COST_TOTAL || 0);
+}
+window.omegaItcBasis = omegaItcBasis;
+
+/* Patch 112: storage kWh/kW for per-kWh incentives and revenue. Read the
+   itemised list, then the drawing. The old `|| 760` invented 760 kWh (and
+   `|| 380` invented 380 kW) whenever the list was empty -- so a placed
+   fleet of 6,666 kWh earned a ComEd rebate on 760, and an empty drawing
+   earned one on 760 too. No storage, no rebate. */
+function omegaIncentiveKwh(){
+  var k = 0;
+  try{ k = S.bessList.reduce((s,b)=>(s+(+(b.kwh||0))*(+(b.qty||1))),0); }catch(e){}
+  if(!(k > 0)){ try{ k = +omegaBessKwh() || 0; }catch(e){} }
+  return k;
+}
+function omegaIncentiveKw(){
+  var k = 0;
+  try{ k = S.bessList.reduce((s,b)=>(s+(+(b.kw||0))*(+(b.qty||1))),0); }catch(e){}
+  if(!(k > 0)){ try{ k = +omegaBessKw() || 0; }catch(e){} }
+  return k;
+}
+window.omegaIncentiveKwh = omegaIncentiveKwh;
+window.omegaIncentiveKw = omegaIncentiveKw;
+
 function updateIncentiveSummary() {
   if(!_incentives) return;
-  const kwh = S.bessList.reduce((s,b)=>(s+(+(b.kwh||0))*(+(b.qty||1))),0)||760;
+  const kwh = omegaIncentiveKwh();
   const gross = window._COST_TOTAL||0;
   let incTotal = 0;
   (_incentives||[]).forEach(inc => {
     if(!inc.enabled) return;
-    if(inc.type==='pct-project') incTotal += gross * inc.rate/100;
+    if(inc.type==='pct-project') incTotal += omegaItcBasis() * inc.rate/100;
     else if(inc.type==='per-kwh') incTotal += kwh * inc.rate;
     else incTotal += inc.customValue||0;
   });
@@ -27345,8 +27507,8 @@ function renderRevenuePanel() {
       if (m) vsZip.value = m[1];
     }
   }
-  const kwh = S.bessList.reduce((s,b)=>(s+(+(b.kwh||0))*(+(b.qty||1))),0)||760;
-  const kw  = S.bessList.reduce((s,b)=>(s+(+(b.kw||0))*(+(b.qty||1))),0)||380;
+  const kwh = omegaIncentiveKwh();
+  const kw  = omegaIncentiveKw();
   el.innerHTML = _revStreams.map((r,i) => {
     var certBadge = '';
     if (r.annualValue > 0) {
@@ -34036,13 +34198,27 @@ function buildBOM() {
   }catch(e){}
 
   if(_cs.pods){
+    var _podBasis = '';
+    try{
+      var _pc = (window.OmegaComputeCost && OmegaComputeCost.figures()) || null;
+      if(_pc && _pc.projectCapex > 0){
+        var _pp = _pc.projectCapex / _pc.pods;
+        _podBasis = ' \u2014 $' + Math.round(_pp/1e6*10)/10 + 'M each'
+          + (_pc.isBenchmark ? ' (operator benchmark, all-in, replace with quote)' : (_pc.excludeIt ? ' (enclosure only, entered)' : ' (entered, all-in)'));
+      } else { _podBasis = ' \u2014 unpriced'; }
+    }catch(e){}
     addItem('Compute', 'Modular compute pod', Math.round(_cs.podKw/_cs.pods)+' kW IT each',
-            _cs.pods, 'ea', 'Load, not generation \u2014 '+Math.round(_cs.podKw).toLocaleString()+' kW IT total');
+            _cs.pods, 'ea', 'Load, not generation \u2014 '+Math.round(_cs.podKw).toLocaleString()+' kW IT total'+_podBasis);
     addItem('Compute', 'Pod foundation / pad + anchoring', '', _cs.pods, 'ea', 'Per pod, on compacted base');
   }
   if(_cs.gen){
+    var _genBasis = '';
+    try{
+      var _gb = (typeof omegaGenBenchCost==='function') ? omegaGenBenchCost() : null;
+      if(_gb && _gb.total > 0 && _gb.kw > 0) _genBasis = ' \u2014 $' + Math.round(_gb.total/_gb.kw).toLocaleString() + '/kW installed (EIA class benchmark, BoP excluded)';
+    }catch(e){}
     addItem('Generation', (_cs.genModel||'Prime mover'), Math.round(_cs.genKw/_cs.gen)+' kW each',
-            _cs.gen, 'ea', Math.round(_cs.genKw).toLocaleString()+' kW total \u2014 confirm gas supply');
+            _cs.gen, 'ea', Math.round(_cs.genKw).toLocaleString()+' kW total \u2014 confirm gas supply'+_genBasis);
     addItem('Generation', 'Generator pad + gas train + exhaust', '', _cs.gen, 'ea',
             'Per unit; fuel piping by others until the gas letter is in hand');
   }
@@ -34521,9 +34697,9 @@ function exportSpecSheet() {
 
   // Incentives rows
   const incRows = (_incentives||[]).filter(i=>i.enabled).map(i=>{
-    const kwh = kwh_total||760;
+    const kwh = kwh_total || omegaIncentiveKwh();
     let val = 0;
-    if(i.type==='pct-project') val = grossCost*i.rate/100;
+    if(i.type==='pct-project') val = omegaItcBasis()*i.rate/100;
     else if(i.type==='per-kwh') val = kwh*i.rate;
     else val = i.customValue||0;
     return `<tr><td>${i.name}</td><td>${i.tag.toUpperCase()}</td><td>${i.notes||i.desc||'--'}</td><td style="color:#22c55e;font-weight:700">${fmt(val)}</td></tr>`;
@@ -40954,11 +41130,22 @@ async function generateBlueprint() {
 
     if(typeof html2canvas !== 'undefined') {
       const cvs = await _captureCanvasWithSVG(sc, {
-        useCORS: true, allowTaint: true, scale: 1.5,
+        useCORS: true, allowTaint: true, scale: 3,
         backgroundColor: '#0A1628', logging: false,
         width: sc.offsetWidth, height: sc.offsetHeight
       });
-      canvasImg = cvs.toDataURL('image/jpeg', 0.85);
+      /* Patch 113: the sheet gets the capture LOSSLESS. JPEG at 0.85 put
+         ringing on every symbol edge and dimension line; on a technical
+         drawing that reads as blur. The AI gets a separate small copy --
+         it needs to see the layout, not 15 MB of pixels. */
+      canvasImg = cvs.toDataURL('image/png');
+      try {
+        var _aw = Math.min(1600, cvs.width), _ah = Math.round(cvs.height * _aw / cvs.width);
+        var _ac = document.createElement('canvas'); _ac.width = _aw; _ac.height = _ah;
+        _ac.getContext('2d').drawImage(cvs, 0, 0, _aw, _ah);
+        window._bpAiImg = _ac.toDataURL('image/jpeg', 0.85);
+      } catch (e) { window._bpAiImg = null; }
+      window._bpCapturePx = cvs.width + 'x' + cvs.height;
     }
 
     // 2. Get AI description if enabled
@@ -40970,7 +41157,7 @@ async function generateBlueprint() {
       btn.textContent = '  Analyzing with AI...';
       status.textContent = 'AI is analyzing your site map...';
       try {
-        const base64Data = canvasImg.split(',')[1];
+        const base64Data = (window._bpAiImg || canvasImg).split(',')[1];
         const bessInfo = S.bessList.map(b =>
           `${b.name}: ${b.kwh}kWh / ${b.kw}kW ${b.chem||'LFP'} -- ${b.mfr||''} ${b.model||''}`
         ).join('; ');
@@ -41308,7 +41495,7 @@ Respond with ONLY the JSON, no other text.`
 
     <!-- Main map area -->
     <div class="map-panel">
-      ${canvasImg ? `<img src="${canvasImg}" style="width:100%;height:100%;object-fit:contain;display:block;${isBlueprint?'filter:brightness(0.9) contrast(1.1)':''}" alt="Site Map">` :
+      ${canvasImg ? `<img src="${canvasImg}" style="width:100%;height:100%;object-fit:contain;display:block;image-rendering:auto;${isBlueprint?'filter:brightness(0.9) contrast(1.1)':''}" alt="Site Map">` :
         `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:${dim};font-size:14px;font-family:Arial">Site map capture unavailable</div>`}
       <!-- Scale bar overlay -->
       <div style="position:absolute;bottom:10px;left:10px">${scaleBar}</div>
@@ -41441,14 +41628,17 @@ async function _bpDeliverPDF(html, project){
         setTimeout(finish, 6000);            /* never hang on a stalled image */
       });
 
+      /* Patch 113: 1632 px x 2 = 192 dpi on a 17 in sheet, and the map
+         panel inside it was being resampled a second time. 3.2x is 300
+         dpi, which is what a print shop and an AHJ plan reviewer expect. */
       const cvs = await html2canvas(doc.body, {
-        useCORS:true, allowTaint:true, scale:2, logging:false,
+        useCORS:true, allowTaint:true, scale:3.2, logging:false,
         backgroundColor:null, width:W, height:H, windowWidth:W, windowHeight:H
       });
 
       const { jsPDF } = window.jspdf;
       const pdf = new jsPDF({ orientation:'landscape', unit:'in', format:[17,11] });
-      pdf.addImage(cvs.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, 17, 11, undefined, 'FAST');
+      pdf.addImage(cvs.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, 17, 11, undefined, 'FAST');
       pdf.save(name + '.pdf');
       return true;
     }catch(e){
@@ -45679,6 +45869,10 @@ function openLaborProposal() {
     +'<h1>'+brandName()+' &#8212; BESS Labor Proposal</h1><div class="meta">Site: <strong>'+addr+'</strong> &nbsp;|&nbsp; Date: '+date+'</div>'
     +'<div class="badge">$'+costPerKW.toLocaleString()+'/kW Installed &nbsp;&middot;&nbsp; '+totalKW+' kW &nbsp;&middot;&nbsp; '+totalKWh+' kWh</div>'
     +'<h2>Project Cost Summary</h2><table><tr><th>Category</th><th style="text-align:right">Amount</th></tr>'
+    +((window._COMPUTE_TOTAL>0)?'<tr><td>Compute Pods &times;'+(window._COMPUTE_PODS||0)+(window._COMPUTE_IS_BENCHMARK?' (benchmark, all-in)':'')+'</td><td style="text-align:right">'+fmt(window._COMPUTE_TOTAL)+'</td></tr>':'')
+    +((window._GEN_TOTAL>0)?'<tr><td>On-site Generation (benchmark)</td><td style="text-align:right">'+fmt(window._GEN_TOTAL)+'</td></tr>':'')
+    +((window._DC_TOTAL>0)?'<tr><td>Data-centre Electrical (ROM)</td><td style="text-align:right">'+fmt(window._DC_TOTAL)+'</td></tr>':'')
+    +((window._SOLAR_TOTAL>0)?'<tr><td>Solar PV</td><td style="text-align:right">'+fmt(window._SOLAR_TOTAL)+'</td></tr>':'')
     +'<tr><td>BESS Equipment &amp; Installation</td><td style="text-align:right">'+fmt(bessTotal)+'</td></tr>'
     +'<tr><td>Site Equipment (pad, disconnect, switchgear)</td><td style="text-align:right">'+fmt(siteEqTotal)+'</td></tr>'
     +'<tr><td>Conduit &amp; Wiring ('+( dcFt+acFt+bmsFt)+' LF total)</td><td style="text-align:right">'+fmt(condTotal)+'</td></tr>'
@@ -54994,6 +55188,23 @@ var OMEGA_BENCH = {
   pvUtility:     1.15,   // $/Wdc
   bessKwh:        241,   // $/kWh (energy component)
   bessKw:         379,   // $/kW  (power component)
+  /* Patch 112: a populated 1 MW AI compute pod, ALL-IN -- enclosure, cooling,
+     busway, accelerators, servers, network. Operator figure, Sep 2026:
+     about $30M per pod, plus or minus $10M. Scaled by each pod's IT kW so a
+     500 kW module prices at half. Entered per-pod prices in Compute Cost
+     override this; until then the estimate carries the band, and says so. */
+  podAllInPerKw:   30000,   // $/kW IT  = $30M per 1 MW pod
+  podAllInLoPerKw: 20000,
+  podAllInHiPerKw: 40000,
+  podSource: 'Operator figure, Sep 2026: $30M +/- $10M per populated 1 MW pod',
+  /* Patch 112: installed $/kW of on-site generation by prime-mover class.
+     Anchored on the EIA AEO2025 overnight capital cost table (2024$),
+     rounded to the nearest hundred. Turbine figures are the generator
+     package plus normal install; inlet, exhaust, SCR and gas compression
+     are balance of plant and are NOT in them. Wind is land-based. */
+  genPerKw: { sofc:6500, gen_ng:1200, recip:2000, recip_l:1800,
+              turbine:1500, turbine_l:1000, wind:1900, other:1500 },
+  genSource: 'EIA AEO2025 capital cost assumptions, rounded; BoP excluded',
   source: 'NREL/DOE SETO PV benchmark (2024) . NREL utility-scale storage 2025 update'
 };
 window.OMEGA_BENCH = OMEGA_BENCH;
@@ -55028,6 +55239,61 @@ function omegaBessBenchCost(){
   return kwh*rE + kw*rP;
 }
 window.omegaBessBenchCost = omegaBessBenchCost;
+
+/* Patch 112: which benchmark a placed prime mover falls under. The shape
+   carries altId when it came from the picker; a hand-placed or custom unit
+   only has a model string, so the string is read as a last resort. */
+function omegaGenClass(sh){
+  var id = String((sh && (sh.altId || sh.genId)) || '').toLowerCase();
+  var B = (window.OMEGA_BENCH && OMEGA_BENCH.genPerKw) || {};
+  if(sh && sh.kind==='derwind') return 'wind';
+  if(B[id] != null) return id;
+  var m = String((sh && (sh.model || sh.label)) || '').toLowerCase();
+  if(/fuel\s*cell|sofc|bloom/.test(m)) return 'sofc';
+  if(/wind/.test(m)) return 'wind';
+  if(/large gas turbine|frame/.test(m)) return 'turbine_l';
+  if(/turbine|aero/.test(m)) return 'turbine';
+  if(/large recip/.test(m)) return 'recip_l';
+  if(/recip|engine/.test(m)) return 'recip';
+  if(/genset|generator/.test(m)) return 'gen_ng';
+  var kw = +(sh && sh.kw) || 0;
+  if(kw >= 40000) return 'turbine_l';
+  if(kw >= 15000) return 'turbine';
+  if(kw >= 5000)  return 'recip_l';
+  if(kw >= 1000)  return 'recip';
+  return 'other';
+}
+window.omegaGenClass = omegaGenClass;
+
+/* Patch 112: benchmark cost of the generation actually on the drawing.
+   A 90 MW turbine plant priced at $0 before this because nothing read the
+   deralt shapes; it was the second-largest silent zero after the pods.
+   Per-class $/kW can be overridden per project in S.costOverrides.genPerKw. */
+function omegaGenBenchCost(){
+  var out = { total:0, kw:0, units:0, lines:[], gasKw:0, gasTotal:0, isBenchmark:true,
+              source:(window.OMEGA_BENCH && OMEGA_BENCH.genSource) || '' };
+  try{
+    var B = (window.OMEGA_BENCH && OMEGA_BENCH.genPerKw) || {};
+    var O = (S.costOverrides && S.costOverrides.genPerKw) || {};
+    var by = {};
+    (S.shapes||[]).forEach(function(sh){
+      if(!sh || (sh.kind!=='deralt' && sh.kind!=='derwind')) return;
+      var cls = omegaGenClass(sh), kw = +sh.kw || 0;
+      var rate = (+O[cls] > 0) ? +O[cls] : (+B[cls] > 0 ? +B[cls] : +B.other || 0);
+      var key = cls + '|' + (sh.model || sh.label || cls);
+      if(!by[key]) by[key] = { cls:cls, model:(sh.model || sh.label || cls), units:0, kw:0, rate:rate, cost:0,
+                              overridden: (+O[cls] > 0), fuel:(sh.fuel || (cls==='wind' ? 'wind' : 'natural gas')) };
+      by[key].units++; by[key].kw += kw; by[key].cost += kw * rate;
+    });
+    Object.keys(by).forEach(function(k){
+      var l = by[k]; out.lines.push(l);
+      out.total += l.cost; out.kw += l.kw; out.units += l.units;
+      if(l.cls !== 'wind' && l.cls !== 'sofc'){ out.gasKw += l.kw; out.gasTotal += l.cost; }
+    });
+  }catch(e){}
+  return out;
+}
+window.omegaGenBenchCost = omegaGenBenchCost;
 
 /* ═══════════════════════════════════════════════════════════════════
  *  BNZ  --  BUILDING & NET-ZERO MODULE   (Phase 0 + Phase 1)
@@ -76759,6 +77025,127 @@ if (_omPrevOmegaSite) { Object.keys(_omPrevOmegaSite).forEach(function (k) {
     };
   }
 
+  /* ── PATH 0 ── STATIC MAPS MOSAIC AT EXPORT RESOLUTION (Patch 113) ────
+     PATH 1 below shrinks the whole viewport into ONE <=640 px request,
+     dropping the zoom to make it fit. A 1,440 px canvas became a 360 px
+     request at zoom-2, and scale=2 handed back 720 px to stretch across
+     the drawing. Then the blueprint captured that at 1.5x, JPEG'd it,
+     and printed it 17 inches wide. That is the blur, and the "mushed
+     together" equipment is the same 720 px of ground doing the work of
+     five thousand.
+
+     This fetches the SAME extent as a grid of tiles at a HIGHER zoom --
+     exactly the ground the viewport shows, read from the live map's
+     bounds so a fractional zoom cannot misalign it -- and stitches them.
+     A 1,440 x 800 viewport comes back as ~5,800 x 3,200 px. Budget is
+     capped at 16 Static Maps calls per export; if imagery is missing at
+     the chosen zoom the whole grid is retried one level up. Anything
+     that fails falls through to the old single-image path unchanged. */
+  var MOSAIC_MAX_CALLS = 16, MOSAIC_MAX_PX = 6400;
+  function _wpx(lat, lng, z) {                       /* world pixel at zoom z */
+    var s = 256 * Math.pow(2, z);
+    var x = (lng + 180) / 360 * s;
+    var sy = Math.sin(lat * Math.PI / 180); sy = Math.min(Math.max(sy, -0.9999), 0.9999);
+    var y = (0.5 - Math.log((1 + sy) / (1 - sy)) / (4 * Math.PI)) * s;
+    return { x: x, y: y };
+  }
+  function _wll(x, y, z) {                           /* world pixel -> lat/lng */
+    var s = 256 * Math.pow(2, z);
+    var lng = x / s * 360 - 180;
+    var n = Math.PI - 2 * Math.PI * y / s;
+    var lat = 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+    return { lat: lat, lng: lng };
+  }
+  function mosaicRequest(vp) {
+    var m = MAP(), key = KEY();
+    if (!m || !m.getCenter) return { err: 'no live map' };
+    if (!key) return { err: 'no Google Maps key' };
+    var c = m.getCenter(), z = m.getZoom();
+    if (!c || z == null) return { err: 'map has no centre/zoom yet' };
+    var lat = c.lat(), lng = c.lng();
+    /* Extent from the live bounds when available: exact under fractional zoom. */
+    var ne = null, sw = null;
+    try { var b = m.getBounds(); if (b) { ne = b.getNorthEast(); sw = b.getSouthWest(); } } catch (e) {}
+    var zt, tl, W, H;
+    var target = Math.min(MOSAIC_MAX_PX / 2, vp.w * 2);    /* ground px wanted across (x2 by scale) */
+    if (ne && sw) {
+      var span = Math.abs(ne.lng() - sw.lng()); if (span <= 0) return { err: 'zero-width bounds' };
+      zt = Math.ceil(Math.log(target * 360 / (span * 256)) / Math.LN2);
+    } else {
+      zt = Math.ceil(z + Math.log(target / vp.w) / Math.LN2);
+    }
+    zt = Math.max(1, Math.min(20, zt));
+    var plan = function (zz) {
+      var a, bb;
+      if (ne && sw) { a = _wpx(ne.lat(), sw.lng(), zz); bb = _wpx(sw.lat(), ne.lng(), zz); }
+      else {
+        var cc = _wpx(lat, lng, zz), f = Math.pow(2, zz - z);
+        a = { x: cc.x - vp.w * f / 2, y: cc.y - vp.h * f / 2 };
+        bb = { x: cc.x + vp.w * f / 2, y: cc.y + vp.h * f / 2 };
+      }
+      var w = bb.x - a.x, h = bb.y - a.y;
+      return { z: zz, tl: a, W: w, H: h, cols: Math.ceil(w / MAXSIDE), rows: Math.ceil(h / MAXSIDE) };
+    };
+    var p = plan(zt);
+    while (zt > 1 && (p.cols * p.rows > MOSAIC_MAX_CALLS || p.W * 2 > MOSAIC_MAX_PX)) { zt--; p = plan(zt); }
+    if (p.W < 8 || p.H < 8) return { err: 'extent too small' };
+    return { plan: p, key: key, planAt: plan };
+  }
+  async function viaStaticMosaic() {
+    var vp = viewport();
+    var req = mosaicRequest(vp);
+    if (req.err) { log(TAG, 'mosaic skipped —', req.err); return null; }
+    var p = req.plan, tries = 0;
+    while (p && tries++ < 2) {
+      var out = await fetchMosaic(p, req.key);
+      if (out) return out;
+      if (p.z <= 1) break;
+      p = req.planAt(p.z - 1);                           /* no imagery this deep: one level up */
+    }
+    return null;
+  }
+  async function fetchMosaic(p, key) {
+    var T = MAXSIDE, S2 = 2;
+    var cv = document.createElement('canvas');
+    cv.width = Math.round(p.W * S2); cv.height = Math.round(p.H * S2);
+    var g = cv.getContext('2d');
+    g.fillStyle = '#0b1626'; g.fillRect(0, 0, cv.width, cv.height);
+    var jobs = [];
+    for (var r = 0; r < p.rows; r++) for (var c = 0; c < p.cols; c++) {
+      var cx = p.tl.x + (c + 0.5) * T, cy = p.tl.y + (r + 0.5) * T;
+      var ll = _wll(cx, cy, p.z);
+      jobs.push({ r: r, c: c, url: 'https://maps.googleapis.com/maps/api/staticmap?center='
+        + ll.lat.toFixed(7) + ',' + ll.lng.toFixed(7) + '&zoom=' + p.z + '&size=' + T + 'x' + T
+        + '&scale=' + S2 + '&maptype=satellite&format=jpg&key=' + key });
+    }
+    var CONC = 4, failed = 0;
+    for (var i = 0; i < jobs.length; i += CONC) {
+      var batch = jobs.slice(i, i + CONC);
+      var res = await Promise.all(batch.map(async function (j) {
+        try {
+          var rr = await fetch(j.url);
+          if (!rr.ok) return null;
+          var b = await rr.blob();
+          if (b.size < 2000 || !/^image\//.test(b.type || '')) return null;
+          var bmp = await createImageBitmap(b);
+          return { j: j, bmp: bmp };
+        } catch (e) { return null; }
+      }));
+      for (var k = 0; k < res.length; k++) {
+        if (!res[k]) { failed++; continue; }
+        g.drawImage(res[k].bmp, res[k].j.c * T * S2, res[k].j.r * T * S2, T * S2, T * S2);
+        try { res[k].bmp.close(); } catch (e) {}
+      }
+      if (failed) break;
+    }
+    if (failed) { warn(TAG, 'mosaic at z' + p.z + ': ' + failed + ' tile(s) missing'); return null; }
+    if (looksBlank(cv)) return null;
+    var d = cv.toDataURL('image/jpeg', 0.93);
+    log(TAG, 'mosaic ' + p.cols + 'x' + p.rows + ' tiles at z' + p.z + ' -> ' + cv.width + 'x' + cv.height + ' px');
+    window._exportMapInfo = { path: 'static-mosaic', zoom: p.z, cols: p.cols, rows: p.rows, px: cv.width + 'x' + cv.height };
+    return d;
+  }
+
   async function viaStaticMaps() {
     var req = staticRequest();
     if (req.err) { log(TAG, 'Static Maps skipped —', req.err); return null; }
@@ -77012,7 +77399,8 @@ if (_omPrevOmegaSite) { Object.keys(_omPrevOmegaSite).forEach(function (k) {
     if (!force && cache.url && Date.now() - cache.at < 2500) return cache.url;
     var url = null, path = null;
 
-    try { url = await viaStaticMaps(); if (url) path = 'static-maps'; } catch (e) {}
+    try { url = await viaStaticMosaic(); if (url) path = 'static-mosaic'; } catch (e) {}
+    if (!url) { try { url = await viaStaticMaps(); if (url) path = 'static-maps'; } catch (e) {} }
     if (!url) { try { url = await viaTiles(); if (url) path = 'tile-composite'; } catch (e) {} }
     if (!url) { try { url = viaCanvasReadback(); if (url) path = 'canvas-readback'; } catch (e) {} }
 
@@ -153276,7 +153664,13 @@ if (root.console && console.info) {
     var ov = document.getElementById('report-overlay');
     if (!ov) { if (root.console) console.warn(TAG + ' no report overlay'); return false; }
     if (typeof openReport === 'function') { try { openReport('location'); } catch (e) {} }
-    ov.style.display = 'flex';
+    /* Patch 115: openReport shows the overlay as display:block, which is
+       what lets a tall report scroll. This set it to flex, which turned
+       the card into a flex item stretched to the viewport and its
+       overflow:hidden clipped everything below the fold -- the screen
+       ended at "Estimated fibre RTT" and would not scroll. */
+    ov.style.display = 'block';
+    ov.scrollTop = 0;
     var body = document.getElementById('report-body');
     if (body) body.innerHTML = html();
     var tabs = document.querySelectorAll('.report-tab');
@@ -153541,6 +153935,16 @@ if (root.console && console.info) {
      whenever the parcel is not a rectangle, so it is the wrong number to
      print next to the word "buildable". */
   function buildableAcres() {
+    /* Patch 110: the measured figure wins. OmegaBuildable rasterises the
+       parcel and takes out exclusions AND the perimeter setback, which is
+       why it reads 38 ac where this said 63 — the two were answering
+       different questions on the same sheet. */
+    try {
+      if (root.OmegaBuildable && root.OmegaBuildable.measure) {
+        var m = root.OmegaBuildable.measure();
+        if (m && m.ok && m.buildableAc > 0) return m.buildableAc;
+      }
+    } catch (e) {}
     /* Patch 23 owns this once roles exist: it reads the tagged parcel and
        tagged exclusions, so it is correct before Auto-Layout has ever been
        opened. _alBoundary is only populated when that dialog runs. */
@@ -153562,6 +153966,15 @@ if (root.console && console.info) {
   }
 
   function storage() {
+    /* Patch 110: the config list is empty on a campus project, where the
+       containers are drawn instead. Ask the collector that reads the
+       drawing first, so this report cannot disagree with the legend. */
+    try {
+      if (typeof omegaBessFleet === 'function') {
+        var f = omegaBessFleet();
+        if (f && (f.kw > 0 || f.kwh > 0)) return { kw: f.kw, kwh: f.kwh };
+      }
+    } catch (e) {}
     var list = (typeof S !== 'undefined' && S.bessList) ? S.bessList : [];
     var kw = 0, kwh = 0;
     for (var i = 0; i < list.length; i++) {
@@ -153570,6 +153983,34 @@ if (root.console && console.info) {
       kwh += (+(list[i].kwh || 0)) * q;
     }
     return { kw: kw, kwh: kwh };
+  }
+
+  /* Everything the campus placed, so the report describes the project
+     rather than the PV field inside it. */
+  function campus() {
+    var c = { pods: 0, podKw: 0, gen: 0, genKw: 0, genModel: '', fences: 0, roadFt: 0, mvFt: 0 };
+    try {
+      var P = (typeof S !== 'undefined' && S.pxPerFt > 0) ? S.pxPerFt : 0;
+      (S.shapes || []).forEach(function (sh) {
+        if (!sh) return;
+        if (sh.omegaRoad && sh.pts && sh.pts.length > 1 && P) {
+          for (var i = 1; i < sh.pts.length; i++) {
+            c.roadFt += Math.hypot(sh.pts[i].x - sh.pts[i - 1].x, sh.pts[i].y - sh.pts[i - 1].y) / P;
+          }
+          return;
+        }
+        if (sh.omegaFence || sh.omegaCampus) {
+          if (sh.kind === 'rect' && sh.campusLabel) c.fences++;
+          return;
+        }
+        if (sh.kind === 'derdc') { c.pods++; c.podKw += +sh.kw || 0; }
+        else if (sh.kind === 'deralt') { c.gen++; c.genKw += +sh.kw || 0; c.genModel = sh.model || c.genModel; }
+      });
+      (S.conduits || []).forEach(function (x) {
+        if (x && (x.omegaCampus || x.omegaFence)) c.mvFt += +x.ftLen || 0;
+      });
+    } catch (e) {}
+    return c;
   }
 
   function facts() {
@@ -153612,6 +154053,7 @@ if (root.console && console.info) {
       layout: L,
       buildableAc: buildableAcres(),
       storage: st,
+      campus: campus(),
       cost: cost
     };
   }
@@ -153712,8 +154154,18 @@ if (root.console && console.info) {
       }
     }
     if (st.kw > 0 || st.kwh > 0) {
-      body += row('Storage attachment', n0(st.kw) + ' kW / ' + n0(st.kwh) + ' kWh');
+      body += row('Storage', n0(st.kw) + ' kW / ' + n0(st.kwh) + ' kWh');
     }
+    /* Patch 110: this section described the PV field and nothing else, on
+       a project whose compute and generation are an order of magnitude
+       larger than it. */
+    var K = F.campus || {};
+    if (K.pods) body += row('Compute', K.pods + ' pods \u00b7 ' + n0(K.podKw) + ' kW IT');
+    if (K.gen) body += row('On-site generation',
+      K.gen + ' \u00d7 ' + esc(K.genModel || 'unit') + ' \u00b7 ' + n0(K.genKw) + ' kW');
+    if (K.fences) body += row('Fenced compounds', String(K.fences));
+    if (K.mvFt) body += row('MV duct bank', n0(K.mvFt) + ' ft');
+    if (K.roadFt) body += row('Access road', n0(K.roadFt) + ' ft');
     if (!L && st.kwh === 0 && F.buildableAc == null) {
       body += '<div style="font-size:12.5px;color:var(--sub);padding:8px 2px">'
         + 'Nothing laid out yet \u2014 trace a boundary and run Auto-Layout.</div>';
@@ -153723,6 +154175,83 @@ if (root.console && console.info) {
 
   function costBlock(F) {
     var c = F.cost;
+    /* PATCH 110: TWO COST MODELS, ONE SHEET.
+
+       This block priced PV at a unit rate and stopped: $8.3M on a
+       project whose own cost panel says $56.7M, because the compute
+       electrical, the enclosures, the generation and the site works are
+       not PV and were never in this arithmetic. A report that
+       contradicts the estimate it sits next to is worse than no report.
+
+       When the cost engine has run, its total is the number, broken out
+       by the same lines the panel shows. The PV unit-rate build-up stays
+       only for a project that has never been costed. */
+    var eng = null;
+    try {
+      if (typeof updateCostEst === 'function') updateCostEst();
+      if ((root._COST_TOTAL || 0) > 0) {
+        eng = {
+          total: +root._COST_TOTAL || 0,
+          bess: +root._BESS_TOTAL || 0,
+          solar: +root._SOLAR_TOTAL || 0,
+          compute: +root._COMPUTE_TOTAL || 0,
+          computeBench: !!root._COMPUTE_IS_BENCHMARK,
+          computeExclIt: !!(root._COMPUTE_DETAIL && root._COMPUTE_DETAIL.excludeIt),
+          gen: +root._GEN_TOTAL || 0,
+          ev: +root._EV_TOTAL || 0,
+          bnz: +root._BNZ_TOTAL || 0,
+          low: +root._COST_LOW || 0,
+          high: +root._COST_HIGH || 0,
+          dc: +root._DC_TOTAL || 0,
+          siteEq: +root._SITE_EQ_TOTAL || 0,
+          conduit: +root._CONDUIT_TOTAL || 0,
+          indirect: +root._INDIRECT_TOTAL || 0,
+          cont: +root._CONT_TOTAL || 0,
+          contPct: +root._CONT_PCT || 10,
+          contracted: !!root._COST_IS_CONTRACTED
+        };
+      }
+    } catch (e) {}
+    if (eng) {
+      var b = '';
+      if (eng.compute > 0) b += row('Compute pods' + (eng.computeExclIt ? ' (enclosures only)' : ', all-in')
+        + (eng.computeBench ? ' \u2014 benchmark' : ''), money(eng.compute));
+      if (eng.gen > 0) b += row('On-site generation \u2014 benchmark', money(eng.gen));
+      if (eng.dc > 0) b += row('Data-centre electrical', money(eng.dc));
+      if (eng.solar > 0) b += row('Solar PV', money(eng.solar));
+      if (eng.bess > 0) b += row('Storage', money(eng.bess));
+      if (eng.ev > 0) b += row('EV charging', money(eng.ev));
+      if (eng.bnz > 0) b += row('Building envelope', money(eng.bnz));
+      if (eng.siteEq > 0) b += row('Site equipment', money(eng.siteEq));
+      if (eng.indirect > 0) b += row('Engineering &amp; permitting', money(eng.indirect));
+      if (eng.cont > 0) b += row('Contingency (' + eng.contPct + '%)', money(eng.cont));
+      b += '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:18px;'
+        + 'padding:16px 2px;border-top:2px solid var(--border);margin-top:2px">'
+        + '<span style="font-size:14px;font-weight:700;color:var(--text)">Total installed</span>'
+        + '<span style="font-size:16px;font-weight:800;color:var(--text);'
+        + 'font-family:\'IBM Plex Mono\',monospace">' + money(eng.total) + '</span></div>';
+      var K2 = F.campus || {};
+      var mw = ((K2.podKw || 0) + (F.storage ? F.storage.kw : 0)) / 1000;
+      if (mw > 0) b += row('$/kW of load and storage', '$' + n0(eng.total / (mw * 1000)));
+      b += '<div style="font-size:10px;color:var(--sub);margin-top:12px;line-height:1.6">'
+        + (eng.contracted
+            ? 'Built from the contracted total entered in the cost panel.'
+            : 'From the project cost estimate \u2014 the same build-up the Cost Estimate panel '
+              + 'shows, not a second model. Unit rates and benchmarks, not quotes. '
+              + (eng.computeExclIt
+                  ? 'Accelerator hardware is excluded by choice in Compute Cost: different owner, different life.'
+                  : (eng.computeBench
+                      ? 'Compute pods carry the operator benchmark of $30M \u00b1 $10M per MW, all-in'
+                        + (eng.high > eng.low ? ' \u2014 range ' + money(eng.low) + ' to ' + money(eng.high) : '')
+                        + '. Enter a quote in Compute Cost to replace it.'
+                      : 'Compute pods are at the prices entered in Compute Cost, all-in.')))
+        + '</div>';
+      if (eng.conduit > 0) {
+        b += '<div style="font-size:10px;color:var(--sub);margin-top:6px">Conduit and wiring '
+          + 'materials of ' + money(eng.conduit) + ' are inside the installation lines, not added again.</div>';
+      }
+      return sectionHead('Cost') + b;
+    }
     if (!c) return '';
     var body = '';
     if (c.pv > 0) body += row('Modules, racking, inverters', money(c.pv));
@@ -158845,14 +159374,26 @@ if (root.console && console.info) {
   var LS = 'omega.computecost';
 
   function cfg() {
-    var c = { shellPerPod: null, itPerPod: null, podKw: 1000, note: '', at: null };
+    var c = { shellPerPod: null, itPerPod: null, podKw: 1000, note: '', at: null, excludeIt: false };
+    /* Patch 112: PROJECT DATA. This lived in localStorage, which is
+       per-browser: the same project priced its pods differently on two
+       machines and the proposal could not be trusted. It now lives on S and
+       saves with the project; the old key is read once as a migration. */
     try {
-      var s = JSON.parse(localStorage.getItem(LS) || 'null');
+      var S = root.S, s = S && S.computeCost;
+      if (!s) {
+        var ls = JSON.parse(localStorage.getItem(LS) || 'null');
+        if (ls && (ls.shellPerPod > 0 || ls.itPerPod > 0)) { s = ls; if (S) S.computeCost = ls; }
+      }
       if (s) for (var k in s) if (k in c) c[k] = s[k];
     } catch (e) {}
     return c;
   }
-  function save(c) { try { localStorage.setItem(LS, JSON.stringify(c)); } catch (e) {} }
+  function save(c) {
+    try { if (root.S) { root.S.computeCost = JSON.parse(JSON.stringify(c)); root._workDirty = true; } } catch (e) {}
+    try { localStorage.setItem(LS, JSON.stringify(c)); } catch (e) {}
+    try { if (typeof root._debounceCost === 'function') root._debounceCost(); } catch (e) {}
+  }
 
   function money(v) {
     if (!(v > 0)) return '\u2014';
@@ -158879,13 +159420,40 @@ if (root.console && console.info) {
     var shell = c.shellPerPod > 0 ? c.shellPerPod * p.n : 0;
     var it = c.itPerPod > 0 ? c.itPerPod * p.n : 0;
     var mw = p.kw / 1000;
+    /* Patch 112: nothing entered no longer means $0. The pods are the
+       budget of the site, and a total that leaves them out is not a
+       conservative number, it is a wrong one. Until a quote is entered the
+       estimate carries the operator benchmark ($30M +/- $10M per 1 MW pod,
+       scaled by IT kW) and every place it prints says it is a benchmark. */
+    var B = root.OMEGA_BENCH || {};
+    var midR = +B.podAllInPerKw || 30000, loR = +B.podAllInLoPerKw || 20000, hiR = +B.podAllInHiPerKw || 40000;
+    var entered = (c.shellPerPod > 0) || (c.itPerPod > 0);
+    var benchMid = p.kw * midR, benchLo = p.kw * loR, benchHi = p.kw * hiR;
+    var allIn = entered ? (shell + it) : benchMid;
+    var allInLo = entered ? allIn : benchLo, allInHi = entered ? allIn : benchHi;
+    /* What the project total carries. Accelerators can be kept out of the
+       site pro-forma on purpose (different owner, different life) -- but
+       that needs an enclosure price to be entered, or the line is $0 and
+       the panel says so. */
+    var projectCapex, projectLo, projectHi;
+    if (c.excludeIt) { projectCapex = shell; projectLo = shell; projectHi = shell; }
+    else { projectCapex = allIn; projectLo = allInLo; projectHi = allInHi; }
     return {
       pods: p.n, mw: mw, cfg: c,
       shellTotal: shell, itTotal: it,
       shellPerMw: mw > 0 && shell > 0 ? shell / mw : 0,
       itPerMw: mw > 0 && it > 0 ? it / mw : 0,
-      siteCapex: shell,                 /* what belongs in a site pro-forma */
-      allIn: shell + it
+      entered: entered,
+      isBenchmark: !entered && p.n > 0 && !c.excludeIt,
+      benchPerPod: p.n > 0 ? benchMid / p.n : midR * 1000,
+      benchLoPerPod: p.n > 0 ? benchLo / p.n : loR * 1000,
+      benchHiPerPod: p.n > 0 ? benchHi / p.n : hiR * 1000,
+      benchSource: B.podSource || '',
+      allIn: allIn, allInLo: allInLo, allInHi: allInHi,
+      allInPerMw: mw > 0 && allIn > 0 ? allIn / mw : 0,
+      projectCapex: projectCapex, projectLo: projectLo, projectHi: projectHi,
+      excludeIt: !!c.excludeIt,
+      siteCapex: projectCapex          /* kept for older readers: what the site total carries */
     };
   }
 
@@ -158925,12 +159493,18 @@ if (root.console && console.info) {
       + '<input id="cc-note" type="text" style="' + IN + '" value="'
       + String(c.note || '').replace(/"/g, '&quot;')
       + '" placeholder="vendor quote, date, whose"></div>'
-      + '<div style="font-size:10.5px;color:#F59E0B;margin-top:10px;line-height:1.6">'
-      + 'Nothing is pre-filled. There is no market price for these \u2014 they are '
-      + 'negotiated and they move quarterly, and a placeholder here would be quoted at a '
-      + 'landowner inside a week. A commonly heard figure of $25\u201330M for a populated '
-      + '1 MW pod is almost entirely accelerators; put that in the right box, or the site '
-      + 'pro-forma inherits a number that does not belong to the developer.</div>'
+      + '<label style="display:flex;gap:8px;align-items:center;margin-top:10px;font-size:11.5px;color:#E0E0E0;cursor:pointer">'
+      + '<input id="cc-excl" type="checkbox"' + (c.excludeIt ? ' checked' : '') + '> '
+      + 'Enclosures only in the project total (keep accelerators out of the site pro-forma)</label>'
+      + '<div style="font-size:10.5px;color:#9A9A9A;margin-top:10px;line-height:1.6">'
+      + 'With nothing entered the estimate carries the operator benchmark: '
+      + '<b style="color:#E0E0E0">' + money((root.OMEGA_BENCH && root.OMEGA_BENCH.podAllInPerKw || 30000) * 1000)
+      + ' per 1 MW pod, all-in</b>, range '
+      + money((root.OMEGA_BENCH && root.OMEGA_BENCH.podAllInLoPerKw || 20000) * 1000) + '\u2013'
+      + money((root.OMEGA_BENCH && root.OMEGA_BENCH.podAllInHiPerKw || 40000) * 1000)
+      + ', scaled by each pod\u2019s IT kW. It prints as a benchmark everywhere. Enter quoted '
+      + 'prices above and the benchmark drops out. Almost all of an all-in pod price is '
+      + 'accelerators; if you have the split, put it in the right boxes.</div>'
       + '<div style="display:flex;gap:8px;margin-top:18px">'
       + '<button data-a="copy" style="flex:1;padding:11px;background:rgba(255,255,255,.05);'
       + 'border:1px solid #3A3A3A;color:#E0E0E0;border-radius:8px;cursor:pointer;'
@@ -158958,6 +159532,8 @@ if (root.console && console.info) {
       c2.shellPerPod = g('cc-shell'); c2.itPerPod = g('cc-it');
       var ne = document.getElementById('cc-note');
       c2.note = ne ? ne.value : ''; c2.at = Date.now();
+      var xe = document.getElementById('cc-excl');
+      c2.excludeIt = !!(xe && xe.checked);
       save(c2);
       var f2 = figures(), h = '', lines = [];
       if (!f2.pods) {
@@ -158983,12 +159559,22 @@ if (root.console && console.info) {
         } else {
           h += row('Accelerators', '\u2014', 'enter a per-pod price to see this');
         }
-        if (f2.allIn > 0) {
+        if (f2.isBenchmark) {
+          h += row('Benchmark, all-in', money(f2.allIn),
+                   money(f2.benchPerPod) + ' per pod \u00b7 range ' + money(f2.allInLo) + '\u2013' + money(f2.allInHi)
+                   + ' \u00b7 ' + f2.benchSource + ' \u2014 this is what the estimate carries until a quote replaces it');
+          lines.push('Benchmark all-in: ' + money(f2.allIn) + ' (' + money(f2.allInLo) + '\u2013' + money(f2.allInHi) + ')');
+        } else if (f2.allIn > 0) {
           h += row('All-in', money(f2.allIn),
-                   'shown for completeness \u2014 do not put this in a site pro-forma, '
-                   + 'two different owners and two different lives are added together here');
+                   'enclosures plus accelerators \u2014 two owners and two lives added together');
           lines.push('All-in: ' + money(f2.allIn));
         }
+        h += row('In the project total', money(f2.projectCapex),
+                 f2.excludeIt
+                   ? (f2.shellTotal > 0 ? 'enclosures only, by your choice above'
+                                        : 'enclosures only is ON but no enclosure price is entered \u2014 the pods carry $0')
+                   : (f2.entered ? 'entered prices, all-in' : 'operator benchmark, all-in'));
+        lines.push('In project total: ' + money(f2.projectCapex));
         if (c2.note) lines.push('Basis: ' + c2.note);
         if (!c2.note && (f2.shellTotal || f2.itTotal)) {
           h += '<div style="font-size:10.5px;color:#F59E0B;margin-top:8px;line-height:1.5">'
@@ -159205,14 +159791,19 @@ if (root.console && console.info) {
         'confirm the pod rating and the PUE with the operator');
       var cc = null;
       try { cc = root.OmegaComputeCost.figures(); } catch (e) {}
-      if (cc && cc.cfg && (cc.cfg.shellPerPod || cc.cfg.itPerPod)) {
-        add(!!(cc.cfg.note), 'Compute capex \u2014 ' + money(cc.siteCapex) + ' site, '
-          + money(cc.itTotal) + ' accelerators',
+      if (cc && cc.entered) {
+        add(!!(cc.cfg.note), 'Compute capex \u2014 ' + money(cc.shellTotal) + ' enclosures, '
+          + money(cc.itTotal) + ' accelerators' + (cc.excludeIt ? ' (accelerators kept out of the site total)' : ''),
           cc.cfg.note ? esc(cc.cfg.note) : 'no source recorded',
           cc.cfg.note ? '' : 'record the quote and its date');
+      } else if (cc && cc.isBenchmark) {
+        add(false, 'Compute capex \u2014 ' + money(cc.allIn) + ' all-in',
+          'operator benchmark, ' + money(cc.benchPerPod) + ' per pod, range '
+          + money(cc.allInLo) + '\u2013' + money(cc.allInHi),
+          'replace with an enclosure quote and a rack quote \u2014 two vendors, two numbers');
       } else {
-        add(false, 'Compute capex', 'not entered', 'get an enclosure quote and a rack quote \u2014 '
-          + 'they are two vendors and two different numbers');
+        add(false, 'Compute capex', cc && cc.excludeIt ? 'enclosures only, no enclosure price entered' : 'not entered',
+          'get an enclosure quote and a rack quote \u2014 they are two vendors and two different numbers');
       }
     }
 
@@ -159338,13 +159929,18 @@ if (root.console && console.info) {
       }
       var cc = null;
       try { cc = root.OmegaComputeCost.figures(); } catch (e) {}
-      if (cc && cc.siteCapex > 0) {
-        h += row('Enclosure capex', money(cc.siteCapex),
-          money(cc.shellPerMw) + '/MW \u2014 the site pro-forma number');
+      if (cc && cc.shellTotal > 0) {
+        h += row('Enclosure capex', money(cc.shellTotal),
+          money(cc.shellPerMw) + '/MW \u2014 real property, 20\u201330 year life');
       }
       if (cc && cc.itTotal > 0) {
         h += row('Accelerator capex', money(cc.itTotal),
-          money(cc.itPerMw) + '/MW \u2014 3\u20135 year life, usually not the developer\u2019s money');
+          money(cc.itPerMw) + '/MW \u2014 3\u20135 year life' + (cc.excludeIt ? ', kept out of the site total' : ''));
+      }
+      if (cc && cc.isBenchmark) {
+        h += row('Compute capex, all-in', money(cc.allIn),
+          'operator benchmark ' + money(cc.benchPerPod) + ' per pod, range ' + money(cc.allInLo) + '\u2013' + money(cc.allInHi)
+          + ' \u2014 replace with a quote in Compute Cost');
       }
     }
 
@@ -159669,60 +160265,64 @@ if (root.console && console.info) {
   }
 
   /* A cheap signature of the census, so an unchanged drawing never
-     causes a repaint. Rewriting identical HTML is what made the legend
-     flash and jump: every write triggered the observer, which wrote
-     again. */
+     causes a repaint. */
   function sig(h) {
     var n = 0;
     for (var i = 0; i < h.length; i++) { n = (n * 31 + h.charCodeAt(i)) | 0; }
     return String(n) + ':' + h.length;
   }
 
-  var painting = false;
+  /* ITS OWN NODE, OUTSIDE THE ONE THE APP REWRITES.
+
+     Patch 111: the census was inserted INTO #lgd-items, and
+     renderLegend() rebuilds that node's innerHTML from scratch. Every
+     legend render therefore deleted the census, the observer put it
+     back, and the key visibly alternated between the two states — which
+     is the flashing, and why one screenshot has the block and the next
+     does not seconds later.
+
+     A sibling node settles it. renderLegend owns #lgd-items and never
+     touches anything beside it, so the census is written once, survives
+     every legend render, and nothing has to watch for its own deletion.
+     No MutationObserver, so no feedback loop is even possible. */
+  function censusHost() {
+    var items = document.getElementById('lgd-items');
+    if (!items || !items.parentNode) return null;
+    var el = document.getElementById('omega-census');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'omega-census';
+      items.parentNode.insertBefore(el, items);
+    }
+    return el;
+  }
+
   function paint() {
-    if (painting) return false;
-    var host = document.getElementById('lgd-items');
-    if (!host) return false;
+    var el = censusHost();
+    if (!el) return false;
     var h = rows();
-    var old = host.querySelector('[' + MARK + ']');
     if (!h) {
-      if (old && old.parentNode) { painting = true; old.parentNode.removeChild(old); painting = false; }
+      if (el.innerHTML) { el.innerHTML = ''; el.removeAttribute('data-omega-sig'); }
       return false;
     }
     var s = sig(h);
-    if (old && old.getAttribute('data-omega-sig') === s) return false;   /* unchanged */
-    painting = true;
-    try {
-      if (old && old.parentNode) old.parentNode.removeChild(old);
-      var block = document.createElement('div');
-      block.setAttribute(MARK, '1');
-      block.setAttribute('data-omega-sig', s);
-      block.innerHTML = h;
-      /* First, because what is on the drawing is what the key is for. */
-      host.insertBefore(block, host.firstChild);
-    } finally { painting = false; }
+    if (el.getAttribute('data-omega-sig') === s) return false;   /* unchanged */
+    el.setAttribute('data-omega-sig', s);
+    el.innerHTML = h;
     return true;
   }
 
   var observing = false;
   function watch() {
     if (observing) return true;
-    var host = document.getElementById('lgd-items');
-    if (!host) return false;
-    /* A wrapper around renderLegend only wins if nothing writes after
-       it, and several things do. Watching the node is the only way that
-       does not depend on being last. */
-    var mo = new MutationObserver(function () {
-      if (painting || paintPending) return;
-      paintPending = true;
-      setTimeout(function () { paintPending = false; try { paint(); } catch (e) {} }, 250);
-    });
-    mo.observe(host, { childList: true, subtree: false });
+    if (!document.getElementById('lgd-items')) return false;
     observing = true;
     paint();
+    /* A slow poll picks up drawing changes; the signature check means an
+       unchanged drawing costs one string compare. */
+    setInterval(function () { try { paint(); } catch (e) {} }, 1500);
     return true;
   }
-  var paintPending = false;
 
   function boot() {
     var n = 0, iv = setInterval(function () {
@@ -159735,9 +160335,8 @@ if (root.console && console.info) {
   root.OmegaRecord = {
     legendRows: ownRows, reconstruct: reconstruct, restore: restore, persist: persist,
     repaintLegend: function () {
-      var host = document.getElementById('lgd-items');
-      var old = host && host.querySelector('[' + MARK + ']');
-      if (old) old.parentNode.removeChild(old);
+      var el = document.getElementById('omega-census');
+      if (el) el.removeAttribute('data-omega-sig');
       return paint();
     },
     status: function () {
@@ -159747,8 +160346,8 @@ if (root.console && console.info) {
         savedSizing: !!(s.omegaSizing && s.omegaSizing.facKw > 0),
         inMemory: !!(root._omegaComputeLast && root._omegaComputeLast.facKw > 0),
         reconstructed: !!(root._omegaComputeLast && root._omegaComputeLast.reconstructed),
-        legendCensusPainted: !!(document.getElementById('lgd-items')
-          && document.getElementById('lgd-items').querySelector('[' + MARK + ']'))
+        legendCensusPainted: !!(document.getElementById('omega-census')
+          && document.getElementById('omega-census').innerHTML)
       };
       if (root.console) console.table ? console.table(o) : console.log(o);
       return o;
@@ -160063,7 +160662,10 @@ if (root.console && console.info) {
     { n: 89, k: 'OmegaOverview',      what: 'report overview and confirmed ledger' },
     { n: 91, k: 'OmegaRecord',        what: 'compute facts survive reload, legend census' },
     { n: 94, k: 'OmegaRibbon',        what: 'empty ribbon groups hidden' },
-    { n: 98, k: 'OmegaSubstationClean', what: 'substation label slab removal' }
+    { n: 98, k: 'OmegaSubstationClean', what: 'substation label slab removal' },
+    { n: 112, k: 'OmegaCanvasCost',   what: 'pods and generation priced off the canvas; ITC basis; pod price saves with project' },
+    { n: 113, k: 'OmegaSharpExport',  what: 'mosaic aerial at export zoom, print-resolution capture, lossless blueprint image' },
+    { n: 114, k: 'OmegaComputeTab',   what: 'Compute ribbon tab: site, place, design, size & cost' }
   ];
 
   /* Source-level edits have no module to look for, so they are detected
@@ -160169,6 +160771,209 @@ if (root.console && console.info) {
   else boot();
 })(typeof window !== 'undefined' ? window : globalThis);
 
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 112 — THE CANVAS PRICES ITSELF
+ *  ---------------------------------------------------------------------
+ *  A site map with forty 1 MW pods and three 30 MW turbines totalled
+ *  $58M. That was the batteries, the PV and the switchgear. The two
+ *  lines that are 95% of the job were $0 — the pods because nothing was
+ *  typed into a dialog, the turbines because no code read them — and
+ *  nothing on the panel, the proposal or the report said the total was
+ *  short. A silent zero on the biggest line is the worst number the
+ *  tool can print, because it looks finished.
+ *
+ *  WHAT CHANGED (all source-level, this block is the diagnostic)
+ *   · Pods price at an operator benchmark, $30M ± $10M per 1 MW pod
+ *     all-in, scaled by IT kW, until a quote is entered in Compute Cost.
+ *     Every place it prints says "benchmark", and the total carries a
+ *     low–high range. Enclosures-only remains an explicit choice.
+ *   · On-site generation prices at the EIA class benchmark ($/kW).
+ *   · Pod pricing moved from localStorage to the project. Patch 91's
+ *     compute sizing (S.omegaSizing) now actually reaches the payload.
+ *   · The proposal cost table lists every line the total is made of.
+ *   · Federal ITC applies to energy property, not to pods, gas turbines,
+ *     the DC electrical package or buildings. _COST_ITC_BASIS is that.
+ *   · Per-kWh incentives and revenue read the fleet on the drawing; the
+ *     invented 760 kWh / 380 kW fallback is gone.
+ *
+ *  OmegaCanvasCost.status() prints what is priced, on what basis, and
+ *  what is still $0 with a reason.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[CanvasCost]';
+  function money(v){ v=+v||0; if(v>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if(v>=1e6) return '$'+(v/1e6).toFixed(1)+'M'; return '$'+Math.round(v).toLocaleString(); }
+  function status(){
+    try{ if(typeof root.updateCostEst==='function') root.updateCostEst(); }catch(e){}
+    var cc = null; try{ cc = root.OmegaComputeCost.figures(); }catch(e){}
+    var g = root._GEN_DETAIL || {};
+    var rows = [];
+    var push = function(line, amount, basis){ rows.push({ line:line, amount:money(amount), basis:basis }); };
+    if(cc && cc.pods){
+      push('Compute pods x'+cc.pods+' ('+cc.mw.toFixed(1)+' MW IT)', cc.projectCapex,
+        cc.isBenchmark ? 'BENCHMARK all-in '+money(cc.benchPerPod)+'/pod, range '+money(cc.allInLo)+'-'+money(cc.allInHi)
+        : (cc.excludeIt ? (cc.shellTotal>0 ? 'entered, enclosures only' : 'ZERO: enclosures-only on, no enclosure price') : 'entered, all-in'));
+    } else push('Compute pods', 0, 'none on the drawing');
+    if(g.units) (g.lines||[]).forEach(function(l){ push('Generation: '+l.model+' x'+l.units+' ('+Math.round(l.kw).toLocaleString()+' kW)', l.cost, (l.overridden?'project override ':'EIA benchmark ')+'$'+Math.round(l.rate).toLocaleString()+'/kW, BoP excluded'); });
+    else push('On-site generation', 0, 'none on the drawing');
+    push('DC electrical package', root._DC_TOTAL, root._DC_TOTAL>0 ? 'ROM (Eaton EESS)' : 'no compute load');
+    push('Solar PV', root._SOLAR_TOTAL, root._SOLAR_IS_BENCHMARK ? 'benchmark $/Wdc by size' : (root._SOLAR_TOTAL>0?'entered':'none'));
+    push('Storage', root._BESS_TOTAL, root._BESS_IS_BENCHMARK ? 'benchmark $/kWh + $/kW' : (root._BESS_TOTAL>0?'itemised':'none'));
+    push('EV charging', root._EV_TOTAL, root._EV_TOTAL>0?'catalog':'none');
+    push('Building envelope', root._BNZ_TOTAL, root._BNZ_TOTAL>0?'assembly catalog':'none');
+    push('Site equipment', root._SITE_EQ_TOTAL, 'cost sheet allowances');
+    push('Indirect', root._INDIRECT_TOTAL, 'cost sheet (blank = 0)');
+    push('Contingency', root._CONT_TOTAL, (root._CONT_PCT||10)+'%');
+    push('TOTAL', root._COST_TOTAL, root._COST_IS_CONTRACTED ? 'CONTRACTED override' : ('range '+money(root._COST_LOW)+' - '+money(root._COST_HIGH)));
+    push('ITC basis (energy property)', root._COST_ITC_BASIS, 'excludes '+money(root._COST_ITC_EXCLUDED)+' of pods, gas gen, DC electrical, buildings');
+    if(root.console){ console.table ? console.table(rows) : console.log(rows); }
+    return rows;
+  }
+  root.OmegaCanvasCost = { status: status, money: money };
+  if (root.console) console.info(TAG + ' ready \u2014 OmegaCanvasCost.status()');
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 113 — THE BLUEPRINT IS SHARP
+ *  ---------------------------------------------------------------------
+ *  Three resamplings stood between the canvas and the sheet, and each one
+ *  threw pixels away:
+ *   1. the export aerial was ONE <=640 px Static Maps request with the
+ *      zoom dropped to make the viewport fit -- ~720 px stretched across
+ *      a 1,440 px drawing (source edit in the map-export block);
+ *   2. the drawing was captured at 1.5x and saved as JPEG 0.85
+ *      (source edit in _captureCanvasWithSVG and generateBlueprint);
+ *   3. the finished 17x11 sheet was rasterised at 192 dpi for the PDF
+ *      (source edit in the blueprint PDF path).
+ *  Now: tiles at export zoom stitched to the exact viewport extent
+ *  (~4x screen resolution, <=16 calls), the drawing captured at ~4,800 px
+ *  across and kept lossless, the sheet printed at 300 dpi.
+ *  OmegaSharpExport.status() reports what the last export actually got.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  root.OmegaSharpExport = {
+    status: function () {
+      var o = {
+        aerial: root._exportMapInfo || '(no export yet, or fell back to single image)',
+        captureScale: root._lastCaptureScale || null,
+        blueprintCapturePx: root._bpCapturePx || null,
+        mapsKey: !!(typeof _CFG !== 'undefined' && _CFG && _CFG.googleMapsKey)
+      };
+      if (root.console) console.table ? console.table(o) : console.log(o);
+      return o;
+    }
+  };
+  if (root.console) console.info('[SharpExport] ready \u2014 OmegaSharpExport.status()');
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 114 — COMPUTE GETS ITS OWN TAB
+ *  ---------------------------------------------------------------------
+ *  The compute tools are injected into the Build page by a dozen patches,
+ *  each inserting itself next to whichever earlier button it found. The
+ *  Compute page is static HTML with four empty panels; this watches the
+ *  ribbon and moves each tool, by id, into the panel it belongs in, in a
+ *  fixed order. Nothing is cloned except Site Setup, which every project
+ *  type starts with and stays on Build too.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[ComputeTab]';
+  /* panel -> ordered ids (or a selector for the two static buttons) */
+  var PLAN = {
+    site:   ['@site-setup', 'rb-trace-boundary', 'rb-trace-exclusion', 'rb-place-sub', 'rb-gas-tie', 'rb-max-fit'],
+    place:  ['@dc-cluster'],
+    design: ['rb-design-site', '@compute-build', 'rb-site-build', 'rb-sub-envelope', 'rb-buildable', 'rb-fence-tie', 'rb-feas-csv'],
+    size:   ['rb-elec', 'rb-max-load', 'rb-load-screen', 'rb-optimise', 'rb-compute-cost']
+  };
+  function panel(key) {
+    return document.querySelector('#ribbon .ribbon-page[data-page="compute"] .rpanel[data-ct="' + key + '"] .rpanel-body');
+  }
+  function find(id) {
+    if (id === '@site-setup') {
+      var ex = document.getElementById('rb-compute-site-setup');
+      if (ex) return ex;
+      var hero = document.querySelector('#ribbon .ribbon-page[data-page="home"] .rbtn.home-hero');
+      if (!hero) return null;
+      var c = hero.cloneNode(true); c.id = 'rb-compute-site-setup'; c.classList.remove('home-hero');
+      return c;
+    }
+    if (id === '@compute-build') {
+      var bs = document.querySelectorAll('#ribbon .rbtn');
+      for (var i = 0; i < bs.length; i++) {
+        if ((bs[i].getAttribute('onclick') || '').indexOf("_guidedPick('compute')") > -1) return bs[i];
+      }
+      return null;
+    }
+    if (id === '@dc-cluster') {
+      var b = document.getElementById('rb-dccluster');
+      return b ? (b.closest('.rbtn-wrap') || b) : null;
+    }
+    var el = document.getElementById(id);
+    return el ? (el.closest('.rbtn-wrap') || el) : null;
+  }
+  function place() {
+    var moved = 0;
+    Object.keys(PLAN).forEach(function (key) {
+      var body = panel(key); if (!body) return;
+      var prev = null;
+      PLAN[key].forEach(function (id) {
+        var el = find(id); if (!el) return;
+        var want = prev ? prev.nextSibling : body.firstChild;
+        if (el.parentNode !== body || el !== want) {
+          body.insertBefore(el, prev ? prev.nextSibling : body.firstChild);
+          moved++;
+        }
+        prev = el;
+      });
+    });
+    return moved;
+  }
+  function keepInDesigner() {
+    try {
+      if (root.OmegaMode && root.OmegaMode.tabs) root.OmegaMode.tabs.compute = 1;
+      if (root.OmegaMode && root.OmegaMode.keep) root.OmegaMode.keep(/rb-compute-site-setup|rb-dccluster/);
+      if (root.OmegaMode && root.OmegaMode.retag) root.OmegaMode.retag();
+    } catch (e) {}
+  }
+  var pending = null;
+  function later() { clearTimeout(pending); pending = setTimeout(function () { try { place(); } catch (e) {} }, 120); }
+  function boot() {
+    var rb = document.getElementById('ribbon');
+    if (!rb || !panel('site')) { setTimeout(boot, 400); return; }
+    place(); keepInDesigner();
+    /* The injectors run on their own timers for the first minutes of a
+       session and a mode switch repopulates panels, so this watches the
+       Build page rather than running once. */
+    var home = document.querySelector('#ribbon .ribbon-page[data-page="home"]');
+    try {
+      new MutationObserver(later).observe(home || rb, { childList: true, subtree: true });
+    } catch (e) {}
+    var n = 0, iv = setInterval(function () { place(); if (++n === 6) keepInDesigner(); if (n > 240) clearInterval(iv); }, 500);
+    if (root.console) console.info(TAG + ' ready \u2014 OmegaComputeTab.status()');
+  }
+  root.OmegaComputeTab = {
+    place: place,
+    status: function () {
+      var o = {};
+      Object.keys(PLAN).forEach(function (k) {
+        var body = panel(k);
+        o[k] = body ? Array.prototype.map.call(body.querySelectorAll('.rbtn'), function (b) {
+          return (b.id || b.textContent.replace(/\s+/g, ' ').trim()) + (b.offsetParent || b.style.display !== 'none' ? '' : ' (hidden)');
+        }).join(', ') : '(no panel)';
+      });
+      if (root.console) console.table ? console.table(o) : console.log(o);
+      return o;
+    }
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof window !== 'undefined' ? window : globalThis);
 </script>
 <script>
 /* ══════════════════════════════════════════════════════════════════════
