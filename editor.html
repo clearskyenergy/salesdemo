@@ -924,7 +924,8 @@ table.e3-tbl tr.e3-arch td{ opacity:.45 }
 #ruler-lbl{font-size:10px;font-weight:700;color:var(--accent);margin-top:3px;text-align:center;font-family:'IBM Plex Mono',monospace}
 
 /* Legend */
-#lgd{position:absolute;bottom:14px;right:14px;background:rgba(13,27,42,.97);border:1px solid var(--border);border-radius:9px;padding:10px 12px;min-width:155px;z-index:30;pointer-events:none}
+/* Patch 87: the key had no height limit and no scroll, so on a full campus it either ran off the top of the canvas or clipped silently. A legend that hides half the equipment is worse than no legend. */
+#lgd{position:absolute;bottom:14px;right:14px;background:rgba(13,27,42,.97);border:1px solid var(--border);border-radius:9px;padding:10px 12px;min-width:175px;max-width:260px;max-height:52vh;overflow-y:auto;z-index:30;pointer-events:auto}
 #lgd h4{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--sub);margin-bottom:7px}
 .li{display:flex;align-items:center;gap:6px;margin-bottom:4px;font-size:10px}
 .li-ico{width:18px;height:18px;flex-shrink:0;display:flex;align-items:center;justify-content:center}
@@ -31323,6 +31324,12 @@ var O2_CLASSES = [
   /* Patch 7: wind, fuel cells and gensets were landing in Structures, so a
      site with 4 turbines and 3 fuel cells reported them as generic shapes. */
   { key:'gen',    label:'Wind / Gen', color:'#A78BFA' },
+  /* Patch 87: compute pods were counted under Wind / Gen, so a 40 MW
+     campus reported as generation. Compute is neither generation nor
+     storage; every rollup that treats it as one produces numbers that
+     argue with each other. */
+  { key:'compute',label:'Compute',    color:'#8B7BD8' },
+  { key:'fence',  label:'Fence / Tie',color:'#4ADE80' },
   { key:'struct', label:'Structures', color:'#9A9A9A' }
 ];
 
@@ -31366,11 +31373,17 @@ function o2Members(key){
     });
   } else if(key==='gen'){
     out.shapes = shapes.filter(function(s){
-      return s && (s.kind==='derwind' || s.kind==='deralt' || s.kind==='derdc');
+      return s && (s.kind==='derwind' || s.kind==='deralt');
     });
+  } else if(key==='compute'){
+    out.shapes = shapes.filter(function(s){ return s && s.kind==='derdc'; });
+  } else if(key==='fence'){
+    out.shapes = shapes.filter(function(s){ return s && (s.omegaFence || s.omegaCampus); });
+    out.conduits = conds.filter(function(c){ return c && (c.omegaFence || c.omegaCampus); });
   } else { /* struct: everything not claimed above */
     out.shapes = shapes.filter(function(s){
       if(!s) return false;
+      if(s.omegaFence || s.omegaCampus) return false;
       return ['dersolar','solar','assembly','bespad','evunit','evpost','evcab',
               'derwind','deralt','derdc'].indexOf(s.kind)<0;
     });
@@ -155421,7 +155434,10 @@ if (root.console && console.info) {
           var host = document.getElementById('lgd-items');
           if (host) {
             if (/Add elements/.test(host.innerHTML)) host.innerHTML = '';
-            host.innerHTML += rows;
+            /* First, not last. What is actually on the drawing is the
+               thing a reviewer reads the key for; the derived rollups
+               can sit under it. */
+            host.innerHTML = rows + host.innerHTML;
           }
         }
       } catch (e) {}
@@ -157504,7 +157520,20 @@ if (root.console && console.info) {
        is being built, not a setting somewhere else. */
     var anchor = dlg.querySelector('#od-solar');
     var host = anchor ? anchor.closest('label') : null;
-    if (!host || !host.parentNode) return;
+    if (!host || !host.parentNode) {
+      /* The dialog's markup can move. Falling back to the Load section
+         keeps the picker on screen rather than silently not appearing,
+         which is how the original od-genclass came to be read but never
+         built. */
+      var alt = dlg.querySelector('#od-fixed');
+      host = alt ? alt.previousElementSibling : null;
+      if (!host || !host.parentNode) {
+        var box = dlg.querySelector('div');
+        if (!box) { dlg.__prime = false; return; }
+        host = box.lastElementChild;
+        if (!host) { dlg.__prime = false; return; }
+      }
+    }
 
     var list = classes(), cur = (root.OmegaSolarZone.chosen && root.OmegaSolarZone.chosen()) || '';
     var opts = '<option value=""' + (cur ? '' : ' selected') + '>Auto \u2014 let the engine choose</option>';
