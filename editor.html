@@ -145250,6 +145250,218 @@ if (root.console && console.info) {
 
 <script>
 /* ══════════════════════════════════════════════════════════════════════
+ *  OMEGA PATCH 74 — ZONES, CLEARANCES, AND WHY EACH THING IS THAT SIZE
+ *  ---------------------------------------------------------------------
+ *  Everything shared one clearance number I invented (15 ft) and one
+ *  band split. Batteries, engines and compute containers do not have
+ *  the same neighbours or the same failure modes, so they do not have
+ *  the same spacing, and mixing them in one field is not how a site is
+ *  built or permitted.
+ *
+ *  CLEARANCES, WITH SOURCES
+ *  Storage unit-to-unit: NFPA 855 s.15.5 and IFC 1207.5.1 set 3 ft as
+ *  the floor, reducible below that only with UL 9540A large-scale fire
+ *  test data accepted by the AHJ. Insurers commonly ask for 8 ft or
+ *  more. 10 ft is used here: above the code minimum, inside what
+ *  underwriters typically want, and it does not depend on a test report
+ *  the project may not have.
+ *
+ *  Storage zone to other equipment: IFC 1207.8.3 sets 10 ft from
+ *  outdoor ESS to buildings and other exposures, reducible to 3 ft
+ *  through documented exceptions. 25 ft is used between zones, because
+ *  the compute containers ARE the exposure and 10 ft is the floor, not
+ *  a target.
+ *
+ *  Vegetation clearance around storage is 10 ft under IFC 1207.5.7 with
+ *  no exception available. That is a maintenance obligation rather than
+ *  a layout dimension, so it is reported, not drawn.
+ *
+ *  Generation to compute: driven by noise, exhaust and fuel rather than
+ *  a single code clause, so 40 ft is a planning figure and labelled as
+ *  one. Reciprocating plant at scale usually wants more.
+ *
+ *  Every number is on OmegaZones.clearances and every one of them
+ *  should be checked against the AHJ before it means anything.
+ * ══════════════════════════════════════════════════════════════════════ */
+(function (root) {
+  'use strict';
+  var TAG = '[Zones]';
+
+  var CLEAR = {
+    computeUnitFt: 15,
+    computeNote: 'Cooling airflow and service access. Planning figure.',
+
+    storageUnitFt: 10,
+    storageNote: 'NFPA 855 s.15.5 / IFC 1207.5.1 set 3 ft minimum, reducible only with '
+      + 'UL 9540A test data accepted by the AHJ. Insurers commonly require 8 ft or more.',
+
+    storageExposureFt: 25,
+    storageExposureNote: 'IFC 1207.8.3 requires 10 ft from outdoor ESS to buildings and '
+      + 'other exposures. 25 ft used because the compute containers are the exposure.',
+
+    storageVegetationFt: 10,
+    vegetationNote: 'IFC 1207.5.7. No exception available. Maintenance obligation.',
+
+    generationUnitFt: 20,
+    generationNote: 'Radiator airflow and service access between sets. Planning figure.',
+
+    generationToComputeFt: 40,
+    generationToComputeNote: 'Noise, exhaust and fuel handling. Planning figure, not a '
+      + 'code clause. Reciprocating plant at scale usually wants more.',
+
+    zoneGutterFt: 30,
+    zoneGutterNote: 'Fire lane between zones. Confirm width with the AHJ.'
+  };
+
+  /* ── solar sized against the load, not the leftover land ────────────── */
+
+  /* Solar offsets ENERGY. A compute load runs near flat at high load
+     factor, so offsetting a given fraction of its consumption needs
+     roughly fraction x facility / capacity-factor of AC capacity. At a
+     0.20 capacity factor, offsetting 20% of a 52 MW facility takes
+     about 52 MW-AC — which is the honest and slightly deflating answer,
+     and the reason solar on a compute site is an energy-cost play
+     rather than a capacity one. Saying so is more useful than filling
+     the leftover ground and reporting a number nobody asked for. */
+  function solarForOffset(facilityKw, offsetFraction, capacityFactor) {
+    var cf = +capacityFactor || 0.20;
+    var f = +offsetFraction || 0.20;
+    if (!(facilityKw > 0) || !(cf > 0)) return null;
+    var kwAc = facilityKw * f / cf;
+    return {
+      offsetFraction: f, capacityFactor: cf,
+      kwAc: kwAc, kwDc: kwAc * 1.25,
+      acresApprox: (kwAc * 1.25) / 1000 * 4.5,   /* ~4.5 ac per MW-DC fixed tilt */
+      note: 'Sized to offset ' + Math.round(f * 100) + '% of facility energy at a '
+        + cf.toFixed(2) + ' capacity factor. Replace the capacity factor with PVWatts '
+        + 'for this location before relying on it.'
+    };
+  }
+
+  /* ── storage sized for cost, not only ride-through ──────────────────── */
+
+  /* Two different jobs, two different sizes, and conflating them is how
+     a battery ends up wrong for both.
+
+     Ride-through carries the critical bus for minutes through a
+     transient or a transfer. Peak shaving holds the facility under a
+     contracted ceiling for hours, and is sized on the overage and how
+     long it lasts. A site that needs both needs the larger of the two,
+     not the sum, because the same energy serves whichever event
+     arrives. */
+  function storageSizing(opts) {
+    opts = opts || {};
+    var critKw = +opts.criticalKw || 0;
+    var rideMin = +opts.rideMin || 10;
+    var overKw = Math.max(0, (+opts.facilityKw || 0) - (+opts.ceilingKw || 0));
+    var peakHrs = +opts.peakHours || 0;
+
+    var ride = { kw: critKw, kwh: critKw * (rideMin / 60), basis: rideMin + ' min on critical bus' };
+    var shave = peakHrs > 0
+      ? { kw: overKw, kwh: overKw * peakHrs,
+          basis: 'holding ' + (overKw / 1000).toFixed(1) + ' MW under the ceiling for '
+            + peakHrs + ' h' }
+      : null;
+
+    var pick = (shave && shave.kwh > ride.kwh) ? shave : ride;
+    return {
+      rideThrough: ride, peakShave: shave, selected: pick,
+      note: shave
+        ? 'The larger of the two governs; the same energy serves whichever event arrives.'
+        : 'Ride-through only. Set peakHours to size for demand-charge management as well.'
+    };
+  }
+
+  /* ── zone plan ──────────────────────────────────────────────────────── */
+
+  /* Divides the build pad into four bands with real gutters between
+     them. Compute and generation are the two big consumers of ground,
+     so they take the split; storage takes a strip against the
+     generation side because that is where the interconnection is; solar
+     takes whatever is left OUTSIDE the pad, which is the awkward
+     boundary land nothing else can use. */
+  function plan(pad, mix) {
+    if (!pad) return null;
+    var P = 6;
+    try { if (S.pxPerFt > 0) P = S.pxPerFt; } catch (e) {}
+    var gut = CLEAR.zoneGutterFt * P;
+    var w = pad.x2 - pad.x1, h = pad.y2 - pad.y1;
+    if (!(w > 0 && h > 0)) return null;
+
+    var computeArea = Math.max(0, +mix.computeArea || 0);
+    var genArea = Math.max(0, +mix.genArea || 0);
+    var bessArea = Math.max(0, +mix.bessArea || 0);
+    var total = computeArea + genArea + bessArea;
+    if (total <= 0) return null;
+
+    /* Storage gets its own band at the far side, sized on need but
+       floored so it is never a sliver. */
+    var bessFrac = Math.min(0.25, Math.max(0.06, bessArea / total));
+    var rest = 1 - bessFrac;
+    var cFrac = rest * (computeArea / Math.max(1, computeArea + genArea));
+
+    var x = pad.x1;
+    var compute = { x1: x, y1: pad.y1, x2: x + w * cFrac - gut / 2, y2: pad.y2 };
+    x = compute.x2 + gut;
+    var gFrac = rest - cFrac;
+    var generation = { x1: x, y1: pad.y1, x2: x + w * gFrac - gut / 2, y2: pad.y2 };
+    x = generation.x2 + gut;
+    var storage = { x1: x, y1: pad.y1, x2: pad.x2, y2: pad.y2 };
+
+    return {
+      compute: compute, generation: generation, storage: storage,
+      gutterFt: CLEAR.zoneGutterFt,
+      note: 'Compute, generation and storage in separate zones with '
+        + CLEAR.zoneGutterFt + ' ft fire lanes. Storage sits on the interconnection side.'
+    };
+  }
+
+  /* Per-zone clearance, so the packer uses the right one per equipment
+     type rather than one number for everything. */
+  function clearanceFor(kind) {
+    if (kind === 'bespad') return CLEAR.storageUnitFt;
+    if (kind === 'deralt') return CLEAR.generationUnitFt;
+    return CLEAR.computeUnitFt;
+  }
+
+  function report() {
+    var rows = [
+      { item: 'Compute unit to unit', ft: CLEAR.computeUnitFt, basis: CLEAR.computeNote },
+      { item: 'Storage unit to unit', ft: CLEAR.storageUnitFt, basis: CLEAR.storageNote },
+      { item: 'Storage to other equipment', ft: CLEAR.storageExposureFt,
+        basis: CLEAR.storageExposureNote },
+      { item: 'Storage vegetation clearance', ft: CLEAR.storageVegetationFt,
+        basis: CLEAR.vegetationNote },
+      { item: 'Generation unit to unit', ft: CLEAR.generationUnitFt, basis: CLEAR.generationNote },
+      { item: 'Generation to compute', ft: CLEAR.generationToComputeFt,
+        basis: CLEAR.generationToComputeNote },
+      { item: 'Fire lane between zones', ft: CLEAR.zoneGutterFt, basis: CLEAR.zoneGutterNote }
+    ];
+    if (root.console && console.table) console.table(rows);
+    if (root.console) {
+      console.info(TAG + ' every figure above is a planning value. Confirm with the AHJ '
+        + 'and the serving utility before it means anything.');
+    }
+    return rows;
+  }
+
+  root.OmegaZones = {
+    clearances: CLEAR,
+    clearanceFor: clearanceFor,
+    plan: plan,
+    solarForOffset: solarForOffset,
+    storageSizing: storageSizing,
+    report: report
+  };
+
+  if (root.console) {
+    console.info(TAG + ' ready \u2014 OmegaZones.report() lists every clearance and its basis');
+  }
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
  *  OMEGA PATCH 50 — SITE CONTEXT: COUNTY, STATE, ZIP
  *  ---------------------------------------------------------------------
  *  Both geocode() callbacks in this file read results[0].geometry and
@@ -147286,10 +147498,17 @@ if (root.console && console.info) {
      centred, with roads at the block intervals. Returns fewer than
      asked if the rectangle cannot hold them; the caller decides whether
      to spill the remainder elsewhere. */
-  function gridPack(count, wFt, hFt, box, taken) {
+  function gridPack(count, wFt, hFt, box, taken, kind) {
     var P = ppf();
     var w = wFt * P, h = hFt * P;
-    var clear = CFG.clearanceFt * P, aisle = CFG.aisleFt * P;
+    /* Clearance is per equipment type: batteries, engines and compute
+       containers have different neighbours and different failure modes,
+       so one number for all three was wrong for at least two of them. */
+    var clearFt = CFG.clearanceFt;
+    try {
+      if (kind && root.OmegaZones) clearFt = root.OmegaZones.clearanceFor(kind);
+    } catch (e) {}
+    var clear = clearFt * P, aisle = CFG.aisleFt * P;
     var out = [];
     if (count < 1 || !box) return out;
 
@@ -147565,9 +147784,10 @@ if (root.console && console.info) {
     if (r.bessKwh > 0) {
       var perUnit = +CFG.bessKwhPerContainer || 4000;
       var units = Math.max(1, Math.ceil(r.bessKwh / perUnit));
-      var bessBoxRect = pad ? { x1: pad.x1, y1: pad.y1, x2: pad.x2, y2: pad.y2 } : null;
-      bessSlots = pad ? gridPack(units, 40, 8, bessBoxRect, taken)
-                      : pack(units, 40, 8, poly, excl, taken);
+      var bessBoxRect = zones ? zones.storage
+        : (pad ? { x1: pad.x1, y1: pad.y1, x2: pad.x2, y2: pad.y2 } : null);
+      bessSlots = bessBoxRect ? gridPack(units, 40, 8, bessBoxRect, taken, 'bespad')
+                              : pack(units, 40, 8, poly, excl, taken);
       if (bessSlots.length < units) {
         bessSlots = bessSlots.concat(
           pack(units - bessSlots.length, 40, 8, poly, excl, taken));
