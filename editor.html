@@ -1765,19 +1765,19 @@ window.onerror = function(msg, src, line, col, err) {
        nodes the patches inject; OmegaComputeTab moves them into these
        panels as they appear, so nothing was re-implemented. -->
   <div class="ribbon-page" data-page="compute">
-    <div class="rpanel" data-ct="site">
+    <div class="rpanel" data-ct="site" data-shelf="1">
       <div class="rpanel-body"></div>
       <div class="rpanel-cap">1 &middot; Site</div>
     </div>
-    <div class="rpanel" data-ct="place">
+    <div class="rpanel" data-ct="place" data-shelf="1">
       <div class="rpanel-body"></div>
       <div class="rpanel-cap">2 &middot; Place</div>
     </div>
-    <div class="rpanel" data-ct="design">
+    <div class="rpanel" data-ct="design" data-shelf="1">
       <div class="rpanel-body"></div>
       <div class="rpanel-cap">3 &middot; Design</div>
     </div>
-    <div class="rpanel" data-ct="size">
+    <div class="rpanel" data-ct="size" data-shelf="1">
       <div class="rpanel-body"></div>
       <div class="rpanel-cap">4 &middot; Size &amp; Cost</div>
     </div>
@@ -155034,7 +155034,11 @@ if (root.console && console.info) {
     var pages = document.querySelectorAll('#ribbon .ribbon-page');
     for (var i = 0; i < pages.length; i++) {
       var pg = pages[i], name = pg.getAttribute('data-page');
-      if (name === 'home' || name === 'validation') continue;
+      /* Patch 118: 'compute' is filled at runtime by OmegaComputeTab, and
+         this runs 1.2 s after load -- before the injectors it waits on.
+         Hiding it then made the tab and its four panels disappear for the
+         rest of the session, because apply() only ever runs once. */
+      if (name === 'home' || name === 'validation' || name === 'compute') continue;
       var live = 0;
       var bs = pg.querySelectorAll('.rbtn');
       for (var j = 0; j < bs.length; j++) {
@@ -160967,6 +160971,24 @@ if (root.console && console.info) {
         prev = el;
       });
     });
+    /* Patch 118: a sweep that ran while these panels were still empty may
+       have hidden them, and those sweeps only restore what they flagged
+       themselves. Anything holding a button is shown. */
+    try {
+      var pg = document.querySelector('#ribbon .ribbon-page[data-page="compute"]');
+      if (pg) {
+        var pnls = pg.querySelectorAll('.rpanel');
+        for (var i = 0; i < pnls.length; i++) {
+          if (pnls[i].querySelector('.rbtn') && pnls[i].style.display === 'none') pnls[i].style.display = '';
+        }
+        if (pg.querySelector('.rbtn')) {
+          var tab = document.querySelector('#ribbon-tabs .rtab[data-page="compute"]');
+          if (tab && tab.style.display === 'none') tab.style.display = '';
+          var mi = document.querySelector('#ribbon-tab-menu .rtm-item[onclick*="compute"]');
+          if (mi && mi.style.display === 'none') mi.style.display = '';
+        }
+      }
+    } catch (e) {}
     return moved;
   }
   function keepInDesigner() {
