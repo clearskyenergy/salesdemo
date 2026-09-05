@@ -34067,6 +34067,24 @@ function buildBOM() {
             Math.round(_cs.fenceFt), 'ft', _cs.fences+' fenced compound(s), measured from the drawing');
     addItem('Civil', 'Fence gate, double swing', '', _cs.fences, 'ea', 'One per compound');
   }
+  try{
+    var _rdFt=0, _rdW=20;
+    (S.shapes||[]).forEach(function(sh){
+      if(!sh || !sh.omegaRoad || !sh.pts || sh.pts.length<2) return;
+      _rdW = +sh.roadWidthFt || _rdW;
+      for(var i=1;i<sh.pts.length;i++){
+        _rdFt += Math.hypot(sh.pts[i].x-sh.pts[i-1].x, sh.pts[i].y-sh.pts[i-1].y);
+      }
+    });
+    if(S.pxPerFt>0) _rdFt = _rdFt / S.pxPerFt;
+    if(_rdFt>0){
+      addItem('Civil', 'Gravel access road, '+_rdW+' ft wide', '', Math.round(_rdFt), 'ft',
+              'Compound gates to the control yard and out to the public road');
+      addItem('Civil', 'Road base / surfacing', '', Math.round(_rdFt*_rdW), 'sf',
+              'Area at '+_rdW+' ft width \u2014 depth and section from the geotech report');
+    }
+  }catch(e){}
+
   if(_cs.mvFt){
     addItem('Conduit', 'MV duct bank, trenched', '4\" PVC (MV)', Math.round(_cs.mvFt*(1+BOM_CONTINGENCY)), 'ft',
             'Compound feeders to the control yard, +'+Math.round(BOM_CONTINGENCY*100)+'% contingency');
@@ -132719,6 +132737,7 @@ var ARCH = {
   /* Patch 79. A campus fence rectangle and a substation yard are objects
      in their own right. */
   'compound':      { label:'Fenced compound',        group:'civil', h:8   },
+  'road':          { label:'Access road',            group:'civil', h:0   },
   'substation':    { label:'Utility substation yard',group:'elec',  h:0   },
   'ignore':        { label:'— not shown —',          group:'none' }
 };
@@ -133041,6 +133060,10 @@ var SHAPE_ARCH = {
 function classifyShape(sh, ctx){
   if(sh._visArch && ARCH[sh._visArch]) return { arch:sh._visArch, why:'explicit' };
   if(sh.omegaCampus || sh.omegaFence){
+    /* Patch 108: an access road is a graded surface, and it is most of
+       what makes a site render read as buildable rather than as
+       equipment dropped in a field. */
+    if(sh.omegaRoad) return { arch:'road', why:'authored' };
     if(sh.omegaCampus==='feeder' || sh.omegaCampus==='trunk' || sh.omegaCampus==='service')
       return { arch:'ignore', why:'authored' };
     if(sh.kind==='rect') return { arch:'compound', why:'authored' };
@@ -134770,6 +134793,36 @@ function fenceRun(g, x1, z1, x2, z2, h, maxPosts){
    gate on the side facing the middle of the site. The gate is what
    stops it reading as a cage: a fence with no way in is not a thing
    anybody builds. */
+/* ACCESS ROAD.
+   A polyline with a width in feet, drawn as a flat crushed-stone ribbon
+   just above grade with a soft shoulder each side. Flat on purpose: a
+   road that stands proud of the ground reads as a wall from a low
+   camera angle, and the whole point of it is to sit in the terrain. */
+function buildRoad(it, arch){
+  var g = new THREE.Group();
+  var pts = (it.ref && it.ref.pts) || null;
+  var w = Math.max(8, (it.ref && +it.ref.roadWidthFt) || 20);
+  if(!pts || pts.length < 2) return g;
+  var p = ppf(); if(!(p>0)) return g;
+  /* Item x/z is the centre of the shape's bbox in scene feet; rebuild
+     each vertex relative to it so the ribbon follows the drawn line. */
+  var xs = pts.map(function(q){ return q.x; }), ys = pts.map(function(q){ return q.y; });
+  var cx = (Math.min.apply(null,xs)+Math.max.apply(null,xs))/2;
+  var cy = (Math.min.apply(null,ys)+Math.max.apply(null,ys))/2;
+  for(var i=1;i<pts.length;i++){
+    var a = { x:(pts[i-1].x-cx)/p, z:(pts[i-1].y-cy)/p };
+    var b = { x:(pts[i].x-cx)/p,   z:(pts[i].y-cy)/p };
+    var dx = b.x-a.x, dz = b.z-a.z, len = Math.sqrt(dx*dx+dz*dz);
+    if(len < 1) continue;
+    var seg = box(len + w, 0.25, w, MAT.concrete);
+    seg.position.set((a.x+b.x)/2, 0.12, (a.z+b.z)/2);
+    seg.rotation.y = -Math.atan2(dz, dx);
+    seg.receiveShadow = true; seg.castShadow = false;
+    g.add(seg);
+  }
+  return g;
+}
+
 function buildCompound(it, arch){
   var g = new THREE.Group();
   var w = Math.max(6, it.wf), d = Math.max(6, it.lf), h = arch.h || 8;
@@ -135589,6 +135642,7 @@ function populate(site){
       case 'parking':        g = buildParking(it); break;
       case 'fence':          g = buildFence(it, arch); break;
       case 'compound':       g = buildCompound(it, arch); break;
+      case 'road':           g = buildRoad(it, arch); break;
       case 'substation':     g = buildSubstationYard(it, arch); break;
       case 'bollard':        g = buildBollard(it, arch); break;
       case 'tree':           g = buildTree(it, arch); break;
@@ -155090,6 +155144,7 @@ if (root.console && console.info) {
     fenceStandoffFt: 12,             /* security fence outside each block */
     minSolarFt: 120,                 /* below this a solar field is noise */
     solarFields: 4,                  /* open ground is rarely one rectangle */
+    reachFt: 120,                    /* how far a compound sits from the yard */
     grid: 110,                       /* mask cells across the long side   */
     snapFt: 25,                      /* compounds start on this lattice   */
     alignBonusFt: 60,                /* pull toward sharing an edge line  */
@@ -155354,17 +155409,30 @@ if (root.console && console.info) {
        them is the controlling clearance, so putting them in diagonal
        quadrants satisfies it by construction rather than by search. */
     var qx = (band.x1 + band.x2) / 2, qy = (band.y1 + band.y2) / 2;
+    /* COMPACT, NOT SPREAD.
+
+       Anchoring each compound on the corner of its quadrant left the
+       open ground contiguous, which was the point — and pushed the
+       blocks to opposite ends of the parcel, which was not. Every foot
+       between a compound and the control yard is trenched duct bank and
+       graded road, and on a 45 acre parcel that turned a few hundred
+       feet of feeder into a few thousand. Land is cheap here; MV cable
+       and access road are not.
+
+       So the anchor is a short offset from the control yard in the
+       quadrant's DIRECTION, not the corner of the parcel. The blocks
+       still land in four distinct quarters, generation still sits
+       diagonally opposite compute so the 40 ft separation is satisfied
+       by construction, and everything packs against the yard it feeds.
+       Solar then takes whatever is left, which on a compact campus is
+       most of the parcel in one piece. */
+    var reach = CAMPUS.reachFt * P;
     var QUAD = {
-      compute:    { x: band.x1, y: band.y1 },   /* NW */
-      storage:    { x: band.x2, y: band.y1 },   /* NE */
-      generation: { x: band.x2, y: band.y2 },   /* SE */
-      yard:       { x: band.x1, y: band.y2 }    /* SW */
+      compute:    { x: ctrl.x1 - reach, y: ctrl.y1 - reach },   /* NW of the yard */
+      storage:    { x: ctrl.x2 + reach, y: ctrl.y1 - reach },   /* NE */
+      generation: { x: ctrl.x2 + reach, y: ctrl.y2 + reach },   /* SE */
+      yard:       { x: ctrl.x1 - reach, y: ctrl.y2 + reach }    /* SW */
     };
-    /* Anchored on the CORNER of each quadrant rather than its centre.
-       Compounds pulled to the middle of their quarters leave four
-       leftover slivers; pulled into the corners they leave one open
-       middle, which is the difference between a fragmented solar field
-       and a contiguous one. */
 
     var taken = [ctrl], zones = {}, zonesGrid = {}, slots = { pods: [], gen: [], bess: [], yard: [] };
     var why = null;
@@ -156187,7 +156255,16 @@ if (root.console && console.info) {
       + 'margin:8px 0 4px">ON THE DRAWING</div>' + rows;
   }
 
+  /* ONE CENSUS, NOT TWO.
+
+     Patch 109: this wrapper and the observer in patch 91 were both
+     inserting a census into the legend, so the key carried the same
+     block twice and each insertion triggered the other's observer —
+     which is the flashing and the bouncing height. The observer owns
+     the legend now; this stays only as a fallback for a build where
+     that module is absent. */
   function wrapLegend() {
+    if (root.OmegaRecord) return;              /* the observer has it */
     if (typeof root.renderLegend !== 'function' || root.renderLegend.__campus) return;
     var orig = root.renderLegend;
     root.renderLegend = function () {
@@ -157838,6 +157915,7 @@ if (root.console && console.info) {
     clusterFt: 150,        /* farther apart than this is a separate compound */
     gutterFt: 30,          /* fire lane, and the corridor the ties run on */
     ctrlLf: 40, ctrlWf: 30,
+    roadWidthFt: 20,       /* gravel access road, fire-apparatus width */
     ctrlLabel: 'MASTER CONTROLLER'
   };
 
@@ -158185,13 +158263,67 @@ if (root.console && console.info) {
       }
     } catch (e) {}
 
+    /* ── ACCESS ROADS ────────────────────────────────────────────────
+       A fenced compound with no road to its gate is not a site anybody
+       can build, maintain or get a fire truck to, and the civil cost of
+       that road is a real line nobody was carrying. The roads follow
+       the same corridors as the feeders, so the trench and the road
+       share alignment the way they do in the field, and each one ends
+       at the compound's GATE rather than at its centre.
+
+       Drawn as their own shapes with a width in feet, so the takeoff
+       can price gravel by the square foot instead of guessing. */
+    var roadW = CFG.roadWidthFt;
+    var roadFt = 0;
+    var road = function (pts, label) {
+      var px = 0;
+      for (var i = 1; i < pts.length; i++) px += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+      roadFt += px / p;
+      return push({ id: nid('rd'), kind: 'polyline', style: '',
+        pts: pts.map(function (q) { return { x: q.x, y: q.y }; }),
+        color: '#B08D57', omegaFence: true, omegaRoad: true,
+        roadWidthFt: roadW, label: label || 'Access road' });
+    };
+    comps.forEach(function (c) {
+      /* The gate sits on the face toward the middle of the site, which
+         is where buildCompound puts it in 3D. */
+      var g0 = edgePoint(c.r, target);
+      var others = obs.filter(function (r) { return r !== c.r; });
+      road(route(g0, ctrlPort(ctrlFence, g0), others, corr).concat([target]),
+           'Access road \u2014 ' + c.label.toLowerCase());
+    });
+    /* And a way in from the public road: the shortest run from the
+       control yard to the parcel edge. */
+    try {
+      var bnd = null;
+      try { bnd = root.OmegaComputePlace && root.OmegaComputePlace.boundary(); } catch (e) {}
+      if (bnd && bnd.length > 2) {
+        var bx1 = Infinity, by1 = Infinity, bx2 = -Infinity, by2 = -Infinity;
+        bnd.forEach(function (q) {
+          bx1 = Math.min(bx1, q.x); by1 = Math.min(by1, q.y);
+          bx2 = Math.max(bx2, q.x); by2 = Math.max(by2, q.y);
+        });
+        var d = [{ x: bx1, y: target.y }, { x: bx2, y: target.y },
+                 { x: target.x, y: by1 }, { x: target.x, y: by2 }];
+        var best = null;
+        d.forEach(function (q) {
+          var dist = Math.hypot(q.x - target.x, q.y - target.y);
+          if (!best || dist < best.d) best = { d: dist, p: q };
+        });
+        if (best) road([{ x: target.x, y: target.y }, best.p], 'Site entrance road');
+      }
+    } catch (e) {}
+    root._omegaRoadFt = Math.round(roadFt);
+
     try { if (typeof root.updShapeCount === 'function') root.updShapeCount(); } catch (e) {}
     try { if (typeof root.updCondStat === 'function') root.updCondStat(); } catch (e) {}
     try { if (typeof root.renderLegend === 'function') root.renderLegend(); } catch (e) {}
     try { if (typeof root.pushHist === 'function') root.pushHist(); } catch (e) {}
 
     var msg = comps.length + ' compound' + (comps.length === 1 ? '' : 's') + ' fenced, '
-      + runs + ' duct bank' + (runs === 1 ? '' : 's') + ' to the master controller.';
+      + runs + ' duct bank' + (runs === 1 ? '' : 's') + ' and '
+      + Math.round(roadFt).toLocaleString() + ' ft of ' + roadW + ' ft access road '
+      + 'to the master controller.';
     if (typeof root.showBanner === 'function') root.showBanner('cal', msg);
     if (root.console) console.info(TAG + ' ' + msg);
     return { compounds: comps, runs: runs, ctrl: ctrl };
@@ -159464,12 +159596,17 @@ if (root.console && console.info) {
         }
         return;
       }
+      /* ONLY WHAT THE APP'S OWN KEY MISSES.
+
+         Patch 109: the legend already lists solar, storage and
+         generation through derTotals and the fleet collector. Printing
+         them again under a second heading made the key twice as tall as
+         the canvas and repeated three rows verbatim. This block now
+         carries the things nothing else counts — compute, the tie-in
+         yard, the substation, the fences, the controller and the duct
+         bank — so the two sections complement each other instead of
+         arguing. */
       if (sh.kind === 'derdc') add('pod', '\u25a6', sh.model || 'Compute pod', sh.kw);
-      else if (sh.kind === 'deralt') add('gen' + (sh.model || ''), '\u2299', sh.model || 'Generator', sh.kw);
-      else if (sh.kind === 'derwind') add('wind', '\u2732', sh.model || 'Wind turbine', sh.kw);
-      else if (sh.kind === 'bespad') add('bess' + (sh.model || ''), '\u25ac',
-        sh.model || 'BESS container', sh.kw, sh.kwh);
-      else if (sh.kind === 'dersolar') add('pv', '\u2600', 'Solar array', sh.kw);
       else if (sh.kind === 'substation') subs.push(sh);
       else if (sh.omegaYard) add('yard' + (sh.label || sh.kind), '\u25a3',
         sh.label || sh.model || 'Tie-in equipment');
@@ -159485,13 +159622,11 @@ if (root.console && console.info) {
       if (G.kw) parts.push(Math.round(G.kw).toLocaleString() + ' kW');
       if (G.kwh) parts.push(Math.round(G.kwh).toLocaleString() + ' kWh');
       out.push({ mark: G.mark, name: G.name + (G.n > 1 ? ' \u00d7' + G.n : ''),
-                 note: parts.join(' \u00b7 ') || 'counted on the drawing' });
+                 note: parts.join(' \u00b7 ') || '' });
     });
     if (fences) out.push({ mark: '\u25a2', name: 'Fenced compounds \u00d7' + fences,
-      note: fenceAc > 0 ? (Math.round(fenceAc * 10) / 10).toFixed(1) + ' ac inside the fence lines'
-                        : 'security fence' });
-    if (ctrl) out.push({ mark: '\u25c9', name: 'Master controller',
-      note: 'the pad in the middle \u2014 every compound ties here' });
+      note: fenceAc > 0 ? (Math.round(fenceAc * 10) / 10).toFixed(1) + ' ac fenced' : '' });
+    if (ctrl) out.push({ mark: '\u25c9', name: 'Master controller', note: 'control yard' });
     var ft = 0, runs = 0;
     (S.conduits || []).forEach(function (c) {
       if (!c || !(c.omegaCampus || c.omegaFence)) return;
@@ -159499,6 +159634,16 @@ if (root.console && console.info) {
     });
     if (runs) out.push({ mark: '\u2500', name: 'MV duct bank \u00d7' + runs,
       note: Math.round(ft).toLocaleString() + ' ft trenched' });
+    var rdFt = 0, rdW = 20, rdN = 0;
+    S.shapes.forEach(function (sh) {
+      if (!sh || !sh.omegaRoad || !sh.pts || sh.pts.length < 2) return;
+      rdN++; rdW = +sh.roadWidthFt || rdW;
+      for (var i = 1; i < sh.pts.length; i++) {
+        rdFt += Math.hypot(sh.pts[i].x - sh.pts[i - 1].x, sh.pts[i].y - sh.pts[i - 1].y);
+      }
+    });
+    if (rdN && P > 0) out.push({ mark: '\u2550', name: 'Access road',
+      note: Math.round(rdFt / P).toLocaleString() + ' ft \u00b7 ' + rdW + ' ft wide' });
     if (!out.length) return '';
     var h = '';
     out.forEach(function (r) {
@@ -159523,17 +159668,39 @@ if (root.console && console.info) {
     return '';
   }
 
+  /* A cheap signature of the census, so an unchanged drawing never
+     causes a repaint. Rewriting identical HTML is what made the legend
+     flash and jump: every write triggered the observer, which wrote
+     again. */
+  function sig(h) {
+    var n = 0;
+    for (var i = 0; i < h.length; i++) { n = (n * 31 + h.charCodeAt(i)) | 0; }
+    return String(n) + ':' + h.length;
+  }
+
+  var painting = false;
   function paint() {
+    if (painting) return false;
     var host = document.getElementById('lgd-items');
     if (!host) return false;
-    if (host.querySelector('[' + MARK + ']')) return false;      /* already there */
     var h = rows();
-    if (!h) return false;
-    var block = document.createElement('div');
-    block.setAttribute(MARK, '1');
-    block.innerHTML = h;
-    /* First, because what is on the drawing is what the key is for. */
-    host.insertBefore(block, host.firstChild);
+    var old = host.querySelector('[' + MARK + ']');
+    if (!h) {
+      if (old && old.parentNode) { painting = true; old.parentNode.removeChild(old); painting = false; }
+      return false;
+    }
+    var s = sig(h);
+    if (old && old.getAttribute('data-omega-sig') === s) return false;   /* unchanged */
+    painting = true;
+    try {
+      if (old && old.parentNode) old.parentNode.removeChild(old);
+      var block = document.createElement('div');
+      block.setAttribute(MARK, '1');
+      block.setAttribute('data-omega-sig', s);
+      block.innerHTML = h;
+      /* First, because what is on the drawing is what the key is for. */
+      host.insertBefore(block, host.firstChild);
+    } finally { painting = false; }
     return true;
   }
 
@@ -159546,9 +159713,9 @@ if (root.console && console.info) {
        it, and several things do. Watching the node is the only way that
        does not depend on being last. */
     var mo = new MutationObserver(function () {
-      if (paintPending) return;
+      if (painting || paintPending) return;
       paintPending = true;
-      setTimeout(function () { paintPending = false; try { paint(); } catch (e) {} }, 60);
+      setTimeout(function () { paintPending = false; try { paint(); } catch (e) {} }, 250);
     });
     mo.observe(host, { childList: true, subtree: false });
     observing = true;
